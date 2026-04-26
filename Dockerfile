@@ -3,6 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY proxy-router /app/proxy-router
+COPY proxy_router /app/proxy_router
 
 RUN useradd --create-home --home-dir /home/proxy-router --shell /usr/sbin/nologin proxyrouter \
     && chmod +x /app/proxy-router \
