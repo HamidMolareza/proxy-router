@@ -903,6 +903,14 @@ def format_client_address(address) -> str:
     return str(address)
 
 
+def truncate_for_log(value: str, limit: int = MAX_DEBUG_VALUE_LENGTH) -> str:
+    if len(value) <= limit:
+        return value
+
+    extra = len(value) - limit
+    return f"{value[:limit]}... <truncated {extra} chars>"
+
+
 def redact_header_value(header_name: str, value: str) -> str:
     if header_name.lower() in SENSITIVE_HEADER_NAMES:
         return "<redacted>"
@@ -931,6 +939,12 @@ def resolve_usage_log_path(path_text: str | None) -> Path | None:
 def resolve_failure_log_path(path_text: str | None) -> Path | None:
     if not path_text:
         return DEFAULT_FAILURE_LOG_PATH
+    return Path(path_text).expanduser()
+
+
+def resolve_error_log_path(path_text: str | None) -> Path | None:
+    if not path_text:
+        return DEFAULT_ERROR_LOG_PATH
     return Path(path_text).expanduser()
 
 

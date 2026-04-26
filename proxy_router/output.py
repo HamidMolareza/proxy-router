@@ -94,6 +94,7 @@ class DebugLogger:
 
 
 DEBUG_LOGGER = DebugLogger()
+ERROR_LOGGER = DebugLogger(enabled=True)
 RUNTIME_LOG_ENABLED = True
 
 
@@ -103,12 +104,19 @@ def configure_debug_logger(enabled: bool, log_file: Path | None):
     DEBUG_LOGGER = DebugLogger(enabled=enabled, log_file=log_file)
 
 
+def configure_error_logger(log_file: Path | None):
+    global ERROR_LOGGER
+    ERROR_LOGGER.close()
+    ERROR_LOGGER = DebugLogger(enabled=True, log_file=log_file)
+
+
 def debug_log(proxy_label: str, message: str, *, level: str = "DEBUG"):
     DEBUG_LOGGER.write(proxy_label, message, level=level)
 
 
 def debug_exception(proxy_label: str, context: str, exc: Exception):
     DEBUG_LOGGER.exception(proxy_label, context, exc)
+    ERROR_LOGGER.exception(proxy_label, context, exc)
 
 
 def configure_runtime_logging(enabled: bool):

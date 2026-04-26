@@ -45,6 +45,7 @@ SENSITIVE_HEADER_NAMES = {
 MAX_DEBUG_VALUE_LENGTH = 512
 DEFAULT_USAGE_LOG_PATH = Path("/tmp/proxy-router-usage.log")
 DEFAULT_FAILURE_LOG_PATH = Path("/tmp/proxy-router-failures.log")
+DEFAULT_ERROR_LOG_PATH = Path("/tmp/proxy-router-errors.log")
 DEFAULT_ROUTER_CONFIG_PATH = Path.home() / ".config" / "proxy-router" / "router-config.json"
 DEFAULT_AUTO_PROXY_FAILURE_THRESHOLD = 2
 AUTO_PROXY_REPEAT_FAILURE_THRESHOLD = 1

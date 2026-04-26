@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit
 
 from .constants import *
 from .output import debug_exception, debug_log, log_event
@@ -1146,7 +1147,10 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 )
             else:
                 route_decision = self.server.router_config.decide(destination_host)
-                route_decision = apply_auto_proxy_probe_route(destination_host, route_decision)
+                route_decision = self.server.runtime.apply_auto_proxy_probe_route(
+                    destination_host,
+                    route_decision,
+                )
                 route_decision["connect_host"] = destination_host
                 route_decision["connect_port"] = destination_port
                 matched_rule = route_decision["matched_rule"]

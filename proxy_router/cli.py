@@ -135,6 +135,11 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help=f"Failure log file path for failed requests. Default: {DEFAULT_FAILURE_LOG_PATH}",
     )
     parser.add_argument(
+        "--error-log-file",
+        default=str(DEFAULT_ERROR_LOG_PATH),
+        help=f"Error log file path for exception details and tracebacks. Default: {DEFAULT_ERROR_LOG_PATH}",
+    )
+    parser.add_argument(
         "--router-config-file",
         default=str(DEFAULT_ROUTER_CONFIG_PATH),
         help=f"Router config file path used by the dashboard API. Default: {DEFAULT_ROUTER_CONFIG_PATH}",
@@ -449,6 +454,7 @@ def print_startup_instructions(
     debug_log_path: Path | None,
     usage_log_path: Path | None,
     failure_log_path: Path | None,
+    error_log_path: Path | None,
     router_config_path: Path,
     dashboard: RunningDashboard | None,
 ):
@@ -506,6 +512,8 @@ def print_startup_instructions(
         print_info(f"Analyze totals later with: {Path(sys.argv[0]).name} usage-analyze {usage_log_path}")
     if failure_log_path is not None:
         print_info(f"Failure log file: {failure_log_path}")
+    if error_log_path is not None:
+        print_info(f"Error log file: {error_log_path}")
     print_info(f"Router config file: {router_config_path}")
     if debug_log_path is not None:
         print_info(f"Debug log file: {debug_log_path}")
@@ -575,11 +583,18 @@ def main():
     debug_log_path = resolve_debug_log_path(args.debug_log_file) if args.debug else None
     usage_log_path = resolve_usage_log_path(args.usage_log_file)
     failure_log_path = resolve_failure_log_path(args.failure_log_file)
+    error_log_path = resolve_error_log_path(args.error_log_file)
     router_config_path = resolve_router_config_path(args.router_config_file)
+
+    try:
+        configure_error_logger(error_log_path)
+    except OSError as exc:
+        raise SystemExit(f"Error: could not open error log file '{error_log_path}': {exc}") from exc
 
     try:
         configure_debug_logger(args.debug, debug_log_path)
     except OSError as exc:
+        ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not open debug log file '{debug_log_path}': {exc}") from exc
 
     runtime = AppRuntime()
@@ -587,6 +602,7 @@ def main():
         runtime.configure_usage_log(usage_log_path)
     except OSError as exc:
         DEBUG_LOGGER.close()
+        ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not open usage log file '{usage_log_path}': {exc}") from exc
 
     try:
@@ -594,6 +610,7 @@ def main():
     except OSError as exc:
         runtime.close()
         DEBUG_LOGGER.close()
+        ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not open failure log file '{failure_log_path}': {exc}") from exc
 
     runtime.configure_traffic_quota_manager(usage_log_path)
@@ -604,6 +621,7 @@ def main():
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         runtime.close()
         DEBUG_LOGGER.close()
+        ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not load router config file '{router_config_path}': {exc}") from exc
 
     runtime.attach_router_config(router_config)
@@ -614,7 +632,7 @@ def main():
         "configuration "
         f"bind={args.bind} mixed_port={args.mixed_port} http_port={args.http_port} https_port={args.https_port} "
         f"socks5_port={args.socks5_port} timeout={args.timeout}s verbose={args.verbose} debug={args.debug} "
-        f"usage_log={usage_log_path} failure_log={failure_log_path} router_config={router_config_path} "
+        f"usage_log={usage_log_path} failure_log={failure_log_path} error_log={error_log_path} router_config={router_config_path} "
         f"dashboard={args.dashboard_bind}:{args.dashboard_port} dashboard_enabled={not args.no_dashboard} quiet={args.quiet}",
         level="INFO",
     )
@@ -654,6 +672,7 @@ def main():
         debug_log_path,
         usage_log_path,
         failure_log_path,
+        error_log_path,
         router_config_path,
         dashboard,
     )
@@ -666,6 +685,7 @@ def main():
     finally:
         shutdown_servers(servers, dashboard, runtime, router_config)
         DEBUG_LOGGER.close()
+        ERROR_LOGGER.close()
 
 
 if __name__ == "__main__":

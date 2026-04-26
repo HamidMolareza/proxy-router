@@ -7,7 +7,7 @@
 - A Python backend that accepts proxy traffic and exposes dashboard APIs
 - A React frontend that renders the dashboard and talks to the backend through `/api/*`
 
-In Docker, both are built from the single root `Dockerfile` using separate targets.
+In Docker, the backend and dashboard use separate Dockerfiles.
 
 ## Runtime Components
 
@@ -75,6 +75,7 @@ Persisted files:
 - `router-config-auto-proxy-state.json`: auto-proxy activation state
 - `usage.log`: JSONL transfer summaries
 - `failures.log`: JSONL failed-request events
+- `error.log`: exception details and tracebacks
 
 On backend startup:
 
@@ -86,16 +87,10 @@ This means the dashboard and routing-related state survive container restarts as
 
 ## Docker Layout
 
-The root [`Dockerfile`](../Dockerfile) contains three stages:
+Docker build files:
 
-- `frontend-build`: installs frontend dependencies and builds the Vite app
-- `backend`: packages the Python backend
-- `dashboard`: serves the built frontend with Nginx
-
-Compose uses:
-
-- `backend` target for the `proxy-router` service
-- `dashboard` target for the `proxy-router-dashboard` service
+- [`Dockerfile`](../Dockerfile): Python backend image
+- [`frontend/Dockerfile`](../frontend/Dockerfile): React dashboard + Nginx image
 
 ## Public Interfaces
 
@@ -124,7 +119,7 @@ Common defaults:
 
 - Local backend mixed listener: `8799`
 - Local backend dashboard API: `8798`
-- Compose published proxy listener: `8900`
+- Compose published proxy listener: `8901`
 - Compose published dashboard frontend: `8798`
 
 ## Design Notes

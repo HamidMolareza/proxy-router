@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './styles.css'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
@@ -476,7 +476,7 @@ function normalizeRouterConfig(config) {
           note: String(exemption.note || ''),
         }),
       )
-      .filter((exemption) => exemption.client && !isExemptionExpired(exemption)),
+      .filter((exemption) => !isExemptionExpired(exemption)),
     auto_proxy_failures: {
       enabled: Boolean(autoProxyFailures.enabled),
     },
@@ -491,6 +491,50 @@ function normalizeRouterConfig(config) {
       (profile, index) => normalizeRoutingProfile(profile, index),
     ),
   }
+}
+
+function isPersistableRule(rule) {
+  return Boolean(normalizeRulePattern(rule && rule.pattern))
+}
+
+function isPersistableClientTrafficLimit(limit) {
+  const client = String((limit && limit.client) || '').trim()
+  if (!client) {
+    return false
+  }
+  return limit.enabled === false || limit.max_past_hour_mb != null || limit.max_past_3h_mb != null
+}
+
+function isPersistableClientTrafficExemption(exemption) {
+  return Boolean(String((exemption && exemption.client) || '').trim()) && !isExemptionExpired(exemption)
+}
+
+function buildPersistableRouterConfig(config) {
+  const normalized = normalizeRouterConfig(config)
+  return {
+    ...normalized,
+    client_traffic_limits: normalized.client_traffic_limits.filter((limit) => isPersistableClientTrafficLimit(limit)),
+    client_traffic_exemptions: normalized.client_traffic_exemptions.filter((exemption) =>
+      isPersistableClientTrafficExemption(exemption),
+    ),
+    rules: normalized.rules.filter((rule) => isPersistableRule(rule)),
+    routing_profiles: normalized.routing_profiles.map((profile) => ({
+      ...profile,
+      rules: (profile.rules || []).filter((rule) => isPersistableRule(rule)),
+    })),
+  }
+}
+
+function countRouterDraftItems(config) {
+  const normalized = normalizeRouterConfig(config)
+  let count = normalized.rules.filter((rule) => !isPersistableRule(rule)).length
+  count += normalized.client_traffic_limits.filter((limit) => !isPersistableClientTrafficLimit(limit)).length
+  count += normalized.client_traffic_exemptions.filter((exemption) => !isPersistableClientTrafficExemption(exemption)).length
+  count += normalized.routing_profiles.reduce(
+    (sum, profile) => sum + (profile.rules || []).filter((rule) => !isPersistableRule(rule)).length,
+    0,
+  )
+  return count
 }
 
 function getRoutingTargetById(config, profileId) {
@@ -605,7 +649,7 @@ function failureDispositionForHost(host, config, profileId) {
 }
 
 function routerConfigFingerprint(config) {
-  return JSON.stringify(normalizeRouterConfig(config))
+  return JSON.stringify(config)
 }
 
 function currentRouterRuntime(snapshot) {
@@ -837,26 +881,33 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   ]
 }
 
-function buildRouterStatusText(config, lastSavedConfig, profileId) {
-  const dirty = routerConfigFingerprint(config) !== routerConfigFingerprint(lastSavedConfig)
+function buildRouterStatusText(config, lastSavedConfig, profileId, options = {}) {
+  const { draftCount = 0, isSaving = false, saveError = '' } = options
+  const dirty =
+    routerConfigFingerprint(buildPersistableRouterConfig(config)) !==
+    routerConfigFingerprint(buildPersistableRouterConfig(lastSavedConfig))
   const visibleRuleEntries = getEditorVisibleRuleEntries(config, profileId)
   const editorLabel = getEditorTargetLabel(config, profileId)
-  if (dirty) {
-    return `Unsaved changes · ${
-      visibleRuleEntries.filter((entry) => entry.rule && entry.rule.enabled).length
-    } enabled rules · ${
-      config.client_traffic_limits.filter((limit) => limit.enabled).length
-    } active client limits · ${
-      config.client_traffic_exemptions.filter((exemption) => exemption.enabled).length
-    } active exemptions · editing ${editorLabel}`
+  const draftLabel = draftCount === 1 ? '1 draft item still local' : `${draftCount} draft items still local`
+  if (saveError) {
+    return `Sync paused · ${saveError} · editing ${editorLabel}`
   }
-  return `Config in sync · ${visibleRuleEntries.length} rules · ${config.client_traffic_limits.length} client limits · ${config.client_traffic_exemptions.length} exemptions · ${
+  if (isSaving) {
+    return draftCount ? `Saving changes… ${draftLabel} · editing ${editorLabel}` : `Saving changes… editing ${editorLabel}`
+  }
+  if (dirty) {
+    return draftCount ? `Changes pending sync · ${draftLabel} · editing ${editorLabel}` : `Changes pending sync · editing ${editorLabel}`
+  }
+  if (draftCount) {
+    return `${draftLabel} until required fields are filled · editing ${editorLabel}`
+  }
+  return `Auto-sync on · ${visibleRuleEntries.length} rules · ${config.client_traffic_limits.length} client limits · ${config.client_traffic_exemptions.length} exemptions · ${
     config.upstream.enabled ? 'upstream on' : 'upstream off'
   } · editing ${editorLabel}`
 }
 
 function buildRulesExportPayload(config) {
-  const normalized = normalizeRouterConfig(config)
+  const normalized = buildPersistableRouterConfig(config)
   return {
     exported_at: new Date().toISOString(),
     shared: {
@@ -874,6 +925,13 @@ function buildRulesExportPayload(config) {
       rules: profile.rules,
     })),
   }
+}
+
+function createProfileId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return `profile-${globalThis.crypto.randomUUID().slice(0, 8)}`
+  }
+  return `profile-${Date.now().toString(36)}`
 }
 
 function BucketChart({ series, emptyMessage, ariaLabel }) {
@@ -982,6 +1040,9 @@ function App() {
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
   const [isClearingTraffic, setIsClearingTraffic] = useState(false)
   const [isSavingRouter, setIsSavingRouter] = useState(false)
+  const [routerSaveError, setRouterSaveError] = useState('')
+  const [routerEditVersion, setRouterEditVersion] = useState(0)
+  const routerEditVersionRef = useRef(0)
 
   const safeEditorProfileId =
     currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
@@ -989,12 +1050,21 @@ function App() {
       ? currentEditorProfileId
       : DEFAULT_ROUTING_PROFILE_ID
   const currentEditorTarget = getRoutingTargetById(currentRouterConfig, safeEditorProfileId) || currentRouterConfig
-  const routerDirty =
-    routerConfigFingerprint(currentRouterConfig) !== routerConfigFingerprint(lastSavedRouterConfig)
+  const routerPersistableConfig = buildPersistableRouterConfig(currentRouterConfig)
+  const savedRouterPersistableConfig = buildPersistableRouterConfig(lastSavedRouterConfig)
+  const routerPersistableFingerprint = routerConfigFingerprint(routerPersistableConfig)
+  const lastSavedRouterFingerprint = routerConfigFingerprint(savedRouterPersistableConfig)
+  const routerDirty = routerPersistableFingerprint !== lastSavedRouterFingerprint
+  const routerDraftCount = countRouterDraftItems(currentRouterConfig)
+  const routerHasLocalChanges = routerDirty || routerDraftCount > 0
   const routerStatus =
     routerStatusOverride || {
-      text: buildRouterStatusText(currentRouterConfig, lastSavedRouterConfig, safeEditorProfileId),
-      warning: false,
+      text: buildRouterStatusText(currentRouterConfig, lastSavedRouterConfig, safeEditorProfileId, {
+        draftCount: routerDraftCount,
+        isSaving: isSavingRouter,
+        saveError: routerSaveError,
+      }),
+      warning: Boolean(routerSaveError),
     }
   const rulesEntries = getEditorVisibleRuleEntries(currentRouterConfig, safeEditorProfileId)
   const orderedRules = rulesEntries
@@ -1077,7 +1147,7 @@ function App() {
     }
   }, [activeTab])
 
-  async function loadRouterConfig({ silent = false } = {}) {
+  async function loadRouterConfig({ showStatus = false } = {}) {
     const response = await fetch('/api/router-config', {
       cache: 'no-store',
       headers: {
@@ -1088,16 +1158,16 @@ function App() {
       throw new Error(`router config HTTP ${response.status}`)
     }
     const loadedConfig = normalizeRouterConfig(await response.json())
-    if (silent && routerDirty) {
-      return
-    }
     setCurrentRouterConfig(loadedConfig)
     setLastSavedRouterConfig(cloneJson(loadedConfig))
-    if (!silent) {
+    setRouterSaveError('')
+    if (showStatus) {
       setRouterStatusOverride({
         text: `Loaded from disk · ${new Date().toLocaleTimeString()}`,
         warning: false,
       })
+    } else {
+      setRouterStatusOverride(null)
     }
   }
 
@@ -1128,6 +1198,48 @@ function App() {
   useEffect(() => {
     let cancelled = false
 
+    async function loadInitialRouterConfig() {
+      try {
+        const response = await fetch('/api/router-config', {
+          cache: 'no-store',
+          headers: {
+            Accept: 'application/json',
+          },
+        })
+        if (!response.ok) {
+          throw new Error(`router config HTTP ${response.status}`)
+        }
+        const loadedConfig = normalizeRouterConfig(await response.json())
+        if (!cancelled) {
+          setCurrentRouterConfig(loadedConfig)
+          setLastSavedRouterConfig(cloneJson(loadedConfig))
+          setRouterSaveError('')
+          setRouterStatusOverride(null)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setRouterStatusOverride({
+            text: `Initial config load failed: ${error.message}`,
+            warning: true,
+          })
+        }
+      }
+    }
+
+    loadInitialRouterConfig()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    routerEditVersionRef.current = routerEditVersion
+  }, [routerEditVersion])
+
+  useEffect(() => {
+    let cancelled = false
+
     async function refreshAll() {
       try {
         const response = await fetch('/api/dashboard', {
@@ -1147,25 +1259,6 @@ function App() {
             text: `Live updates every 2 seconds · ${new Date().toLocaleTimeString()}`,
             warning: false,
           })
-        }
-        if (!routerDirty) {
-          try {
-            const configResponse = await fetch('/api/router-config', {
-              cache: 'no-store',
-              headers: {
-                Accept: 'application/json',
-              },
-            })
-            if (configResponse.ok) {
-              const loadedConfig = normalizeRouterConfig(await configResponse.json())
-              if (!cancelled) {
-                setCurrentRouterConfig(loadedConfig)
-                setLastSavedRouterConfig(cloneJson(loadedConfig))
-              }
-            }
-          } catch {
-            // Keep the last local config state if the silent refresh fails.
-          }
         }
       } catch (error) {
         if (!cancelled) {
@@ -1214,10 +1307,65 @@ function App() {
       cancelled = true
       window.clearInterval(intervalId)
     }
-  }, [historyRange, historyProxyType, routerDirty])
+  }, [historyRange, historyProxyType])
+
+  useEffect(() => {
+    if (!routerDirty) {
+      return undefined
+    }
+
+    const requestVersion = routerEditVersion
+    const configToPersist = JSON.parse(routerPersistableFingerprint)
+    const timeoutId = window.setTimeout(() => {
+      setIsSavingRouter(true)
+      fetch('/api/router-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(configToPersist),
+      })
+        .then(async (response) => {
+          const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+          if (!response.ok) {
+            throw new Error(payload.error || `router config HTTP ${response.status}`)
+          }
+
+          const normalizedConfig = normalizeRouterConfig(payload)
+          setLastSavedRouterConfig(cloneJson(normalizedConfig))
+          setRouterSaveError('')
+          setRouterStatusOverride(null)
+          setCurrentRouterConfig((existingConfig) => {
+            const existingPersistableFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(existingConfig))
+            const normalizedFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(normalizedConfig))
+            if (routerEditVersionRef.current !== requestVersion) {
+              return existingConfig
+            }
+            if (existingPersistableFingerprint !== normalizedFingerprint) {
+              return existingConfig
+            }
+            return countRouterDraftItems(existingConfig) ? existingConfig : normalizedConfig
+          })
+        })
+        .catch((error) => {
+          setRouterSaveError(error.message)
+          setRouterStatusOverride(null)
+        })
+        .finally(() => {
+          setIsSavingRouter(false)
+        })
+    }, 500)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [routerDirty, routerEditVersion, routerPersistableFingerprint])
 
   function setLocalRouterConfig(nextConfig, options = {}) {
     setCurrentRouterConfig(normalizeRouterConfig(nextConfig))
+    setRouterEditVersion((version) => version + 1)
+    setRouterSaveError('')
     if (Object.prototype.hasOwnProperty.call(options, 'editorProfileId')) {
       setCurrentEditorProfileId(options.editorProfileId)
     }
@@ -1257,7 +1405,7 @@ function App() {
     setLocalRouterConfig(nextConfig, {
       activateTab: 'routing',
       resetRulesPage: true,
-      message: 'Rule added locally. Save config to apply it.',
+      message: 'Rule draft added. It syncs automatically after you enter a host pattern.',
     })
   }
 
@@ -1293,7 +1441,7 @@ function App() {
     )
     setLocalRouterConfig(nextConfig, {
       activateTab: 'quotas',
-      message: 'Client traffic limit added locally. Save config to apply it.',
+      message: 'Client traffic limit draft added. It syncs automatically after you enter a client and limit.',
     })
   }
 
@@ -1321,7 +1469,7 @@ function App() {
     )
     setLocalRouterConfig(nextConfig, {
       activateTab: 'quotas',
-      message: 'Quota exemption added locally. Save config to apply it.',
+      message: 'Quota exemption draft added. It syncs automatically after you enter a client.',
     })
   }
 
@@ -1342,7 +1490,7 @@ function App() {
   function clearCurrentScopeRules() {
     const editorLabel = getEditorTargetLabel(currentRouterConfig, safeEditorProfileId)
     const confirmed = window.confirm(
-      `Clear all rules in ${editorLabel}? Shared rules in other scopes will be kept until you save.`,
+      `Clear all rules in ${editorLabel}? Shared rules in other scopes will be kept unless you remove them separately.`,
     )
     if (!confirmed) {
       return
@@ -1352,7 +1500,7 @@ function App() {
     currentTarget.rules = []
     setLocalRouterConfig(nextConfig, {
       resetRulesPage: true,
-      message: `Rules cleared locally for ${editorLabel}. Save config to apply the change.`,
+      message: `Rules cleared for ${editorLabel}. Syncing automatically.`,
     })
   }
 
@@ -1394,7 +1542,7 @@ function App() {
       expires_at: null,
     }
     setLocalRouterConfig(nextConfig, {
-      message: 'Auto rule converted to a permanent direct rule. Save config to apply the change.',
+      message: 'Auto rule converted to a permanent direct rule. Syncing automatically.',
     })
   }
 
@@ -1409,7 +1557,7 @@ function App() {
       currentTarget.ignored_failure_hosts.push(normalizedHost)
     }
     setLocalRouterConfig(nextConfig, {
-      message: 'Domain added to ignored failures. Save config to apply the change.',
+      message: 'Domain added to ignored failures. Syncing automatically.',
     })
   }
 
@@ -1444,7 +1592,7 @@ function App() {
 
     const sourceProfileId = activeProfileId(dashboardSnapshot)
     const sourceTarget = cloneJson(getRoutingTargetById(nextConfig, sourceProfileId) || nextConfig)
-    const profileId = `profile-${Math.random().toString(36).slice(2, 10)}`
+    const profileId = createProfileId()
     nextConfig.routing_profiles.push({
       id: profileId,
       name: makeProfileNameFromSignature(signature),
@@ -1459,35 +1607,8 @@ function App() {
     setLocalRouterConfig(nextConfig, {
       editorProfileId: profileId,
       resetRulesPage: true,
-      message: 'Profile created locally from the current network. Review it and save config.',
+      message: 'Profile created from the current network. Syncing automatically.',
     })
-  }
-
-  async function saveRouterConfig() {
-    setIsSavingRouter(true)
-    try {
-      const response = await fetch('/api/router-config', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify(normalizeRouterConfig(currentRouterConfig)),
-      })
-      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
-      if (!response.ok) {
-        throw new Error(payload.error || `router config HTTP ${response.status}`)
-      }
-      const normalizedConfig = normalizeRouterConfig(payload)
-      setCurrentRouterConfig(normalizedConfig)
-      setLastSavedRouterConfig(cloneJson(normalizedConfig))
-      setRouterStatusOverride({
-        text: `Saved · ${new Date().toLocaleTimeString()}`,
-        warning: false,
-      })
-    } finally {
-      setIsSavingRouter(false)
-    }
   }
 
   async function clearTrafficData() {
@@ -1543,24 +1664,15 @@ function App() {
         <div className="panel-header">
           <div>
             <h2>Configuration</h2>
-            <div className="router-note">Routing profiles, rules, quotas, and exemptions are saved together.</div>
+            <div className="router-note">Routing profiles, rules, quotas, and exemptions sync automatically.</div>
           </div>
           <div className="config-actions">
             <div className={`pill ${routerStatus.warning ? 'pill-warning' : ''}`}>{routerStatus.text}</div>
-            <button className="primary" type="button" disabled={!routerDirty || isSavingRouter} onClick={() => {
-              saveRouterConfig().catch((error) => {
-                setRouterStatusOverride({
-                  text: `Save failed: ${error.message}`,
-                  warning: true,
-                })
-              })
-            }}>
-              {isSavingRouter ? 'Saving…' : 'Save config'}
-            </button>
             <button
               type="button"
+              disabled={isSavingRouter}
               onClick={() => {
-                loadRouterConfig().catch((error) => {
+                loadRouterConfig({ showStatus: true }).catch((error) => {
                   setRouterStatusOverride({
                     text: `Reload failed: ${error.message}`,
                     warning: true,
@@ -1898,7 +2010,7 @@ function App() {
                                     const nextConfig = cloneJson(currentRouterConfig)
                                     nextConfig.routing_profiles[index].enabled = event.target.checked
                                     setLocalRouterConfig(nextConfig, {
-                                      message: 'Profile updated locally. Save config to apply the change.',
+                                      message: 'Profile updated. Syncing automatically.',
                                     })
                                   }}
                                 />
@@ -1912,7 +2024,7 @@ function App() {
                                     const nextConfig = cloneJson(currentRouterConfig)
                                     nextConfig.routing_profiles[index].name = event.target.value
                                     setLocalRouterConfig(nextConfig, {
-                                      message: 'Profile updated locally. Save config to apply the change.',
+                                      message: 'Profile updated. Syncing automatically.',
                                     })
                                   }}
                                 />
@@ -1945,7 +2057,7 @@ function App() {
                                         : safeEditorProfileId
                                     setLocalRouterConfig(nextConfig, {
                                       editorProfileId: nextEditorId,
-                                      message: 'Profile removed locally. Save config to apply the change.',
+                                      message: 'Profile removed. Syncing automatically.',
                                     })
                                   }}
                                 >
@@ -1969,7 +2081,7 @@ function App() {
                   <h3>Upstream proxy</h3>
                   <label className="checkbox-row">
                     <input
-                      className={routerDirty ? 'input-dirty' : ''}
+                      className={routerHasLocalChanges ? 'input-dirty' : ''}
                       type="checkbox"
                       checked={currentRouterConfig.upstream.enabled}
                       onChange={(event) => {
@@ -1984,7 +2096,7 @@ function App() {
                     <label className="field">
                       <span>Proxy type</span>
                       <select
-                        className={routerDirty ? 'input-dirty' : ''}
+                        className={routerHasLocalChanges ? 'input-dirty' : ''}
                         value={currentRouterConfig.upstream.type}
                         onChange={(event) => {
                           const nextConfig = cloneJson(currentRouterConfig)
@@ -1999,7 +2111,7 @@ function App() {
                     <label className="field">
                       <span>Host</span>
                       <input
-                        className={routerDirty ? 'input-dirty' : ''}
+                        className={routerHasLocalChanges ? 'input-dirty' : ''}
                         type="text"
                         value={currentRouterConfig.upstream.host}
                         placeholder="127.0.0.1"
@@ -2013,7 +2125,7 @@ function App() {
                     <label className="field">
                       <span>Port</span>
                       <input
-                        className={routerDirty ? 'input-dirty' : ''}
+                        className={routerHasLocalChanges ? 'input-dirty' : ''}
                         type="number"
                         min="1"
                         max="65535"
@@ -2040,7 +2152,7 @@ function App() {
                   <div className="router-note">Auto proxy failing domains</div>
                   <label className="checkbox-row">
                     <input
-                      className={routerDirty ? 'input-dirty' : ''}
+                      className={routerHasLocalChanges ? 'input-dirty' : ''}
                       type="checkbox"
                       checked={currentRouterConfig.auto_proxy_failures.enabled}
                       onChange={(event) => {
@@ -2074,7 +2186,7 @@ function App() {
                                 (host) => host !== item.domain,
                               )
                               setLocalRouterConfig(nextConfig, {
-                                message: 'Ignored domain removed locally. Save config to apply the change.',
+                                message: 'Ignored domain removed. Syncing automatically.',
                               })
                             }}
                           >
@@ -2126,7 +2238,7 @@ function App() {
                     <label className="control">
                       <span>Default action</span>
                       <select
-                        className={routerDirty ? 'input-dirty' : ''}
+                        className={routerHasLocalChanges ? 'input-dirty' : ''}
                         value={currentEditorTarget.default_action}
                         onChange={(event) => {
                           const nextConfig = cloneJson(currentRouterConfig)
@@ -2318,7 +2430,7 @@ function App() {
                                         }
                                         targetScope.rules.splice(entry.index, 1)
                                         setLocalRouterConfig(nextConfig, {
-                                          message: 'Rule removed locally. Save config to apply the change.',
+                                          message: 'Rule removed. Syncing automatically.',
                                         })
                                       }}
                                     >
@@ -2364,7 +2476,7 @@ function App() {
               <div className="router-note">Default traffic quota for all devices</div>
               <label className="checkbox-row">
                 <input
-                  className={routerDirty ? 'input-dirty' : ''}
+                  className={routerHasLocalChanges ? 'input-dirty' : ''}
                   type="checkbox"
                   checked={currentRouterConfig.default_client_traffic_limit.enabled}
                   onChange={(event) => {
@@ -2379,7 +2491,7 @@ function App() {
                 <label className="field">
                   <span>Last hour (MB)</span>
                   <input
-                    className={routerDirty ? 'input-dirty' : ''}
+                    className={routerHasLocalChanges ? 'input-dirty' : ''}
                     type="number"
                     min="1"
                     value={currentRouterConfig.default_client_traffic_limit.max_past_hour_mb ?? ''}
@@ -2396,7 +2508,7 @@ function App() {
                 <label className="field">
                   <span>Last 3h (MB)</span>
                   <input
-                    className={routerDirty ? 'input-dirty' : ''}
+                    className={routerHasLocalChanges ? 'input-dirty' : ''}
                     type="number"
                     min="1"
                     value={currentRouterConfig.default_client_traffic_limit.max_past_3h_mb ?? ''}
@@ -2413,7 +2525,7 @@ function App() {
                 <label className="field">
                   <span>Note</span>
                   <input
-                    className={routerDirty ? 'input-dirty' : ''}
+                    className={routerHasLocalChanges ? 'input-dirty' : ''}
                     type="text"
                     value={currentRouterConfig.default_client_traffic_limit.note || ''}
                     placeholder="optional note"
@@ -2518,7 +2630,7 @@ function App() {
                                 const nextConfig = cloneJson(currentRouterConfig)
                                 nextConfig.client_traffic_limits.splice(index, 1)
                                 setLocalRouterConfig(nextConfig, {
-                                  message: 'Client traffic limit removed locally. Save config to apply the change.',
+                                  message: 'Client traffic limit removed. Syncing automatically.',
                                 })
                               }}
                             >
@@ -2616,7 +2728,7 @@ function App() {
                                 const nextConfig = cloneJson(currentRouterConfig)
                                 nextConfig.client_traffic_exemptions.splice(index, 1)
                                 setLocalRouterConfig(nextConfig, {
-                                  message: 'Quota exemption removed locally. Save config to apply the change.',
+                                  message: 'Quota exemption removed. Syncing automatically.',
                                 })
                               }}
                             >

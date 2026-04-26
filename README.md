@@ -21,9 +21,7 @@ It is designed for cases where a phone or another device on the same network sho
 - `frontend/` contains the React dashboard app.
 - The backend exposes the dashboard API on `/api/*`.
 - The dashboard frontend is served separately and reverse-proxies `/api/*` to the backend.
-- Docker uses a single root `Dockerfile` with two targets:
-  - `backend`
-  - `dashboard`
+- Docker uses separate Dockerfiles for the backend and dashboard services
 
 More detail: [docs/architecture.md](docs/architecture.md)
 
@@ -38,7 +36,7 @@ docker compose up -d --build
 Open:
 
 - Dashboard: `http://127.0.0.1:8798`
-- Proxy listener: `127.0.0.1:8900`
+- Proxy listener: `127.0.0.1:8901`
 
 If you want to use a phone on the same Wi-Fi:
 
@@ -46,7 +44,7 @@ If you want to use a phone on the same Wi-Fi:
 2. In the phone Wi-Fi proxy settings, choose a manual HTTP proxy.
 3. Set:
    - Host: your computer's LAN IP
-   - Port: `8900`
+   - Port: `8901`
 
 ### Local development
 
@@ -88,6 +86,7 @@ Persisted backend files:
 - `./data/router-config-auto-proxy-state.json`
 - `./data/usage.log`
 - `./data/failures.log`
+- `./data/error.log`
 
 On startup, the backend rebuilds dashboard totals, recent requests, recent failures, quota history, and auto-proxy state from these persisted files.
 
@@ -101,15 +100,15 @@ To reset stored state completely:
 
 The Compose stack publishes:
 
-- Proxy listener: `8900`
+- Proxy listener: `8901`
 - Dashboard frontend: `8798`
 
 The backend dashboard API stays internal to Compose on port `8798` and is reverse-proxied by the dashboard container at `/api/*`.
 
-Both images are built from the single root [Dockerfile](Dockerfile):
+Build files:
 
-- `backend` target for the Python proxy/API container
-- `dashboard` target for the static React dashboard container
+- [Dockerfile](Dockerfile) for the Python proxy/API container
+- [frontend/Dockerfile](frontend/Dockerfile) for the static React dashboard container
 
 ## Routing Model
 
@@ -135,6 +134,7 @@ The dashboard includes five main areas:
 
 Current dashboard behaviors:
 
+- Router, profile, quota, and exemption changes sync automatically without a Save button
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
 - `Ignore` on an automatic rule converts it into a permanent manual `Direct` rule
@@ -163,6 +163,7 @@ Response behavior:
 - `--router-config-file`: router config JSON path
 - `--usage-log-file`: usage log path
 - `--failure-log-file`: failure log path
+- `--error-log-file`: persistent exception log path with traceback details
 - `--dashboard-bind`: dashboard API bind address
 - `--dashboard-port`: dashboard API port
 - `--no-dashboard`: disable the dashboard API
@@ -181,7 +182,8 @@ proxy-router/              backend executable shim
 proxy_router/              Python backend package
 frontend/                  React dashboard app
 compose.yaml               local Docker Compose stack
-Dockerfile                 single multi-stage Dockerfile for backend + dashboard
+Dockerfile                 backend container image build
+frontend/Dockerfile        dashboard container image build
 data/                      persisted runtime state when using Compose
 docs/                      supporting project documentation
 ```

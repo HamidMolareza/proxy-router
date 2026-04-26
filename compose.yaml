@@ -3,13 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: backend
     container_name: proxy-router
     command:
       - --bind
       - 0.0.0.0
       - --mixed-port
-      - "8900"
+      - "8901"
       - --dashboard-bind
       - 0.0.0.0
       - --dashboard-port
@@ -20,8 +19,10 @@ services:
       - /data/usage.log
       - --failure-log-file
       - /data/failures.log
+      - --error-log-file
+      - /data/error.log
     ports:
-      - "8900:8900"
+      - "8901:8901"
     expose:
       - "8798"
     volumes:
@@ -42,9 +43,8 @@ services:
 
   proxy-router-dashboard:
     build:
-      context: .
+      context: ./frontend
       dockerfile: Dockerfile
-      target: dashboard
     container_name: proxy-router-dashboard
     depends_on:
       proxy-router:
