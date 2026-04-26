@@ -3,7 +3,7 @@
 `proxy-router` is a standalone single-file Python proxy router with:
 
 - a mixed HTTP + SOCKS5 listener
-- an optional dashboard
+- a separate React dashboard frontend backed by a small dashboard API
 - shared and per-network routing profiles
 - automatic direct-failure probing before temporary auto-proxy rules
 - per-client traffic quotas, default quotas, and temporary/permanent quota exemptions
@@ -16,7 +16,17 @@ python3 ./proxy-router --help
   --bind 0.0.0.0 \
   --dashboard-bind 127.0.0.1 \
   --mixed-port 8799
+
+cd frontend
+npm install
+npm run dev
 ```
+
+Local development URLs:
+
+- proxy listener: `http://127.0.0.1:8799`
+- dashboard frontend: `http://127.0.0.1:5173`
+- dashboard API: `http://127.0.0.1:8798`
 
 Useful paths on the host:
 
@@ -32,10 +42,12 @@ Build and run with Compose:
 docker compose up -d --build
 ```
 
-Default container ports:
+Published Compose ports:
 
-- proxy listener: `8799`
-- dashboard: `8798`
+- proxy listener: `8900`
+- dashboard frontend: `8798`
+
+The backend dashboard API stays internal to Compose on port `8798` and is reverse-proxied by the frontend container at `/api/*`.
 
 Compose mounts `./data` into `/data` and passes explicit file paths:
 
@@ -57,7 +69,7 @@ Typical example:
 
 ## Rules and dashboard
 
-- The dashboard uses tabs for overview, history, routing, quotas, and failures.
+- The React dashboard uses tabs for overview, history, routing, quotas, and failures.
 - `Clear rules` clears only the currently edited scope.
 - `Export rules` downloads routing-only JSON for shared rules plus all saved profiles.
 - `Ignore` on an auto rule converts it into a permanent manual `Direct` rule.
@@ -79,4 +91,6 @@ For browser-style HTTP requests, quota blocks return an HTML page. For CONNECT/H
 ```bash
 python3 -m py_compile ./proxy-router
 python3 ./proxy-router --help
+cd frontend && npm install && npm run build
+docker compose config
 ```
