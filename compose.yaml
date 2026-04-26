@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: backend
     container_name: proxy-router
     command:
       - --bind
@@ -41,8 +42,9 @@ services:
 
   proxy-router-dashboard:
     build:
-      context: ./frontend
+      context: .
       dockerfile: Dockerfile
+      target: dashboard
     container_name: proxy-router-dashboard
     depends_on:
       proxy-router:

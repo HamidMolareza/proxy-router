@@ -1243,9 +1243,18 @@ def print_usage_summary(label: str, summary):
     print(f"  Total:    {format_mb(summary['total_bytes'])} ({summary['total_bytes']} bytes)")
 
 
-def load_usage_records(log_file: Path, *, log_invalid: bool = True):
+def load_jsonl_records(
+    log_file: Path | None,
+    *,
+    log_invalid: bool = False,
+    allow_missing: bool = False,
+    debug_label: str = "jsonl",
+):
     records = []
     invalid_lines = 0
+
+    if log_file is None:
+        return records, invalid_lines
 
     try:
         with log_file.open("r", encoding="utf-8") as stream:
@@ -1259,14 +1268,37 @@ def load_usage_records(log_file: Path, *, log_invalid: bool = True):
                     invalid_lines += 1
                     if log_invalid:
                         debug_log(
-                            "usage-analyze",
+                            debug_label,
                             f"skipping invalid JSON line {line_number} from {log_file}",
                             level="WARNING",
                         )
+    except FileNotFoundError:
+        if allow_missing:
+            return records, invalid_lines
+        raise
+
+    return records, invalid_lines
+
+
+def load_usage_records(log_file: Path, *, log_invalid: bool = True, allow_missing: bool = False):
+    try:
+        return load_jsonl_records(
+            log_file,
+            log_invalid=log_invalid,
+            allow_missing=allow_missing,
+            debug_label="usage-analyze",
+        )
     except FileNotFoundError as exc:
         raise SystemExit(f"Error: usage log file not found: {log_file}") from exc
 
-    return records, invalid_lines
+
+def load_failure_records(log_file: Path | None, *, log_invalid: bool = False, allow_missing: bool = True):
+    return load_jsonl_records(
+        log_file,
+        log_invalid=log_invalid,
+        allow_missing=allow_missing,
+        debug_label="failure-log",
+    )
 
 
 def first_query_value(query: dict[str, list[str]], key: str) -> str | None:

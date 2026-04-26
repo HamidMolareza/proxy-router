@@ -589,14 +589,15 @@ def main():
         DEBUG_LOGGER.close()
         raise SystemExit(f"Error: could not open usage log file '{usage_log_path}': {exc}") from exc
 
-    runtime.configure_traffic_quota_manager(usage_log_path)
-
     try:
         runtime.configure_failure_log(failure_log_path)
     except OSError as exc:
         runtime.close()
         DEBUG_LOGGER.close()
         raise SystemExit(f"Error: could not open failure log file '{failure_log_path}': {exc}") from exc
+
+    runtime.configure_traffic_quota_manager(usage_log_path)
+    runtime.rehydrate_dashboard_state()
 
     try:
         router_config = RouterConfigManager(router_config_path)

@@ -418,6 +418,66 @@ class AppRuntime:
         self.traffic_quota_manager = TrafficQuotaManager()
         self.traffic_quota_manager.load_from_log(log_file)
 
+    def rehydrate_dashboard_state(self):
+        self.dashboard_state.clear_traffic_data()
+
+        usage_records, _ = load_usage_records(
+            self.usage_log_path,
+            log_invalid=False,
+            allow_missing=True,
+        )
+        usage_records.sort(key=lambda item: str(item.get("timestamp") or ""))
+        for record in usage_records:
+            client = str(record.get("client") or "").strip()
+            timestamp = str(record.get("timestamp") or "").strip()
+            if not client or not timestamp:
+                continue
+            self.dashboard_state.record_request(
+                proxy_label=str(record.get("proxy_type") or "unknown"),
+                kind=str(record.get("kind") or "http"),
+                client=client,
+                destination=str(record.get("destination") or ""),
+                uploaded_bytes=int(record.get("uploaded_bytes", 0)),
+                downloaded_bytes=int(record.get("downloaded_bytes", 0)),
+                method=str(record.get("method")) if record.get("method") is not None else None,
+                timestamp=timestamp,
+                route_label=str(record.get("route_label") or "direct"),
+                matched_rule=record.get("matched_rule") if isinstance(record.get("matched_rule"), dict) else None,
+                profile_id=str(record.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID),
+            )
+
+        failure_records, _ = load_failure_records(
+            self.failure_log_path,
+            log_invalid=False,
+            allow_missing=True,
+        )
+        failure_records.sort(key=lambda item: str(item.get("timestamp") or ""))
+        for record in failure_records:
+            timestamp = str(record.get("timestamp") or "").strip()
+            if not timestamp:
+                continue
+
+            port = record.get("port")
+            try:
+                normalized_port = int(port) if port is not None else None
+            except (TypeError, ValueError):
+                normalized_port = None
+
+            self.dashboard_state.record_failure(
+                proxy_label=str(record.get("proxy_type") or "system"),
+                client=str(record.get("client") or ""),
+                method=str(record.get("method") or "CONNECT"),
+                destination=str(record.get("destination") or ""),
+                host=str(record.get("host")) if record.get("host") is not None else None,
+                port=normalized_port,
+                error=str(record.get("error") or ""),
+                context=str(record.get("context") or ""),
+                timestamp=timestamp,
+                route_label=str(record.get("route_label") or "direct"),
+                matched_rule=record.get("matched_rule") if isinstance(record.get("matched_rule"), dict) else None,
+                profile_id=str(record.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID),
+            )
+
     def attach_router_config(self, router_config):
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.shutdown()
