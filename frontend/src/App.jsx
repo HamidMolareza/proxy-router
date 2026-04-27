@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react'
-import './styles.css'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
 const ROUTE_TYPES = ['direct', 'proxy', 'self', 'rejected']
@@ -42,6 +41,62 @@ const RULE_DURATION_SECONDS = {
 const RULES_PAGE_SIZE = 10
 const DEFAULT_FAILURE_PAGE_SIZE = 10
 const BYTES_IN_MB = 1_000_000
+
+function cx(...classes) {
+  return classes.filter(Boolean).join(' ')
+}
+
+const pageClass = [
+  'min-h-screen bg-[linear-gradient(180deg,#f6f2e9_0%,#ece6d8_100%)] text-[#1f2a30]',
+  "font-['IBM_Plex_Sans','Noto_Sans',sans-serif]",
+  '[&_h1]:text-2xl [&_h1]:leading-tight [&_h1]:font-bold sm:[&_h1]:text-3xl',
+  '[&_h2]:text-lg [&_h2]:leading-snug [&_h2]:font-bold sm:[&_h2]:text-xl',
+  '[&_h3]:text-base [&_h3]:leading-snug [&_h3]:font-bold',
+  "[&_button]:min-h-10 [&_button]:cursor-pointer [&_button]:rounded-[10px] [&_button]:border [&_button]:border-[#c8c0b2] [&_button]:bg-[#fffdf8] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[#1f2a30]",
+  '[&_button:disabled]:cursor-default [&_button:disabled]:opacity-55',
+  "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[10px] [&_input[type='number']]:border [&_input[type='number']]:border-[#d8d1c2] [&_input[type='number']]:bg-[#fffdf8] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2",
+  "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[#d8d1c2] [&_input[type='search']]:bg-[#fffdf8] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2",
+  "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[#d8d1c2] [&_input[type='text']]:bg-[#fffdf8] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2",
+  '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[#d8d1c2] [&_select]:bg-[#fffdf8] [&_select]:px-3 [&_select]:py-2',
+].join(' ')
+const shellClass = 'mx-auto w-full max-w-[1200px] px-2 py-3 sm:px-4 sm:py-6'
+const heroClass = 'mb-3 flex flex-col items-start gap-2 sm:mb-4 min-[901px]:flex-row min-[901px]:items-end min-[901px]:justify-between'
+const panelClass = 'min-w-0 rounded-xl border border-[#d8d1c2] bg-[#fffdf8] p-3 shadow-[0_8px_20px_rgba(24,36,39,0.06)] sm:rounded-[18px] sm:p-4 sm:shadow-[0_12px_30px_rgba(24,36,39,0.08)]'
+const subpanelClass = 'min-w-0 overflow-x-auto rounded-xl border border-[#e8e0d1] bg-gradient-to-b from-white to-[#f6f4ed] p-3 sm:rounded-[14px] sm:p-4'
+const panelHeaderClass = 'flex flex-wrap items-stretch justify-between gap-3 sm:items-center sm:gap-4'
+const noteClass = 'mt-2 text-sm leading-relaxed text-[#6a6f73]'
+const mutedClass = 'text-[#6a6f73]'
+const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[#d9ece8] px-3 py-1.5 font-semibold text-[#116466]'
+const warningPillClass = 'bg-[#f7e4bb] text-[#9b6b00]'
+const mutedPillClass = 'bg-[#ece7dc] text-[#6a6f73]'
+const gridClass = 'grid grid-cols-12 gap-4'
+const cardGridClass = 'col-span-full grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(150px,1fr))] sm:gap-3'
+const cardClass = 'min-w-0 rounded-[10px] border border-[#e8e0d1] bg-gradient-to-b from-white to-[#f6f4ed] p-3 sm:rounded-[14px] sm:p-4'
+const cardLabelClass = 'text-xs text-[#6a6f73] sm:text-sm'
+const cardValueClass = 'mt-1 [overflow-wrap:anywhere] text-base leading-tight font-bold sm:text-xl'
+const tableWrapClass = [
+  '-mx-1 w-full overflow-x-auto px-1 pb-1 [-webkit-overflow-scrolling:touch]',
+  '[&_table]:w-full [&_table]:border-collapse [&_table]:text-sm max-sm:[&_table]:min-w-[42rem] sm:[&_table]:text-[0.95rem]',
+  '[&_th]:border-b [&_th]:border-[#ece5d8] [&_th]:px-2 [&_th]:py-2 [&_th]:text-left [&_th]:align-top [&_th]:text-xs [&_th]:font-semibold [&_th]:tracking-[0.05em] [&_th]:text-[#6a6f73] [&_th]:uppercase',
+  '[&_td]:border-b [&_td]:border-[#ece5d8] [&_td]:px-2 [&_td]:py-2 [&_td]:align-top',
+].join(' ')
+const controlClass = 'flex min-w-0 flex-col gap-1 text-sm text-[#6a6f73] sm:min-w-36'
+const controlsClass = 'mt-3 mb-1 grid grid-cols-1 gap-3 sm:flex sm:flex-wrap'
+const fieldGridClass = 'mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fit,minmax(180px,1fr))]'
+const fieldClass = 'flex min-w-0 flex-col gap-1 text-sm text-[#6a6f73]'
+const buttonRowClass = 'mt-3 flex flex-wrap gap-3 max-sm:[&>button]:w-full'
+const tightButtonRowClass = 'mt-0 flex flex-wrap gap-3 max-sm:[&>button]:w-full'
+const warnButtonClass = '!border-[#e4c980] !bg-[#f7e4bb] !text-[#6b4a00]'
+const primaryButtonClass = '!border-[#116466] !bg-[#116466] !text-white'
+const dirtyInputClass = '!border-[#116466] shadow-[0_0_0_3px_rgba(17,100,102,0.12)]'
+const readOnlyInputClass = 'opacity-70'
+const chipListClass = 'mt-3 flex flex-wrap gap-2'
+const chipClass = 'inline-flex max-w-full items-center gap-2 [overflow-wrap:anywhere] rounded-full border border-[#ddd2bf] bg-white px-3 py-1.5 text-sm'
+const chipButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !font-bold !text-[#8c5a00]'
+const ruleActionsClass = 'flex flex-wrap gap-2 max-sm:flex-col max-sm:items-stretch max-sm:[&_button]:w-full max-sm:[&_button]:whitespace-nowrap'
+const rulePillClass = 'inline-flex items-center rounded-full border border-[#dbcdb7] bg-[#f1ece2] px-2 py-1 text-xs font-bold text-[#5a4631]'
+const autoRulePillClass = '!border-[#b9d7d8] !bg-[#e3f1f1] !text-[#13595b]'
+const ruleMetaClass = 'flex flex-col gap-1 text-sm'
 
 function getTabFromHash() {
   const tabId = window.location.hash.replace(/^#/, '').trim()
@@ -732,12 +787,12 @@ function buildUpstreamConnectivityLabel(upstreamStatus) {
 function buildUpstreamConnectivityPillClass(upstreamStatus) {
   const status = String(upstreamStatus.connectivity.status || 'unknown')
   if (status === 'error') {
-    return 'pill pill-warning'
+    return cx(pillClass, warningPillClass)
   }
   if (status === 'disabled') {
-    return 'pill pill-muted'
+    return cx(pillClass, mutedPillClass)
   }
-  return 'pill'
+  return pillClass
 }
 
 function buildUpstreamTrafficHeadline(upstreamStatus) {
@@ -1060,7 +1115,7 @@ function createProfileId() {
 
 function BucketChart({ series, emptyMessage, ariaLabel }) {
   if (!series.length) {
-    return <div className="empty">{emptyMessage}</div>
+    return <div className="pt-2 text-[#6a6f73]">{emptyMessage}</div>
   }
 
   const svgWidth = 720
@@ -1077,20 +1132,20 @@ function BucketChart({ series, emptyMessage, ariaLabel }) {
   const tickEvery = Math.max(1, Math.floor((series.length + 2) / 4))
 
   return (
-    <div className="chart-shell">
-      <div className="chart-legend">
-        <span>
-          <i className="legend-swatch legend-upload"></i>
+    <div className="mt-3">
+      <div className="mb-2 flex flex-wrap gap-4 text-sm text-[#6a6f73]">
+        <span className="inline-flex items-center gap-2">
+          <i className="inline-block size-3.5 rounded-full bg-[#116466]"></i>
           Upload
         </span>
-        <span>
-          <i className="legend-swatch legend-download"></i>
+        <span className="inline-flex items-center gap-2">
+          <i className="inline-block size-3.5 rounded-full bg-[#7cc6bb]"></i>
           Download
         </span>
       </div>
-      <svg className="usage-chart-svg" viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label={ariaLabel}>
+      <svg className="block h-auto w-full overflow-visible" viewBox={`0 0 ${svgWidth} ${svgHeight}`} role="img" aria-label={ariaLabel}>
         <line
-          className="chart-axis"
+          className="stroke-[#d9d2c3] stroke-1"
           x1={paddingLeft}
           y1={paddingTop + innerHeight}
           x2={svgWidth - paddingRight}
@@ -1110,7 +1165,7 @@ function BucketChart({ series, emptyMessage, ariaLabel }) {
           return (
             <g key={`${point.label}-${index}`}>
               <rect
-                className="chart-download"
+                className="fill-[#7cc6bb]"
                 x={x.toFixed(2)}
                 y={downloadY.toFixed(2)}
                 width={barWidth.toFixed(2)}
@@ -1122,7 +1177,7 @@ function BucketChart({ series, emptyMessage, ariaLabel }) {
               </rect>
               {uploadHeight > 0 ? (
                 <rect
-                  className="chart-upload"
+                  className="fill-[#116466]"
                   x={x.toFixed(2)}
                   y={uploadY.toFixed(2)}
                   width={barWidth.toFixed(2)}
@@ -1134,7 +1189,7 @@ function BucketChart({ series, emptyMessage, ariaLabel }) {
                 </rect>
               ) : null}
               {shouldShowLabel ? (
-                <text className="chart-label" x={(x + barWidth / 2).toFixed(2)} y={svgHeight - 14} textAnchor="middle">
+                <text className="fill-[#6a6f73] font-sans text-xs" x={(x + barWidth / 2).toFixed(2)} y={svgHeight - 14} textAnchor="middle">
                   {point.label}
                 </text>
               ) : null}
@@ -1935,23 +1990,24 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero">
+    <main className={pageClass}>
+      <div className={shellClass}>
+      <section className={heroClass}>
         <div>
           <h1>proxy-router dashboard</h1>
           <p>Current session view for traffic totals, per-device usage, and the latest completed request.</p>
         </div>
-        <div className={`pill ${status.warning ? 'pill-warning' : ''}`}>{status.text}</div>
+        <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
       </section>
 
-      <section className="panel config-bar">
-        <div className="panel-header">
+      <section className={cx(panelClass, 'mb-4')}>
+        <div className={panelHeaderClass}>
           <div>
             <h2>Configuration</h2>
-            <div className="router-note">Routing profiles, rules, quotas, and exemptions sync automatically.</div>
+            <div className={noteClass}>Routing profiles, rules, quotas, and exemptions sync automatically.</div>
           </div>
-          <div className="config-actions">
-            <div className={`pill ${routerStatus.warning ? 'pill-warning' : ''}`}>{routerStatus.text}</div>
+          <div className="flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:items-center sm:flex-wrap">
+            <div className={cx(pillClass, routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
             <button
               type="button"
               disabled={isSavingRouter}
@@ -1970,11 +2026,14 @@ function App() {
         </div>
       </section>
 
-      <section className="tabs" aria-label="Dashboard tabs">
+      <section className="mb-4 grid grid-cols-2 gap-2 min-[361px]:grid-cols-3 sm:flex sm:flex-wrap" aria-label="Dashboard tabs">
         {TAB_DEFINITIONS.map((tab) => (
           <button
             key={tab.id}
-            className={`tab-button ${activeTab === tab.id ? 'is-active' : ''}`}
+            className={cx(
+              'w-full rounded-[10px] px-2 py-2 text-sm sm:w-auto sm:rounded-full sm:px-4',
+              activeTab === tab.id && primaryButtonClass,
+            )}
             type="button"
             aria-pressed={activeTab === tab.id ? 'true' : 'false'}
             onClick={() => setActiveTab(tab.id)}
@@ -1985,18 +2044,20 @@ function App() {
       </section>
 
       {activeTab === 'overview' ? (
-        <section className="tab-panel is-active">
-          <section className="grid">
-            <div className="cards" id="summary-cards">
+        <section className="block">
+          <section className={gridClass}>
+            <div className={cardGridClass} id="summary-cards">
               {overviewCards.map(([label, value]) => (
-                <div className="card" key={label}>
-                  <div className="card-label">{label}</div>
-                  <div className={label === 'Started' ? 'card-value card-value-started' : 'card-value'}>{value}</div>
+                <div className={cardClass} key={label}>
+                  <div className={cardLabelClass}>{label}</div>
+                  <div className={cx(cardValueClass, label === 'Started' && 'text-sm leading-snug sm:text-base')}>
+                    {value}
+                  </div>
                 </div>
               ))}
             </div>
 
-            <section className="panel usage-chart">
+            <section className={cx(panelClass, 'col-span-full lg:col-span-7')}>
               <h2>Recent traffic</h2>
               <BucketChart
                 series={usageChartPoints}
@@ -2005,7 +2066,7 @@ function App() {
               />
             </section>
 
-            <section className="panel latest">
+            <section className={cx(panelClass, 'col-span-full lg:col-span-5')}>
               <h2>Latest request</h2>
               {dashboardSnapshot.latest_request ? (
                 <div>
@@ -2020,20 +2081,20 @@ function App() {
                     ['Download', formatMb(dashboardSnapshot.latest_request.downloaded_bytes)],
                     ['Total', formatMb(dashboardSnapshot.latest_request.total_bytes)],
                   ].map(([label, value]) => (
-                    <div className="detail-row" key={label}>
-                      <span className="detail-label">{label}</span>
-                      <span className="detail-value">{value}</span>
+                    <div className="grid grid-cols-[minmax(4.5rem,0.75fr)_minmax(0,1fr)] gap-3 border-b border-[#ece5d8] py-2 last:border-b-0 sm:flex sm:justify-between sm:gap-4" key={label}>
+                      <span className="min-w-0 text-[#6a6f73] sm:min-w-24">{label}</span>
+                      <span className="break-words text-left font-semibold sm:text-right">{value}</span>
                     </div>
                   ))}
                 </div>
               ) : (
-                <div className="empty">No completed requests yet.</div>
+                <div className="pt-2 text-[#6a6f73]">No completed requests yet.</div>
               )}
             </section>
 
-            <section className="panel totals">
+            <section className={cx(panelClass, 'col-span-full lg:col-span-6')}>
               <h2>By proxy</h2>
-              <div className="table-wrap">
+              <div className={tableWrapClass}>
                 <table>
                   <thead>
                     <tr>
@@ -2065,9 +2126,9 @@ function App() {
               </div>
             </section>
 
-            <section className="panel route-totals">
+            <section className={cx(panelClass, 'col-span-full lg:col-span-6')}>
               <h2>By route</h2>
-              <div className="table-wrap">
+              <div className={tableWrapClass}>
                 <table>
                   <thead>
                     <tr>
@@ -2103,10 +2164,10 @@ function App() {
               </div>
             </section>
 
-            <section className="panel recent">
+            <section className={cx(panelClass, 'col-span-full')}>
               <h2>Recent requests</h2>
               {dashboardSnapshot.recent_requests.length ? (
-                <div className="table-wrap">
+                <div className={tableWrapClass}>
                   <table>
                     <thead>
                       <tr>
@@ -2126,7 +2187,7 @@ function App() {
                           <td>{request.proxy_type}</td>
                           <td>{request.method}</td>
                           <td>{request.client}</td>
-                          <td className="destination">{request.destination}</td>
+                          <td className="max-w-md break-words">{request.destination}</td>
                           <td>{request.route_label || 'direct'}</td>
                           <td>{formatMb(request.total_bytes)}</td>
                         </tr>
@@ -2135,7 +2196,7 @@ function App() {
                   </table>
                 </div>
               ) : (
-                <div className="empty">No recent requests yet.</div>
+                <div className="pt-2 text-[#6a6f73]">No recent requests yet.</div>
               )}
             </section>
           </section>
@@ -2143,12 +2204,12 @@ function App() {
       ) : null}
 
       {activeTab === 'history' ? (
-        <section className="tab-panel is-active">
-          <section className="grid">
-            <section className="panel history">
-              <div className="panel-header">
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
                 <h2>History</h2>
-                <button className="warn" id="clear-traffic-button" type="button" disabled={isClearingTraffic} onClick={() => {
+                <button className={warnButtonClass} id="clear-traffic-button" type="button" disabled={isClearingTraffic} onClick={() => {
                   clearTrafficData().catch((error) => {
                     setStatus({
                       text: `Traffic clear failed: ${error.message}`,
@@ -2160,8 +2221,8 @@ function App() {
                 </button>
               </div>
 
-              <div className="controls">
-                <label className="control">
+              <div className={controlsClass}>
+                <label className={controlClass}>
                   <span>Range</span>
                   <select value={historyRange} onChange={(event) => setHistoryRange(event.target.value)}>
                     {HISTORY_RANGE_OPTIONS.map((option) => (
@@ -2171,7 +2232,7 @@ function App() {
                     ))}
                   </select>
                 </label>
-                <label className="control">
+                <label className={controlClass}>
                   <span>Proxy</span>
                   <select value={historyProxyType} onChange={(event) => setHistoryProxyType(event.target.value)}>
                     <option value="all">All proxies</option>
@@ -2184,21 +2245,21 @@ function App() {
                 </label>
               </div>
 
-              <div className="history-summary">
+              <div className={cx(cardGridClass, 'mt-2')}>
                 {historyCards.map(([label, value]) => (
-                  <div className="card" key={label}>
-                    <div className="card-label">{label}</div>
-                    <div className="card-value">{value}</div>
+                  <div className={cardClass} key={label}>
+                    <div className={cardLabelClass}>{label}</div>
+                    <div className={cardValueClass}>{value}</div>
                   </div>
                 ))}
               </div>
-              <div className="history-note">{historyNote}</div>
+              <div className={noteClass}>{historyNote}</div>
 
-              <div className="history-grid">
-                <section className="subpanel">
+              <div className="mt-3 grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,2.1fr)_minmax(280px,1fr)]">
+                <section className={subpanelClass}>
                   <h3>Traffic over time</h3>
                   {historyError ? (
-                    <div className="empty">{historyError}</div>
+                    <div className="pt-2 text-[#6a6f73]">{historyError}</div>
                   ) : (
                     <BucketChart
                       series={historyData.series || []}
@@ -2208,10 +2269,10 @@ function App() {
                   )}
                 </section>
 
-                <section className="subpanel">
+                <section className={subpanelClass}>
                   <h3>Top destinations</h3>
                   {historyError ? (
-                    <div className="empty">History data is unavailable right now.</div>
+                    <div className="pt-2 text-[#6a6f73]">History data is unavailable right now.</div>
                   ) : historyData.top_destinations.length ? (
                     <table>
                       <thead>
@@ -2224,7 +2285,7 @@ function App() {
                       <tbody>
                         {historyData.top_destinations.map((item) => (
                           <tr key={item.destination}>
-                            <td className="destination">{item.destination}</td>
+                            <td className="max-w-md break-words">{item.destination}</td>
                             <td>{item.count}</td>
                             <td>{formatMb(item.total_bytes)}</td>
                           </tr>
@@ -2232,7 +2293,7 @@ function App() {
                       </tbody>
                     </table>
                   ) : (
-                    <div className="empty">No destinations matched this filter.</div>
+                    <div className="pt-2 text-[#6a6f73]">No destinations matched this filter.</div>
                   )}
                 </section>
               </div>
@@ -2242,36 +2303,36 @@ function App() {
       ) : null}
 
       {activeTab === 'routing' ? (
-        <section className="tab-panel is-active">
-          <section className="grid">
-            <section className="panel router">
-              <div className="panel-header">
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
                 <div>
                   <h2>Routing</h2>
-                  <div className="router-note">Profiles, upstream proxy, auto-proxy policy, and host rules.</div>
+                  <div className={noteClass}>Profiles, upstream proxy, auto-proxy policy, and host rules.</div>
                 </div>
               </div>
 
-              <div className="router-grid">
-                <section className="router-card">
+              <div className="mt-3 grid grid-cols-12 gap-4">
+                <section className={cx(subpanelClass, 'col-span-full lg:col-span-4')}>
                   <h3>Profiles</h3>
-                  <div className="router-note">Detect the current internet and VPN set, then match its saved routing profile.</div>
-                  <div className="router-summary">
+                  <div className={noteClass}>Detect the current internet and VPN set, then match its saved routing profile.</div>
+                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
                     {profileRuntimeItems.map(([label, value]) => (
-                      <div className="mini-card" key={label}>
-                        <div className="mini-label">{label}</div>
-                        <div className="mini-value">{value}</div>
+                      <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3" key={label}>
+                        <div className="text-xs text-[#6a6f73]">{label}</div>
+                        <div className="mt-1 [overflow-wrap:anywhere] font-bold">{value}</div>
                       </div>
                     ))}
                   </div>
 
-                  <div className="button-row">
+                  <div className={buttonRowClass}>
                     <button id="create-profile-from-current-button" type="button" onClick={createProfileFromCurrentNetwork}>
                       Create profile from current network
                     </button>
                   </div>
 
-                  <div className="table-wrap">
+                  <div className={tableWrapClass}>
                     <table>
                       <thead>
                         <tr>
@@ -2316,7 +2377,7 @@ function App() {
                               </td>
                               <td>{formatProfileInternetLabel(profile.signature)}</td>
                               <td>{formatProfileVpnLabel(profile.signature)}</td>
-                              <td className="rule-actions">
+                              <td className={ruleActionsClass}>
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -2353,7 +2414,7 @@ function App() {
                           ))
                         ) : (
                           <tr>
-                            <td colSpan="5" className="empty">
+                            <td colSpan="5" className="pt-2 text-[#6a6f73]">
                               No saved network-specific profiles yet.
                             </td>
                           </tr>
@@ -2362,11 +2423,11 @@ function App() {
                     </table>
                   </div>
 
-                  <div className="router-note section-gap">Global upstream and routing status</div>
+                  <div className={cx(noteClass, 'mt-4')}>Global upstream and routing status</div>
                   <h3>Upstream proxy</h3>
-                  <label className="checkbox-row">
+                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                     <input
-                      className={routerHasLocalChanges ? 'input-dirty' : ''}
+                      className={cx(routerHasLocalChanges && dirtyInputClass)}
                       type="checkbox"
                       checked={currentRouterConfig.upstream.enabled}
                       onChange={(event) => {
@@ -2377,11 +2438,11 @@ function App() {
                     />
                     <span>Enable upstream proxy</span>
                   </label>
-                  <div className="field-grid">
-                    <label className="field">
+                  <div className={fieldGridClass}>
+                    <label className={fieldClass}>
                       <span>Proxy type</span>
                       <select
-                        className={routerHasLocalChanges ? 'input-dirty' : ''}
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
                         value={currentRouterConfig.upstream.type}
                         onChange={(event) => {
                           const nextConfig = cloneJson(currentRouterConfig)
@@ -2393,10 +2454,10 @@ function App() {
                         <option value="socks5">SOCKS5 proxy</option>
                       </select>
                     </label>
-                    <label className="field">
+                    <label className={fieldClass}>
                       <span>Host</span>
                       <input
-                        className={routerHasLocalChanges ? 'input-dirty' : ''}
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
                         type="text"
                         value={currentRouterConfig.upstream.host}
                         placeholder="127.0.0.1"
@@ -2407,10 +2468,10 @@ function App() {
                         }}
                       />
                     </label>
-                    <label className="field">
+                    <label className={fieldClass}>
                       <span>Port</span>
                       <input
-                        className={routerHasLocalChanges ? 'input-dirty' : ''}
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
                         type="number"
                         min="1"
                         max="65535"
@@ -2424,12 +2485,12 @@ function App() {
                       />
                     </label>
                   </div>
-                  <div className="router-note">
+                  <div className={noteClass}>
                     In the Docker Compose deployment, proxy-router uses host networking so a host-side upstream proxy
                     can use
                     <strong> 127.0.0.1</strong>.
                   </div>
-                  <div className="button-row">
+                  <div className={buttonRowClass}>
                     <button
                       type="button"
                       onClick={triggerUpstreamCheck}
@@ -2440,45 +2501,45 @@ function App() {
                         : 'Check upstream now'}
                     </button>
                   </div>
-                  <div className="router-summary">
-                    <div className="mini-card">
-                      <div className="mini-label">Connectivity</div>
-                      <div className="mini-value">
+                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
+                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                      <div className="text-xs text-[#6a6f73]">Connectivity</div>
+                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
                         <span className={buildUpstreamConnectivityPillClass(upstreamStatus)}>
                           {buildUpstreamConnectivityLabel(upstreamStatus)}
                         </span>
                       </div>
-                      <div className="router-note">
+                      <div className={noteClass}>
                         {upstreamStatus.connectivity.message}
                         {upstreamStatus.connectivity.checked_at
                           ? ` Checked at ${formatStatusDateTime(upstreamStatus.connectivity.checked_at)}.`
                           : ''}
                       </div>
                     </div>
-                    <div className="mini-card">
-                      <div className="mini-label">Real traffic</div>
-                      <div className="mini-value">{buildUpstreamTrafficHeadline(upstreamStatus)}</div>
+                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                      <div className="text-xs text-[#6a6f73]">Real traffic</div>
+                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">{buildUpstreamTrafficHeadline(upstreamStatus)}</div>
                       {buildUpstreamTrafficNotes(upstreamStatus).map((note) => (
-                        <div className="router-note" key={note}>
+                        <div className={noteClass} key={note}>
                           {note}
                         </div>
                       ))}
                     </div>
                   </div>
 
-                  <div className="router-summary">
+                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
                     {routerSummaryItems.map(([label, value]) => (
-                      <div className="mini-card" key={label}>
-                        <div className="mini-label">{label}</div>
-                        <div className="mini-value">{value}</div>
+                      <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3" key={label}>
+                        <div className="text-xs text-[#6a6f73]">{label}</div>
+                        <div className="mt-1 [overflow-wrap:anywhere] font-bold">{value}</div>
                       </div>
                     ))}
                   </div>
 
-                  <div className="router-note">Auto proxy failing domains</div>
-                  <label className="checkbox-row">
+                  <div className={noteClass}>Auto proxy failing domains</div>
+                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                     <input
-                      className={routerHasLocalChanges ? 'input-dirty' : ''}
+                      className={cx(routerHasLocalChanges && dirtyInputClass)}
                       type="checkbox"
                       checked={currentRouterConfig.auto_proxy_failures.enabled}
                       onChange={(event) => {
@@ -2489,22 +2550,23 @@ function App() {
                     />
                     <span>Probe failing domains with the upstream proxy before enabling auto proxy</span>
                   </label>
-                  <div className="router-note">
+                  <div className={noteClass}>
                     Policy: 2 direct failures trigger one proxy probe. If the probe succeeds, the domain is auto-routed
                     through proxy using the escalating schedule 1h, 1d, 7d, 30d, 90d. A longer duration is only earned
                     after the previous duration fully expires. If the probe fails, the domain stays in Failed requests
                     for manual review until a later direct or proxy success clears it.
                   </div>
 
-                  <div className="router-note">Ignored failure domains for the selected rules target</div>
-                  <div className="chip-list">
+                  <div className={noteClass}>Ignored failure domains for the selected rules target</div>
+                  <div className={chipListClass}>
                     {ignoredDomains.length ? (
                       ignoredDomains.map((item) => (
-                        <div className="chip" key={`${item.scope}-${item.domain}`}>
+                        <div className={chipClass} key={`${item.scope}-${item.domain}`}>
                           <span>{`${item.scope_label}: ${item.domain}`}</span>
                           <button
                             type="button"
                             aria-label={`Remove ${item.domain}`}
+                            className={chipButtonClass}
                             onClick={() => {
                               const nextConfig = cloneJson(currentRouterConfig)
                               const targetScope = getRoutingTargetById(nextConfig, item.scope) || nextConfig
@@ -2521,19 +2583,19 @@ function App() {
                         </div>
                       ))
                     ) : (
-                      <div className="muted">No ignored domains yet.</div>
+                      <div className={mutedClass}>No ignored domains yet.</div>
                     )}
                   </div>
                 </section>
 
-                <section className="router-rules">
-                  <div className="panel-header">
+                <section className={cx(subpanelClass, 'col-span-full lg:col-span-8')}>
+                  <div className={panelHeaderClass}>
                     <h3>Rules</h3>
-                    <div className="button-row tight-row">
+                    <div className={tightButtonRowClass}>
                       <button id="add-rule-button" type="button" onClick={() => addRule()}>
                         Add rule
                       </button>
-                      <button className="warn" id="clear-rules-button" type="button" onClick={clearCurrentScopeRules}>
+                      <button className={warnButtonClass} id="clear-rules-button" type="button" onClick={clearCurrentScopeRules}>
                         Clear rules
                       </button>
                       <button id="export-rules-button" type="button" onClick={exportRulesConfig}>
@@ -2542,8 +2604,8 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="controls top-tight">
-                    <label className="control control-wide">
+                  <div className={cx(controlsClass, 'mt-3')}>
+                    <label className={cx(controlClass, 'sm:min-w-64')}>
                       <span>Edit rules for</span>
                       <select
                         value={safeEditorProfileId}
@@ -2562,10 +2624,10 @@ function App() {
                         ))}
                       </select>
                     </label>
-                    <label className="control">
+                    <label className={controlClass}>
                       <span>Default action</span>
                       <select
-                        className={routerHasLocalChanges ? 'input-dirty' : ''}
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
                         value={currentEditorTarget.default_action}
                         onChange={(event) => {
                           const nextConfig = cloneJson(currentRouterConfig)
@@ -2578,7 +2640,7 @@ function App() {
                         <option value="proxy">Proxy</option>
                       </select>
                     </label>
-                    <label className="control control-search">
+                    <label className={cx(controlClass, 'sm:min-w-80')}>
                       <span>Search rules</span>
                       <input
                         type="search"
@@ -2593,7 +2655,7 @@ function App() {
                   </div>
 
                   {currentActiveProfileId !== DEFAULT_ROUTING_PROFILE_ID ? (
-                    <div className="router-note section-gap">
+                    <div className={cx(noteClass, 'mt-4')}>
                       Active network profile:
                       <strong>{` ${currentActiveProfileLabel}`}</strong>
                       {activeProfileAutoRules.length
@@ -2603,7 +2665,7 @@ function App() {
                   ) : null}
 
                   {editorDiffersFromActiveProfile && currentActiveProfileId !== DEFAULT_ROUTING_PROFILE_ID ? (
-                    <div className="button-row tight-row">
+                    <div className={tightButtonRowClass}>
                       <button
                         type="button"
                         onClick={() => {
@@ -2622,17 +2684,17 @@ function App() {
                   ) : null}
 
                   {activeProfileAutoRules.length ? (
-                    <div className="chip-list">
+                    <div className={chipListClass}>
                       {activeProfileAutoRules.map((rule) => (
-                        <div className="chip" key={`${currentActiveProfileId}-${rule.pattern}`}>
+                        <div className={chipClass} key={`${currentActiveProfileId}-${rule.pattern}`}>
                           <span>{rule.pattern}</span>
                         </div>
                       ))}
                     </div>
                   ) : null}
 
-                  <div className="failure-controls top-tight">
-                    <div className="muted">
+                  <div className="mt-3 mb-2 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                    <div className={mutedClass}>
                       {orderedRules.length
                         ? currentRulesSearchTerm
                           ? `${orderedRules.length} of ${rulesEntries.length} rules match`
@@ -2641,7 +2703,7 @@ function App() {
                           ? `No rules match "${currentRulesSearchTerm}".`
                           : 'No rules yet.'}
                     </div>
-                    <div className="pager">
+                    <div className="grid w-full grid-cols-1 items-center gap-2 min-[361px]:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:w-auto sm:flex sm:flex-wrap">
                       <button
                         id="rules-prev-button"
                         type="button"
@@ -2650,7 +2712,7 @@ function App() {
                       >
                         Previous
                       </button>
-                      <span className="muted">{`Page ${rulesPage} / ${totalRulePages}`}</span>
+                      <span className={mutedClass}>{`Page ${rulesPage} / ${totalRulePages}`}</span>
                       <button
                         id="rules-next-button"
                         type="button"
@@ -2662,7 +2724,7 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="table-wrap">
+                  <div className={tableWrapClass}>
                     <table>
                       <thead>
                         <tr>
@@ -2684,7 +2746,7 @@ function App() {
                             return (
                               <tr key={`${entry.scope}-${entry.index}-${rule.pattern}-${rule.note}`}>
                                 <td>
-                                  <span className="rule-pill">{entry.scope_label}</span>
+                                  <span className={rulePillClass}>{entry.scope_label}</span>
                                 </td>
                                 <td>
                                   <input
@@ -2698,7 +2760,7 @@ function App() {
                                 </td>
                                 <td>
                                   <input
-                                    className={rule.source === 'auto' ? 'rule-readonly' : ''}
+                                    className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     type="text"
                                     value={rule.pattern}
                                     placeholder="gigabyte.com"
@@ -2710,7 +2772,7 @@ function App() {
                                 </td>
                                 <td>
                                   <select
-                                    className={rule.source === 'auto' ? 'rule-readonly' : ''}
+                                    className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     value={rule.match}
                                     disabled={rule.source === 'auto'}
                                     onChange={(event) =>
@@ -2724,7 +2786,7 @@ function App() {
                                 </td>
                                 <td>
                                   <select
-                                    className={rule.source === 'auto' ? 'rule-readonly' : ''}
+                                    className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     value={rule.action}
                                     disabled={rule.source === 'auto'}
                                     onChange={(event) =>
@@ -2737,8 +2799,8 @@ function App() {
                                   </select>
                                 </td>
                                 <td>
-                                  <div className="rule-meta">
-                                    <span className={`rule-pill ${rule.source === 'auto' ? 'rule-pill-auto' : ''}`}>
+                                  <div className={ruleMetaClass}>
+                                    <span className={cx(rulePillClass, rule.source === 'auto' && autoRulePillClass)}>
                                       {rule.source === 'auto' ? 'Auto' : 'Manual'}
                                     </span>
                                     <small>{rule.source === 'auto' ? 'Auto-managed' : 'User-managed'}</small>
@@ -2746,12 +2808,12 @@ function App() {
                                 </td>
                                 <td>
                                   {rule.source === 'auto' ? (
-                                    <div className="rule-meta">
+                                    <div className={ruleMetaClass}>
                                       <strong>{rule.duration}</strong>
                                       <small>{formatRuleExpiry(rule, nowMs)}</small>
                                     </div>
                                   ) : (
-                                    <div className="rule-meta">
+                                    <div className={ruleMetaClass}>
                                       <select
                                         value={rule.duration}
                                         onChange={(event) =>
@@ -2770,7 +2832,7 @@ function App() {
                                 </td>
                                 <td>
                                   <input
-                                    className={rule.source === 'auto' ? 'rule-readonly' : ''}
+                                    className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     type="text"
                                     value={rule.note}
                                     placeholder="optional note"
@@ -2780,7 +2842,7 @@ function App() {
                                     }
                                   />
                                 </td>
-                                <td className="rule-actions">
+                                <td className={ruleActionsClass}>
                                   {rule.source === 'auto' ? (
                                     <button type="button" onClick={() => ignoreAutoRule(entry.scope, entry.index)}>
                                       Ignore
@@ -2809,7 +2871,7 @@ function App() {
                           })
                         ) : (
                           <tr>
-                            <td colSpan="9" className="empty">
+                            <td colSpan="9" className="pt-2 text-[#6a6f73]">
                               {currentRulesSearchTerm
                                 ? 'No rules match the current search.'
                                 : 'No rules yet. Add one to override the default action.'}
@@ -2827,22 +2889,22 @@ function App() {
       ) : null}
 
       {activeTab === 'quotas' ? (
-        <section className="tab-panel is-active">
-          <section className="grid">
-            <section className="panel quotas">
-              <div className="panel-header">
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
                 <div>
                   <h2>Quotas</h2>
-                  <div className="router-note">
+                  <div className={noteClass}>
                     Default quotas apply to every device unless a custom limit or exemption matches first.
                   </div>
                 </div>
               </div>
 
-              <div className="router-note">Default traffic quota for all devices</div>
-              <label className="checkbox-row">
+              <div className={noteClass}>Default traffic quota for all devices</div>
+              <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                 <input
-                  className={routerHasLocalChanges ? 'input-dirty' : ''}
+                  className={cx(routerHasLocalChanges && dirtyInputClass)}
                   type="checkbox"
                   checked={currentRouterConfig.default_client_traffic_limit.enabled}
                   onChange={(event) => {
@@ -2853,11 +2915,11 @@ function App() {
                 />
                 <span>Enable default quota for every device</span>
               </label>
-              <div className="field-grid">
-                <label className="field">
+              <div className={fieldGridClass}>
+                <label className={fieldClass}>
                   <span>Last hour (MB)</span>
                   <input
-                    className={routerHasLocalChanges ? 'input-dirty' : ''}
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
                     type="number"
                     min="1"
                     value={currentRouterConfig.default_client_traffic_limit.max_past_hour_mb ?? ''}
@@ -2871,10 +2933,10 @@ function App() {
                     }}
                   />
                 </label>
-                <label className="field">
+                <label className={fieldClass}>
                   <span>Last 3h (MB)</span>
                   <input
-                    className={routerHasLocalChanges ? 'input-dirty' : ''}
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
                     type="number"
                     min="1"
                     value={currentRouterConfig.default_client_traffic_limit.max_past_3h_mb ?? ''}
@@ -2888,10 +2950,10 @@ function App() {
                     }}
                   />
                 </label>
-                <label className="field">
+                <label className={fieldClass}>
                   <span>Note</span>
                   <input
-                    className={routerHasLocalChanges ? 'input-dirty' : ''}
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
                     type="text"
                     value={currentRouterConfig.default_client_traffic_limit.note || ''}
                     placeholder="optional note"
@@ -2904,21 +2966,21 @@ function App() {
                 </label>
               </div>
 
-              <div className="router-note">
+              <div className={noteClass}>
                 Custom client IP or CIDR limits override the default. Exemptions override both limits.
               </div>
 
-              <div className="panel-header section-gap">
+              <div className={cx(panelHeaderClass, 'mt-4')}>
                 <h3>Client traffic limits</h3>
                 <button id="add-client-limit-button" type="button" onClick={() => addClientTrafficLimit()}>
                   Add limit
                 </button>
               </div>
-              <div className="router-note">
+              <div className={noteClass}>
                 Match one client IP or CIDR and cap its traffic over the last hour and last 3 hours.
               </div>
 
-              <div className="table-wrap">
+              <div className={tableWrapClass}>
                 <table>
                   <thead>
                     <tr>
@@ -2989,7 +3051,7 @@ function App() {
                               onChange={(event) => updateClientTrafficLimitField(index, 'note', event.target.value)}
                             />
                           </td>
-                          <td className="rule-actions">
+                          <td className={ruleActionsClass}>
                             <button
                               type="button"
                               onClick={() => {
@@ -3007,7 +3069,7 @@ function App() {
                       ))
                     ) : (
                       <tr>
-                        <td colSpan="6" className="empty">
+                        <td colSpan="6" className="pt-2 text-[#6a6f73]">
                           No client traffic limits yet.
                         </td>
                       </tr>
@@ -3016,17 +3078,17 @@ function App() {
                 </table>
               </div>
 
-              <div className="panel-header section-gap">
+              <div className={cx(panelHeaderClass, 'mt-4')}>
                 <h3>Quota exemptions</h3>
                 <button id="add-client-exemption-button" type="button" onClick={() => addClientTrafficExemption()}>
                   Add exemption
                 </button>
               </div>
-              <div className="router-note">
+              <div className={noteClass}>
                 Use exemptions to exclude devices permanently or suspend quota enforcement for a limited time such as 2h.
               </div>
 
-              <div className="table-wrap">
+              <div className={tableWrapClass}>
                 <table>
                   <thead>
                     <tr>
@@ -3074,7 +3136,7 @@ function App() {
                             </select>
                           </td>
                           <td>
-                            <div className="rule-meta">
+                            <div className={ruleMetaClass}>
                               <strong>{exemption.expires_at ? new Date(exemption.expires_at).toLocaleString() : 'Permanent'}</strong>
                               <small>{formatExemptionExpiry(exemption, nowMs)}</small>
                             </div>
@@ -3087,7 +3149,7 @@ function App() {
                               onChange={(event) => updateClientTrafficExemptionField(index, 'note', event.target.value)}
                             />
                           </td>
-                          <td className="rule-actions">
+                          <td className={ruleActionsClass}>
                             <button
                               type="button"
                               onClick={() => {
@@ -3105,7 +3167,7 @@ function App() {
                       ))
                     ) : (
                       <tr>
-                        <td colSpan="6" className="empty">
+                        <td colSpan="6" className="pt-2 text-[#6a6f73]">
                           No quota exemptions yet.
                         </td>
                       </tr>
@@ -3115,10 +3177,10 @@ function App() {
               </div>
             </section>
 
-            <section className="panel clients">
+            <section className={cx(panelClass, 'col-span-full')}>
               <h2>By device</h2>
               {dashboardSnapshot.totals_by_client.length ? (
-                <div className="table-wrap">
+                <div className={tableWrapClass}>
                   <table>
                     <thead>
                       <tr>
@@ -3187,7 +3249,7 @@ function App() {
                   </table>
                 </div>
               ) : (
-                <div className="empty">No client traffic has been recorded yet.</div>
+                <div className="pt-2 text-[#6a6f73]">No client traffic has been recorded yet.</div>
               )}
             </section>
           </section>
@@ -3195,20 +3257,20 @@ function App() {
       ) : null}
 
       {activeTab === 'failures' ? (
-        <section className="tab-panel is-active">
-          <section className="grid">
-            <section className="panel failures">
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
               <h2>Failed requests</h2>
-              <div className="router-note">
+              <div className={noteClass}>
                 Grouped by effective domain. Ignore noisy domains or add direct/proxy rules from the latest failure group.
               </div>
-              <div className="failure-controls">
-                <div className="muted">
+              <div className="mt-3 mb-2 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                <div className={mutedClass}>
                   {`${failureView.groups.length} grouped domains shown${
                     failureView.ignoredGroups.length ? ` · ${failureView.ignoredGroups.length} ignored` : ''
                   }${failureView.handledCount ? ` · ${failureView.handledCount} handled by local rules` : ''}`}
                 </div>
-                <div className="pager">
+                <div className="grid w-full grid-cols-1 items-center gap-2 min-[361px]:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:w-auto sm:flex sm:flex-wrap">
                   <button
                     type="button"
                     disabled={failurePage <= 1}
@@ -3216,7 +3278,7 @@ function App() {
                   >
                     Previous
                   </button>
-                  <span className="muted">{`Page ${failurePage} / ${totalFailurePages}`}</span>
+                  <span className={mutedClass}>{`Page ${failurePage} / ${totalFailurePages}`}</span>
                   <button
                     type="button"
                     disabled={failurePage >= totalFailurePages}
@@ -3228,7 +3290,7 @@ function App() {
               </div>
 
               {failurePageItems.length ? (
-                <div className="table-wrap">
+                <div className={tableWrapClass}>
                   <table>
                     <thead>
                       <tr>
@@ -3246,10 +3308,10 @@ function App() {
                       {failurePageItems.map((group) => (
                         <tr key={group.group_key}>
                           <td>{group.latest_timestamp}</td>
-                          <td className="destination">
+                          <td className="max-w-md break-words">
                             <strong>{group.domain || group.group_key}</strong>
                             <br />
-                            <span className="muted">{`${group.host_count} host(s) · latest ${
+                            <span className={mutedClass}>{`${group.host_count} host(s) · latest ${
                               group.host || group.domain || group.group_key
                             }`}</span>
                           </td>
@@ -3258,7 +3320,7 @@ function App() {
                           <td>{group.client_count}</td>
                           <td>{group.route_label || 'direct'}</td>
                           <td>{group.latest_error}</td>
-                          <td className="rule-actions">
+                          <td className={ruleActionsClass}>
                             <button
                               type="button"
                               onClick={() =>
@@ -3313,7 +3375,7 @@ function App() {
                               Direct domain
                             </button>
                             <button
-                              className="warn"
+                              className={warnButtonClass}
                               type="button"
                               onClick={() =>
                                 addRule({
@@ -3330,7 +3392,7 @@ function App() {
                             >
                               Block domain
                             </button>
-                            <button className="warn" type="button" onClick={() => ignoreFailureHost(group.domain || group.group_key)}>
+                            <button className={warnButtonClass} type="button" onClick={() => ignoreFailureHost(group.domain || group.group_key)}>
                               Ignore
                             </button>
                           </td>
@@ -3340,7 +3402,7 @@ function App() {
                   </table>
                 </div>
               ) : (
-                <div className="empty">
+                <div className="pt-2 text-[#6a6f73]">
                   {failureView.ignoredGroups.length
                     ? 'All failed domains are currently ignored.'
                     : failureView.handledCount
@@ -3349,7 +3411,7 @@ function App() {
                 </div>
               )}
 
-              <div className="router-note">
+              <div className={noteClass}>
                 {failureView.ignoredGroups.length
                   ? `Ignored domains: ${failureView.ignoredGroups
                       .map((item) => item.domain || item.group_key)
@@ -3360,6 +3422,7 @@ function App() {
           </section>
         </section>
       ) : null}
+      </div>
     </main>
   )
 }

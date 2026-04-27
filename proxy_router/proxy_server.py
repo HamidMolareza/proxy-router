@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import errno
+import hashlib
 import html
 import http.client
 import json
@@ -20,6 +22,29 @@ from .constants import *
 from .output import debug_exception, debug_log, log_event
 from .records import UsageHistoryCache
 from .util import *
+
+
+def encode_websocket_text_frame(payload_text: str) -> bytes:
+    payload = payload_text.encode("utf-8")
+    payload_length = len(payload)
+    if payload_length < 126:
+        header = bytes([0x81, payload_length])
+    elif payload_length < 65536:
+        header = bytes([0x81, 126]) + payload_length.to_bytes(2, "big")
+    else:
+        header = bytes([0x81, 127]) + payload_length.to_bytes(8, "big")
+    return header + payload
+
+
+def build_client_live_update_message(server, client_ip: str, range_key: str, event_summary, *, initial: bool = False):
+    revision = 0 if initial else int(event_summary.get("revision", 0))
+    return {
+        "type": "client_snapshot",
+        "revision": revision,
+        "initial": initial,
+        "reasons": [] if initial else list(event_summary.get("reasons") or []),
+        "snapshot": build_client_portal_snapshot(server, client_ip, range_key=range_key),
+    }
 
 class PreconnectedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, port=None, *, preconnected_socket, timeout=None):
@@ -487,6 +512,66 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             content_type="application/json; charset=utf-8",
         )
 
+    def _is_websocket_upgrade(self) -> bool:
+        upgrade = str(self.headers.get("Upgrade") or "").strip().lower()
+        connection = str(self.headers.get("Connection") or "").strip().lower()
+        return upgrade == "websocket" and "upgrade" in connection
+
+    def _send_websocket_json(self, payload):
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        self.connection.sendall(encode_websocket_text_frame(body))
+
+    def _handle_client_portal_live_websocket(self, *, range_key: str):
+        websocket_key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not websocket_key:
+            self.send_error(400, "Missing Sec-WebSocket-Key header")
+            return
+
+        accept_seed = websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept_value = base64.b64encode(hashlib.sha1(accept_seed.encode("utf-8")).digest()).decode("ascii")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_value)
+        self.end_headers()
+
+        try:
+            self.connection.settimeout(DASHBOARD_LIVE_HEARTBEAT_SECONDS + 5.0)
+        except OSError:
+            pass
+
+        client_ip = self.client_address[0]
+        last_revision = self.server.runtime.live_updates.current_revision()
+        self._send_websocket_json(
+            build_client_live_update_message(
+                self.server,
+                client_ip,
+                range_key,
+                {"revision": last_revision},
+                initial=True,
+            )
+        )
+
+        while True:
+            event_summary = self.server.runtime.live_updates.wait_for_changes(
+                last_revision,
+                timeout=DASHBOARD_LIVE_HEARTBEAT_SECONDS,
+            )
+            if event_summary is None:
+                self._send_websocket_json(
+                    {
+                        "type": "heartbeat",
+                        "revision": last_revision,
+                    }
+                )
+                continue
+
+            last_revision = int(event_summary["revision"])
+            self._send_websocket_json(
+                build_client_live_update_message(self.server, client_ip, range_key, event_summary)
+            )
+
     def _handle_client_portal_request(self, scheme: str, host: str, port: int, target_path: str) -> bool:
         if self.command not in {"GET", "HEAD"} or scheme != "http":
             return False
@@ -501,9 +586,26 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         html_paths = {"/", "/index.html", "/client", "/client/"}
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
+        live_paths = {"/api/client/live", "/client.live"}
 
         if route_path == "/favicon.ico":
             self._send_body_response(204, "No Content", None, content_type="image/x-icon")
+            return True
+
+        range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
+        if route_path in live_paths:
+            if not self._is_websocket_upgrade():
+                self._send_body_response(
+                    400,
+                    "Bad Request",
+                    b"Expected a WebSocket upgrade request\n",
+                    content_type="text/plain; charset=utf-8",
+                )
+                return True
+            try:
+                self._handle_client_portal_live_websocket(range_key=range_key)
+            except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+                return True
             return True
 
         if route_path not in html_paths and route_path not in json_paths:
@@ -517,7 +619,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return True
             return False
 
-        range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
         payload = build_client_portal_snapshot(
             self.server,
             self.client_address[0],
@@ -1795,46 +1896,288 @@ def render_client_portal_html(snapshot) -> str:
     active_connections = html.escape(str(totals.get("active_connections") or 0))
     last_seen = html.escape(format_portal_timestamp_text(totals.get("last_seen_at")))
     last_range_json_url = f"/api/client.json?range={html.escape(range_key)}"
+    live_script = """
+  <script>
+    (() => {
+      const rangeParams = new URLSearchParams(window.location.search);
+      const activeRange = rangeParams.get("range") || "24h";
+      const rangeQuery = `?range=${encodeURIComponent(activeRange)}`;
+      const liveStatus = document.getElementById("live-status");
+      let reconnectTimer = null;
+
+      function setText(id, value) {
+        const element = document.getElementById(id);
+        if (element) {
+          element.textContent = value == null || value === "" ? "0" : String(value);
+        }
+      }
+
+      function escapeHtml(value) {
+        return String(value == null ? "" : value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function formatMb(bytes) {
+        return `${(Number(bytes || 0) / 1000000).toFixed(2)} MB`;
+      }
+
+      function formatDuration(seconds) {
+        const remaining = Math.max(1, Number.parseInt(seconds || 0, 10));
+        const days = Math.floor(remaining / 86400);
+        const hours = Math.floor((remaining % 86400) / 3600);
+        const minutes = Math.floor((remaining % 3600) / 60);
+        const secs = remaining % 60;
+        const parts = [];
+        if (days) parts.push(`${days}d`);
+        if (hours) parts.push(`${hours}h`);
+        if (minutes) parts.push(`${minutes}m`);
+        if (secs && !hours && !days) parts.push(`${secs}s`);
+        return parts.join(" ") || "under a minute";
+      }
+
+      function formatTimestamp(value) {
+        if (!value) return "Never";
+        const parsed = new Date(String(value));
+        if (Number.isNaN(parsed.getTime())) return String(value);
+        return parsed.toLocaleString();
+      }
+
+      function quotaStatusText(quota) {
+        const limit = quota && quota.limit ? quota.limit : null;
+        if (quota && quota.exempt) return "Exempt from quota";
+        if (limit && quota && quota.allowed === false) {
+          return `Blocked for about ${formatDuration(quota.retry_after_seconds)}`;
+        }
+        if (limit) return "Within quota";
+        return "No quota configured";
+      }
+
+      function limitScopeText(quota) {
+        const limit = quota && quota.limit ? quota.limit : {};
+        if (quota && quota.exempt) return "Exempt device";
+        if (limit.scope === "default") return "Default quota";
+        if (limit.scope === "custom") return "Custom quota";
+        return "No quota";
+      }
+
+      function renderQuotaRows(quota) {
+        const limit = quota && quota.limit ? quota.limit : {};
+        const usage = quota && quota.usage ? quota.usage : {};
+        const exceeded = new Set((quota && quota.exceeded_windows ? quota.exceeded_windows : []).map((item) => item.key));
+        const windows = [
+          ["1h", "Past Hour", "max_past_hour_bytes"],
+          ["3h", "Past 3 Hours", "max_past_3h_bytes"],
+        ];
+        return windows.map(([key, label, limitField]) => {
+          const usedBytes = Number((usage[key] || {}).total_bytes || 0);
+          const limitBytes = limit[limitField];
+          let state = "OK";
+          if (quota && quota.exempt) state = "Exempt";
+          else if (limitBytes == null) state = "Unlimited";
+          else if (exceeded.has(key)) state = "Blocked";
+          return `<tr><td>${label}</td><td>${formatMb(usedBytes)}</td><td>${limitBytes == null ? "Unlimited" : formatMb(limitBytes)}</td><td>${state}</td></tr>`;
+        }).join("");
+      }
+
+      function setRows(id, rows, emptyHtml) {
+        const element = document.getElementById(id);
+        if (element) {
+          element.innerHTML = rows.length ? rows.join("") : emptyHtml;
+        }
+      }
+
+      function updatePortal(snapshot) {
+        if (!snapshot) return;
+        const totals = snapshot.totals || {};
+        const history = snapshot.history || {};
+        const historySummary = history.summary || {};
+        const quota = snapshot.quota || {};
+        const limit = quota.limit || {};
+        const profile = snapshot.active_profile || {};
+        const quotaText = quotaStatusText(quota);
+
+        setText("client-ip", snapshot.client || "unknown");
+        setText("active-profile", profile.name || "Shared");
+        setText("quota-status", quotaText);
+        setText("updated-at", formatTimestamp(snapshot.requested_at));
+        setText("total-data", formatMb(totals.total_bytes));
+        setText("total-requests", `${totals.count || 0} recorded requests`);
+        setText("history-range-title", history.range_title || "Selected range");
+        setText("history-total", formatMb(historySummary.total_bytes));
+        setText("history-requests", `${historySummary.count || 0} requests in the selected range`);
+        setText("active-connections", totals.active_connections || 0);
+        setText("last-seen", formatTimestamp(totals.last_seen_at));
+        setText("limit-scope", limitScopeText(quota));
+
+        const banner = document.getElementById("quota-banner");
+        if (banner) {
+          const parts = [escapeHtml(quotaText)];
+          if (limit && quota.allowed === false) {
+            parts.push(`Retry after about ${escapeHtml(formatDuration(quota.retry_after_seconds))}.`);
+          }
+          if (limit.note) {
+            parts.push(`Admin note: ${escapeHtml(limit.note)}`);
+          }
+          banner.innerHTML = parts.join("<br>");
+        }
+
+        const quotaRows = document.getElementById("quota-rows");
+        if (quotaRows) quotaRows.innerHTML = renderQuotaRows(quota);
+
+        setRows(
+          "destination-rows",
+          (history.top_destinations || []).map((item) =>
+            `<tr><td>${escapeHtml(item.destination || "unknown")}</td><td>${escapeHtml(item.count || 0)}</td><td>${formatMb(item.total_bytes)}</td></tr>`
+          ),
+          '<tr><td colspan="3" class="empty">No traffic recorded in this range yet.</td></tr>',
+        );
+
+        setRows(
+          "request-rows",
+          (snapshot.recent_requests || []).map((item) =>
+            `<tr><td>${escapeHtml(formatTimestamp(item.timestamp))}</td><td>${escapeHtml(item.method || item.kind || "request")}</td><td>${escapeHtml(item.destination || "unknown")}</td><td>${escapeHtml(item.route_label || "direct")}</td><td>${formatMb(item.total_bytes)}</td></tr>`
+          ),
+          '<tr><td colspan="5" class="empty">No recent requests recorded for this device yet.</td></tr>',
+        );
+
+        setRows(
+          "failure-rows",
+          (snapshot.recent_failures || []).map((item) =>
+            `<tr><td>${escapeHtml(formatTimestamp(item.timestamp))}</td><td>${escapeHtml(item.context || "failure")}</td><td>${escapeHtml(item.destination || "unknown")}</td><td>${escapeHtml(item.error || "unknown error")}</td></tr>`
+          ),
+          '<tr><td colspan="4" class="empty">No recent failures recorded for this device.</td></tr>',
+        );
+      }
+
+      function connectLive() {
+        if (!("WebSocket" in window)) {
+          if (liveStatus) liveStatus.textContent = "Live updates unavailable";
+          return;
+        }
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(`${protocol}//${window.location.host}/api/client/live${rangeQuery}`);
+
+        socket.addEventListener("open", () => {
+          if (liveStatus) liveStatus.textContent = "Live updates connected";
+        });
+
+        socket.addEventListener("message", (event) => {
+          let message = null;
+          try {
+            message = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (message.type === "client_snapshot") {
+            updatePortal(message.snapshot);
+            if (liveStatus) liveStatus.textContent = `Live updates connected · ${new Date().toLocaleTimeString()}`;
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          if (liveStatus) liveStatus.textContent = "Live updates disconnected · retrying";
+          window.clearTimeout(reconnectTimer);
+          reconnectTimer = window.setTimeout(connectLive, 3000);
+        });
+
+        socket.addEventListener("error", () => {
+          try {
+            socket.close();
+          } catch {
+            // Ignore close errors while reconnecting.
+          }
+        });
+      }
+
+      connectLive();
+    })();
+  </script>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="15">
   <title>Your proxy usage</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     :root {{
       color-scheme: light;
-      --bg: #f3efe7;
-      --panel: #fffdfa;
-      --ink: #14213d;
-      --muted: #5c677d;
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
       --accent: #0f766e;
       --accent-soft: #dff7f2;
       --warn: #b45309;
       --warn-soft: #fff4e5;
-      --border: #dfd7ca;
+      --border: #e3e7ef;
       --shadow: rgba(20, 33, 61, 0.10);
     }}
-    * {{ box-sizing: border-box; }}
+    *,
+    *::before,
+    *::after {{
+      box-sizing: border-box;
+    }}
     body {{
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(15, 118, 110, 0.12), transparent 34%),
-        radial-gradient(circle at top right, rgba(180, 83, 9, 0.10), transparent 28%),
-        linear-gradient(180deg, #fcfbf8 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
       color: var(--ink);
     }}
-    main {{
-      width: min(1120px, calc(100% - 28px));
-      margin: 24px auto 48px;
+    .container-xl {{
+      width: min(1140px, 100%);
+      margin-right: auto;
+      margin-left: auto;
+    }}
+    .px-3 {{
+      padding-right: 1rem;
+      padding-left: 1rem;
+    }}
+    .py-3 {{
+      padding-top: 1rem;
+      padding-bottom: 1rem;
+    }}
+    .mb-3 {{
+      margin-bottom: 1rem;
+    }}
+    .mt-0 {{
+      margin-top: 0;
+    }}
+    .h-100 {{
+      height: 100%;
+    }}
+    .row {{
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 1rem;
+    }}
+    .layout > .row + .row {{
+      margin-top: 1rem;
+    }}
+    .row > * {{
+      min-width: 0;
+    }}
+    .col-12 {{
+      grid-column: span 12;
+    }}
+    .table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+    .align-middle td,
+    .align-middle th {{
+      vertical-align: middle;
     }}
     .hero {{
       background: linear-gradient(135deg, rgba(15, 118, 110, 0.95), rgba(20, 33, 61, 0.92));
       color: #f8fafc;
-      border-radius: 28px;
+      border-radius: 22px;
       padding: 28px;
       box-shadow: 0 26px 60px var(--shadow);
     }}
@@ -1855,6 +2198,7 @@ def render_client_portal_html(snapshot) -> str:
       max-width: 58rem;
       line-height: 1.6;
       color: rgba(248, 250, 252, 0.9);
+      overflow-wrap: anywhere;
     }}
     .hero-meta {{
       display: flex;
@@ -1869,43 +2213,39 @@ def render_client_portal_html(snapshot) -> str:
       font-weight: 600;
       background: rgba(255, 255, 255, 0.14);
       border: 1px solid rgba(255, 255, 255, 0.18);
+      overflow-wrap: anywhere;
     }}
     .layout {{
-      display: grid;
-      gap: 18px;
       margin-top: 18px;
     }}
-    .cards {{
-      display: grid;
-      gap: 14px;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    }}
-    .card, .panel {{
+    .metric-card, .portal-card {{
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 24px;
+      border-radius: 18px;
       box-shadow: 0 16px 40px rgba(20, 33, 61, 0.06);
     }}
-    .card {{
+    .metric-card {{
       padding: 18px 18px 16px;
+      min-height: 100%;
     }}
-    .card .label {{
+    .metric-card .label {{
       color: var(--muted);
       font-size: 0.88rem;
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }}
-    .card .value {{
+    .metric-card .value {{
       margin-top: 10px;
       font-size: 1.65rem;
       font-weight: 700;
+      overflow-wrap: anywhere;
     }}
-    .card .sub {{
+    .metric-card .sub {{
       margin-top: 6px;
       color: var(--muted);
       font-size: 0.92rem;
     }}
-    .panel {{
+    .portal-card {{
       padding: 20px;
     }}
     .panel-head {{
@@ -1953,23 +2293,32 @@ def render_client_portal_html(snapshot) -> str:
       font-weight: 600;
       line-height: 1.55;
     }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
+    .table-responsive {{
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
     }}
-    th, td {{
+    .portal-table {{
+      min-width: 560px;
+      margin-bottom: 0;
+    }}
+    .portal-table th,
+    .portal-table td {{
       padding: 12px 10px;
       text-align: left;
       border-bottom: 1px solid var(--border);
       vertical-align: top;
+      overflow-wrap: anywhere;
     }}
-    th {{
+    .portal-table th {{
       color: var(--muted);
       font-size: 0.88rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
+      background: #fbfcfe;
     }}
-    tr:last-child td {{
+    .portal-table tr:last-child td {{
       border-bottom: none;
     }}
     .empty {{
@@ -1977,134 +2326,216 @@ def render_client_portal_html(snapshot) -> str:
       text-align: center;
       padding: 18px 12px;
     }}
-    .two-up {{
-      display: grid;
-      gap: 18px;
-      grid-template-columns: 1.1fr 0.9fr;
-    }}
     .note {{
       margin-top: 14px;
       color: var(--muted);
       line-height: 1.6;
+      overflow-wrap: anywhere;
+    }}
+    .live-status {{
+      margin-top: 12px;
+      color: rgba(248, 250, 252, 0.86);
+      font-size: 0.95rem;
+      font-weight: 600;
     }}
     a {{
       color: var(--accent);
     }}
-    @media (max-width: 860px) {{
-      .two-up {{
+    @media (min-width: 576px) {{
+      .px-sm-4 {{
+        padding-right: 1.5rem;
+        padding-left: 1.5rem;
+      }}
+      .py-sm-4 {{
+        padding-top: 1.5rem;
+        padding-bottom: 1.5rem;
+      }}
+      .mb-sm-4 {{
+        margin-bottom: 1.5rem;
+      }}
+      .col-sm-6 {{
+        grid-column: span 6;
+      }}
+    }}
+    @media (min-width: 1200px) {{
+      .col-xl-3 {{
+        grid-column: span 3;
+      }}
+      .col-xl-5 {{
+        grid-column: span 5;
+      }}
+      .col-xl-7 {{
+        grid-column: span 7;
+      }}
+    }}
+    @media (max-width: 575.98px) {{
+      .hero {{
+        border-radius: 16px;
+        padding: 20px;
+      }}
+      h1 {{
+        font-size: 2rem;
+      }}
+      .hero-meta {{
+        display: grid;
         grid-template-columns: 1fr;
+      }}
+      .pill {{
+        width: 100%;
+      }}
+      .portal-card {{
+        padding: 16px;
+      }}
+      .panel-head {{
+        align-items: flex-start;
+      }}
+      .range-links {{
+        width: 100%;
+      }}
+      .range-link {{
+        flex: 1 1 calc(50% - 8px);
+        text-align: center;
+      }}
+      .metric-card .value {{
+        font-size: 1.4rem;
       }}
     }}
   </style>
 </head>
 <body>
-  <main>
-    <section class="hero">
+  <main class="container-xl px-3 px-sm-4 py-3 py-sm-4">
+    <section class="hero mb-3 mb-sm-4">
       <div class="eyebrow">Proxy client portal</div>
       <h1>Your device usage</h1>
-      <p>This page only shows traffic, quota state, and recent failures recorded for the device currently connected as <strong>{client_ip}</strong>. It refreshes automatically every 15 seconds.</p>
+      <p>This page only shows traffic, quota state, and recent failures recorded for the device currently connected as <strong id="client-ip">{client_ip}</strong>. It updates live while this page is open.</p>
       <div class="hero-meta">
         <div class="pill">Client: {client_ip}</div>
-        <div class="pill">Profile: {active_profile_name}</div>
-        <div class="pill">Quota: {quota_status_text}</div>
-        <div class="pill">Updated: {requested_at}</div>
+        <div class="pill">Profile: <span id="active-profile">{active_profile_name}</span></div>
+        <div class="pill">Quota: <span id="quota-status">{quota_status_text}</span></div>
+        <div class="pill">Updated: <span id="updated-at">{requested_at}</span></div>
       </div>
+      <div class="live-status" id="live-status">Connecting live updates…</div>
     </section>
 
     <div class="layout">
-      <section class="cards">
-        <article class="card">
+      <section class="row g-3">
+        <article class="col-12 col-sm-6 col-xl-3">
+          <div class="metric-card">
           <div class="label">All-time data</div>
-          <div class="value">{total_data}</div>
-          <div class="sub">{total_requests} recorded requests</div>
+          <div class="value" id="total-data">{total_data}</div>
+          <div class="sub" id="total-requests">{total_requests} recorded requests</div>
+          </div>
         </article>
-        <article class="card">
-          <div class="label">{history_range_title}</div>
-          <div class="value">{history_total}</div>
-          <div class="sub">{history_requests} requests in the selected range</div>
+        <article class="col-12 col-sm-6 col-xl-3">
+          <div class="metric-card">
+          <div class="label" id="history-range-title">{history_range_title}</div>
+          <div class="value" id="history-total">{history_total}</div>
+          <div class="sub" id="history-requests">{history_requests} requests in the selected range</div>
+          </div>
         </article>
-        <article class="card">
+        <article class="col-12 col-sm-6 col-xl-3">
+          <div class="metric-card">
           <div class="label">Active connections</div>
-          <div class="value">{active_connections}</div>
+          <div class="value" id="active-connections">{active_connections}</div>
           <div class="sub">Open connections from this device right now</div>
+          </div>
         </article>
-        <article class="card">
+        <article class="col-12 col-sm-6 col-xl-3">
+          <div class="metric-card">
           <div class="label">Last seen</div>
-          <div class="value" style="font-size:1.1rem">{last_seen}</div>
+          <div class="value" id="last-seen" style="font-size:1.1rem">{last_seen}</div>
           <div class="sub">Most recent recorded usage</div>
+          </div>
         </article>
       </section>
 
-      <section class="two-up">
-        <article class="panel">
+      <section class="row g-3 mt-0">
+        <article class="col-12 col-xl-7">
+          <div class="portal-card h-100">
           <div class="panel-head">
             <h2>Quota status</h2>
-            <span class="muted">{limit_scope}</span>
+            <span class="muted" id="limit-scope">{limit_scope}</span>
           </div>
-          <div class="quota-banner">
+          <div class="quota-banner" id="quota-banner">
             {quota_status_text}
             {f"<br>Retry after about {html.escape(format_duration_seconds(quota.get('retry_after_seconds')))}." if limit and not quota.get('allowed', True) else ""}
             {f"<br>Admin note: {limit_note}" if limit_note else ""}
           </div>
-          <table>
+          <div class="table-responsive">
+          <table class="table portal-table align-middle">
             <thead>
               <tr><th>Window</th><th>Used</th><th>Limit</th><th>Status</th></tr>
             </thead>
-            <tbody>
+            <tbody id="quota-rows">
               {''.join(quota_rows)}
             </tbody>
           </table>
+          </div>
           <p class="note">Portal URL while using the proxy: <a href="{portal_url}">{portal_url}</a>. Raw JSON: <a href="{last_range_json_url}">{last_range_json_url}</a></p>
+          </div>
         </article>
 
-        <article class="panel">
+        <article class="col-12 col-xl-5">
+          <div class="portal-card h-100">
           <div class="panel-head">
             <h2>Top destinations</h2>
             <div class="range-links">{''.join(range_links)}</div>
           </div>
-          <table>
+          <div class="table-responsive">
+          <table class="table portal-table align-middle">
             <thead>
               <tr><th>Destination</th><th>Requests</th><th>Data</th></tr>
             </thead>
-            <tbody>
+            <tbody id="destination-rows">
               {''.join(destination_rows)}
             </tbody>
           </table>
+          </div>
+          </div>
         </article>
       </section>
 
-      <section class="two-up">
-        <article class="panel">
+      <section class="row g-3 mt-0">
+        <article class="col-12 col-xl-7">
+          <div class="portal-card h-100">
           <div class="panel-head">
             <h2>Recent requests</h2>
             <span class="muted">Latest usage log entries for this device</span>
           </div>
-          <table>
+          <div class="table-responsive">
+          <table class="table portal-table align-middle">
             <thead>
               <tr><th>Time</th><th>Method</th><th>Destination</th><th>Route</th><th>Data</th></tr>
             </thead>
-            <tbody>
+            <tbody id="request-rows">
               {''.join(request_rows)}
             </tbody>
           </table>
+          </div>
+          </div>
         </article>
 
-        <article class="panel">
+        <article class="col-12 col-xl-5">
+          <div class="portal-card h-100">
           <div class="panel-head">
             <h2>Recent failures</h2>
             <span class="muted">Newest failure records for this device</span>
           </div>
-          <table>
+          <div class="table-responsive">
+          <table class="table portal-table align-middle">
             <thead>
               <tr><th>Time</th><th>Context</th><th>Destination</th><th>Error</th></tr>
             </thead>
-            <tbody>
+            <tbody id="failure-rows">
               {''.join(failure_rows)}
             </tbody>
           </table>
+          </div>
+          </div>
         </article>
       </section>
     </div>
   </main>
+  {live_script}
 </body>
 </html>"""

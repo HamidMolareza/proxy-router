@@ -145,11 +145,14 @@ Client self-service portal:
 - Devices using the HTTP proxy can open `http://proxy.router/` to view only their own usage and quota data
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - This portal is separate from the admin dashboard and does not expose routing or config controls
+- The portal uses a Bootstrap-based responsive layout for mobile screens
+- The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP
 
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
+- Client self-service portal state is also pushed over a WebSocket instead of a timed page refresh
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
