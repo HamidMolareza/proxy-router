@@ -667,6 +667,7 @@ class SelfEndpoints:
         self.dashboard_connect_host = "127.0.0.1"
         self.dashboard_url = f"http://127.0.0.1:{DASHBOARD_DEFAULT_PORT}/"
         self.proxy_listener_ports = set()
+        self.client_portal_direct_host = "127.0.0.1"
 
     def configure(
         self,
@@ -697,12 +698,21 @@ class SelfEndpoints:
         else:
             self.dashboard_url = None
         self.proxy_listener_ports = {int(port) for port in listener_ports}
+        if bind and bind != "0.0.0.0":
+            self.client_portal_direct_host = normalize_host(bind)
+        elif client_ips:
+            self.client_portal_direct_host = normalize_host(client_ips[0])
+        else:
+            self.client_portal_direct_host = "127.0.0.1"
 
     def is_client_portal_host(self, host: str) -> bool:
         return normalize_host(host) in self.client_portal_aliases
 
     def client_portal_url(self) -> str:
         return f"http://{self.client_portal_primary_host}/"
+
+    def client_portal_live_url(self, port: int) -> str:
+        return f"ws://{self.client_portal_direct_host}:{int(port)}/api/client/live"
 
     def resolve_target_kind(self, host: str, port: int) -> str | None:
         normalized_host = normalize_host(host)

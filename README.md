@@ -146,13 +146,13 @@ Client self-service portal:
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - This portal is separate from the admin dashboard and does not expose routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens
-- The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP
+- The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP; `proxy.router` pages open the socket against the direct listener address to avoid browser-specific WebSocket proxy handling
 
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
-- Client self-service portal state is also pushed over a WebSocket instead of a timed page refresh
+- Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - Transient upstream connection/setup failures are retried briefly before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - `Clear rules` clears only the currently edited scope

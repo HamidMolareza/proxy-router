@@ -333,6 +333,7 @@ class ProtocolServerView:
         self.router_config = server.router_config
         self.runtime = server.runtime
         self.history_cache = server.history_cache
+        self.server_address = server.server_address
 
 
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -1739,6 +1740,7 @@ class RunningDashboard:
 
 def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
     normalized_range = range_key if range_key in HISTORY_RANGE_OPTIONS else HISTORY_DEFAULT_RANGE
+    listener_port = int(getattr(server, "server_address", ("", 0))[1] or 0)
     dashboard_snapshot = server.runtime.dashboard_state.snapshot()
     client_totals = next(
         (
@@ -1778,6 +1780,7 @@ def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
         "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "client": client_ip,
         "portal_url": server.runtime.self_endpoints.client_portal_url(),
+        "client_live_url": server.runtime.self_endpoints.client_portal_live_url(listener_port),
         "history": history,
         "totals": client_totals,
         "recent_requests": recent_requests,
@@ -2046,6 +2049,7 @@ def render_client_portal_html(snapshot) -> str:
     active_connections = html.escape(str(totals.get("active_connections") or 0))
     last_seen = html.escape(format_portal_timestamp_text(totals.get("last_seen_at")))
     last_range_json_url = f"/api/client.json?range={html.escape(range_key)}"
+    client_live_url_json = json.dumps(str(snapshot.get("client_live_url") or ""))
     live_script = """
   <script>
     (() => {
@@ -2053,7 +2057,9 @@ def render_client_portal_html(snapshot) -> str:
       const activeRange = rangeParams.get("range") || "24h";
       const rangeQuery = `?range=${encodeURIComponent(activeRange)}`;
       const liveStatus = document.getElementById("live-status");
+      const directLiveUrl = __CLIENT_PORTAL_LIVE_URL__;
       let reconnectTimer = null;
+      let pollTimer = null;
 
       function setText(id, value) {
         const element = document.getElementById(id);
@@ -2203,16 +2209,60 @@ def render_client_portal_html(snapshot) -> str:
         );
       }
 
-      function connectLive() {
-        if (!("WebSocket" in window)) {
-          if (liveStatus) liveStatus.textContent = "Live updates unavailable";
-          return;
+      function setLiveStatusText(value) {
+        if (liveStatus) liveStatus.textContent = value;
+      }
+
+      function buildLiveSocketUrl() {
+        if (directLiveUrl) {
+          const url = new URL(directLiveUrl);
+          url.search = rangeQuery;
+          return url.toString();
         }
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const socket = new WebSocket(`${protocol}//${window.location.host}/api/client/live${rangeQuery}`);
+        return `${protocol}//${window.location.host}/api/client/live${rangeQuery}`;
+      }
+
+      function schedulePoll(delayMs) {
+        window.clearTimeout(pollTimer);
+        pollTimer = window.setTimeout(pollClientSnapshot, delayMs);
+      }
+
+      async function pollClientSnapshot() {
+        try {
+          const response = await fetch(`/api/client.json${rangeQuery}`, {
+            cache: "no-store",
+            headers: { "Accept": "application/json" },
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          updatePortal(await response.json());
+          setLiveStatusText(`Live updates polling · ${new Date().toLocaleTimeString()}`);
+          schedulePoll(3000);
+        } catch {
+          setLiveStatusText("Live updates polling unavailable · retrying");
+          schedulePoll(5000);
+        }
+      }
+
+      function startPolling() {
+        window.clearTimeout(reconnectTimer);
+        setLiveStatusText("Live updates polling");
+        pollClientSnapshot();
+      }
+
+      function connectLive() {
+        if (!("WebSocket" in window)) {
+          startPolling();
+          return;
+        }
+        const socket = new WebSocket(buildLiveSocketUrl());
+        let socketOpened = false;
 
         socket.addEventListener("open", () => {
-          if (liveStatus) liveStatus.textContent = "Live updates connected";
+          socketOpened = true;
+          setLiveStatusText("Live updates connected");
         });
 
         socket.addEventListener("message", (event) => {
@@ -2224,13 +2274,17 @@ def render_client_portal_html(snapshot) -> str:
           }
           if (message.type === "client_snapshot") {
             updatePortal(message.snapshot);
-            if (liveStatus) liveStatus.textContent = `Live updates connected · ${new Date().toLocaleTimeString()}`;
+            setLiveStatusText(`Live updates connected · ${new Date().toLocaleTimeString()}`);
           }
         });
 
         socket.addEventListener("close", () => {
-          if (liveStatus) liveStatus.textContent = "Live updates disconnected · retrying";
           window.clearTimeout(reconnectTimer);
+          if (!socketOpened) {
+            startPolling();
+            return;
+          }
+          setLiveStatusText("Live updates disconnected · retrying");
           reconnectTimer = window.setTimeout(connectLive, 3000);
         });
 
@@ -2246,7 +2300,7 @@ def render_client_portal_html(snapshot) -> str:
       connectLive();
     })();
   </script>
-"""
+""".replace("__CLIENT_PORTAL_LIVE_URL__", client_live_url_json)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
