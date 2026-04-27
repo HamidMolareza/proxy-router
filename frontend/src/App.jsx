@@ -2359,20 +2359,20 @@ function App() {
                   {historyError ? (
                     <div className="pt-2 text-[#6a6f73]">History data is unavailable right now.</div>
                   ) : historyData.top_destinations.length ? (
-                    <table className="w-full table-fixed">
+                    <table className="w-full table-fixed border-collapse">
                       <thead>
                         <tr>
-                          <th className="w-[58%]">Destination</th>
-                          <th className="w-[18%]">Requests</th>
-                          <th className="w-[24%]">Total</th>
+                          <th className="w-[58%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Destination</th>
+                          <th className="w-[18%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Requests</th>
+                          <th className="w-[24%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Total</th>
                         </tr>
                       </thead>
                       <tbody>
                         {historyData.top_destinations.map((item) => (
                           <tr key={item.destination}>
-                            <td className="max-w-md break-words">{item.destination}</td>
-                            <td className="whitespace-nowrap">{item.count}</td>
-                            <td className="whitespace-nowrap">{formatMb(item.total_bytes)}</td>
+                            <td className="max-w-md break-words border-b border-[#ece5d8] px-2 py-3 align-top">{item.destination}</td>
+                            <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{item.count}</td>
+                            <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{formatMb(item.total_bytes)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -2418,7 +2418,7 @@ function App() {
                   </div>
 
                   <div className={tableWrapClass}>
-                    <table className="min-w-[58rem]">
+                    <table className="min-w-[54rem]">
                       <thead>
                         <tr>
                           <th>Enabled</th>
@@ -2445,8 +2445,9 @@ function App() {
                                   }}
                                 />
                               </td>
-                              <td className="min-w-72">
+                              <td className="w-56 min-w-56">
                                 <input
+                                  className="max-w-56"
                                   type="text"
                                   value={profile.name}
                                   placeholder="Profile name"

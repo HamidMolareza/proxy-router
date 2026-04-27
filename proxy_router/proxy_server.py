@@ -407,6 +407,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         request_started = time.monotonic()
         try:
             host, port = split_host_port(self.path, 443)
+            if self._is_client_portal_connect_target(host, port):
+                self._handle_client_portal_connect_request(host, port)
+                return
             if not self._check_client_traffic_limit(
                 method="CONNECT",
                 destination=f"{host}:{port}",
@@ -563,6 +566,42 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _send_websocket_json(self, payload):
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         self.connection.sendall(encode_websocket_text_frame(body))
+
+    def _is_client_portal_connect_target(self, host: str, port: int) -> bool:
+        if not self.server.runtime.self_endpoints.is_client_portal_host(host):
+            return False
+        return int(port) == 80 or int(port) in self.server.runtime.self_endpoints.proxy_listener_ports
+
+    def _handle_client_portal_connect_request(self, host: str, port: int):
+        self._debug(f"CONNECT client portal tunnel target={host}:{port}")
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+
+        try:
+            self.close_connection = True
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(414)
+                return
+            if not self.raw_requestline:
+                return
+            if not self.parse_request():
+                return
+
+            scheme, inner_host, inner_port, target_path = self._extract_target()
+            if self._handle_client_portal_request(scheme, inner_host, inner_port, target_path):
+                return
+            self._send_body_response(
+                404,
+                "Not Found",
+                b"Not Found\n",
+                content_type="text/plain; charset=utf-8",
+            )
+        finally:
+            self.close_connection = True
 
     def _handle_client_portal_live_websocket(self, *, range_key: str):
         websocket_key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -2596,7 +2635,7 @@ def render_client_portal_html(snapshot) -> str:
         </article>
       </section>
 
-      <section class="content-grid content-grid-even">
+      <section class="content-grid">
         <article>
           <div class="portal-card">
           <div class="panel-head">
