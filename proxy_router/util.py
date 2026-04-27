@@ -1143,6 +1143,38 @@ def build_usage_analyze_parser(prog_name: str) -> argparse.ArgumentParser:
     return parser
 
 
+def detect_local_ipv4_addresses_from_procfs():
+    fib_trie_path = Path("/proc/net/fib_trie")
+    try:
+        lines = fib_trie_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    addresses = []
+    pending_candidate = None
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith(("|-- ", "+-- ")):
+            candidate_text = stripped[4:].strip()
+            try:
+                candidate_ip = ipaddress.ip_address(candidate_text)
+            except ValueError:
+                pending_candidate = None
+                continue
+
+            pending_candidate = candidate_text if candidate_ip.version == 4 else None
+            continue
+
+        if pending_candidate and stripped.startswith("/32 host LOCAL"):
+            addresses.append(pending_candidate)
+            pending_candidate = None
+
+    return addresses
+
+
 def detect_candidate_client_ips():
     candidates = []
 
@@ -1160,6 +1192,8 @@ def detect_candidate_client_ips():
                 candidates.append(sockaddr[0])
     except OSError:
         pass
+
+    candidates.extend(detect_local_ipv4_addresses_from_procfs())
 
     preferred = []
     fallback = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import html
 import http.client
+import json
 import select
 import socket
 import socketserver
@@ -11,11 +12,13 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .constants import *
 from .output import debug_exception, debug_log, log_event
+from .records import UsageHistoryCache
 from .util import *
 
 class PreconnectedHTTPConnection(http.client.HTTPConnection):
@@ -105,6 +108,11 @@ def create_http_proxy_tunnel(proxy_host: str, proxy_port: int, target_host: str,
     except Exception:
         connection.close()
         raise
+
+
+def sanitize_http_header_value(value) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    return " ".join(text.split())
 
 
 def tunnel_bidirectional(left_socket, right_socket):
@@ -205,6 +213,7 @@ class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
         self.client_tracker = ClientTracker(proxy_label, runtime)
         self.router_config = router_config
         self.runtime = runtime
+        self.history_cache = UsageHistoryCache(runtime.usage_log_path)
 
 
 class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
@@ -255,6 +264,7 @@ class ProtocolServerView:
         self.client_tracker = server.client_trackers[proxy_label]
         self.router_config = server.router_config
         self.runtime = server.runtime
+        self.history_cache = server.history_cache
 
 
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -270,6 +280,7 @@ class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServ
         self.debug = debug
         self.router_config = router_config
         self.runtime = runtime
+        self.history_cache = UsageHistoryCache(runtime.usage_log_path)
         self.client_trackers = {
             "http": ClientTracker("http", runtime),
             "socks5": ClientTracker("socks5", runtime),
@@ -455,6 +466,77 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 f"{self._client_label()} - client disconnected before response could be sent",
             )
 
+    def _build_client_traffic_limit_headers(self, evaluation, message: str) -> dict[str, str]:
+        headers = {
+            "X-Proxy-Error": "client-traffic-limit",
+            "X-Proxy-Error-Message": sanitize_http_header_value(message),
+            "X-Proxy-Client": self.client_address[0],
+        }
+        retry_after_seconds = evaluation.get("retry_after_seconds")
+        if retry_after_seconds is not None:
+            headers["Retry-After"] = str(retry_after_seconds)
+            headers["X-Proxy-Retry-After"] = str(retry_after_seconds)
+        return headers
+
+    def _send_json_response(self, payload, *, status: int = 200):
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self._send_body_response(
+            status,
+            "OK" if status == 200 else "Response",
+            body,
+            content_type="application/json; charset=utf-8",
+        )
+
+    def _handle_client_portal_request(self, scheme: str, host: str, port: int, target_path: str) -> bool:
+        if self.command not in {"GET", "HEAD"} or scheme != "http":
+            return False
+
+        self_target_kind = self.server.runtime.self_endpoints.resolve_target_kind(host, port)
+        is_alias_host = self.server.runtime.self_endpoints.is_client_portal_host(host)
+        if not is_alias_host and self_target_kind != "listener":
+            return False
+
+        parsed = urlsplit(target_path or "/")
+        route_path = parsed.path or "/"
+        query = parse_qs(parsed.query)
+        html_paths = {"/", "/index.html", "/client", "/client/"}
+        json_paths = {"/api/client", "/api/client.json", "/client.json"}
+
+        if route_path == "/favicon.ico":
+            self._send_body_response(204, "No Content", None, content_type="image/x-icon")
+            return True
+
+        if route_path not in html_paths and route_path not in json_paths:
+            if is_alias_host:
+                self._send_body_response(
+                    404,
+                    "Not Found",
+                    b"Not Found\n",
+                    content_type="text/plain; charset=utf-8",
+                )
+                return True
+            return False
+
+        range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
+        payload = build_client_portal_snapshot(
+            self.server,
+            self.client_address[0],
+            range_key=range_key,
+        )
+        self._log_http_event(f"served client portal {route_path} for {self.client_address[0]}")
+        if route_path in json_paths or str(first_query_value(query, "format") or "").strip().lower() == "json":
+            self._send_json_response(payload)
+            return True
+
+        document = render_client_portal_html(payload)
+        self._send_body_response(
+            200,
+            "OK",
+            document.encode("utf-8"),
+            content_type="text/html; charset=utf-8",
+        )
+        return True
+
     def _check_client_allowed(self) -> bool:
         if ensure_client_allowed(self.client_address[0], self.server.allowed_networks):
             return True
@@ -510,10 +592,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             matched_rule=None,
             profile_id=DEFAULT_ROUTING_PROFILE_ID,
         )
-        extra_headers = {}
-        retry_after_seconds = evaluation.get("retry_after_seconds")
-        if retry_after_seconds is not None:
-            extra_headers["Retry-After"] = str(retry_after_seconds)
+        extra_headers = self._build_client_traffic_limit_headers(evaluation, message)
 
         if method != "CONNECT" and self._prefers_html_error_response():
             document = render_client_traffic_limit_html(
@@ -523,7 +602,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_body_response(
                 429,
-                "Too Many Requests",
+                "Client Traffic Limit Reached",
                 document.encode("utf-8"),
                 content_type="text/html; charset=utf-8",
                 extra_headers=extra_headers,
@@ -532,7 +611,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         self._send_body_response(
             429,
-            "Too Many Requests",
+            "Client Traffic Limit Reached",
             (message + "\n").encode("utf-8"),
             content_type="text/plain; charset=utf-8",
             extra_headers=extra_headers,
@@ -547,6 +626,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._debug(f"request-line={truncate_for_log(self.requestline)}")
             self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             scheme, host, port, target_path = self._extract_target()
+            if self._handle_client_portal_request(scheme, host, port, target_path):
+                return
             if not self._check_client_traffic_limit(
                 method=self.command,
                 destination=f"{scheme}://{host}:{port}{target_path}",
@@ -1404,6 +1485,60 @@ class RunningDashboard:
     server: socketserver.BaseServer
     thread: threading.Thread
 
+
+def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
+    normalized_range = range_key if range_key in HISTORY_RANGE_OPTIONS else HISTORY_DEFAULT_RANGE
+    dashboard_snapshot = server.runtime.dashboard_state.snapshot()
+    client_totals = next(
+        (
+            item
+            for item in dashboard_snapshot.get("totals_by_client", [])
+            if item.get("client") == client_ip
+        ),
+        None,
+    )
+    if client_totals is None:
+        empty_totals = empty_client_usage_summary()
+        client_totals = {
+            "client": client_ip,
+            "count": empty_totals["count"],
+            "active_connections": 0,
+            "uploaded_bytes": empty_totals["uploaded_bytes"],
+            "downloaded_bytes": empty_totals["downloaded_bytes"],
+            "total_bytes": empty_totals["total_bytes"],
+            "proxy_types": [],
+            "last_seen_at": empty_totals["last_seen_at"],
+        }
+
+    history = server.history_cache.build_history_payload(
+        range_key=normalized_range,
+        client=client_ip,
+    )
+    recent_requests = server.history_cache.recent_records(limit=12, client=client_ip)
+    recent_failures = [
+        item
+        for item in dashboard_snapshot.get("recent_failures", [])
+        if item.get("client") == client_ip
+    ][:12]
+    quota = server.runtime.traffic_quota_manager.evaluate_client(client_ip, server.router_config)
+    router_runtime = server.router_config.runtime_snapshot()
+    active_profile = router_runtime.get("active_profile") or {}
+    return {
+        "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "client": client_ip,
+        "portal_url": server.runtime.self_endpoints.client_portal_url(),
+        "history": history,
+        "totals": client_totals,
+        "recent_requests": recent_requests,
+        "recent_failures": recent_failures,
+        "quota": quota,
+        "active_profile": {
+            "id": active_profile.get("id") or DEFAULT_ROUTING_PROFILE_ID,
+            "name": active_profile.get("name") or "Shared",
+        },
+    }
+
+
 def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination: str) -> str:
     limit = evaluation.get("limit") or {}
     rows = []
@@ -1418,6 +1553,7 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
     retry_after_text = format_duration_seconds(evaluation.get("retry_after_seconds"))
     limit_note = html.escape(limit.get("note", "")) if limit.get("note") else ""
     limit_scope = "Default quota" if limit.get("scope") == "default" else "Custom quota"
+    portal_url = html.escape(f"http://{CLIENT_PORTAL_PRIMARY_HOST}/")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1524,7 +1660,450 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
     </table>
     <div class="note">
       Please wait for older traffic to age out and try again.
+      <br><br>Device portal: <a href="{portal_url}">{portal_url}</a>
       {"<br><br><strong>Admin note:</strong> " + limit_note if limit_note else ""}
+    </div>
+  </main>
+</body>
+</html>"""
+
+
+def format_portal_timestamp_text(value) -> str:
+    parsed = parse_usage_timestamp(value)
+    if parsed is None:
+        return str(value or "Never")
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def render_client_portal_html(snapshot) -> str:
+    client_ip = html.escape(str(snapshot.get("client") or "unknown"))
+    requested_at = html.escape(format_portal_timestamp_text(snapshot.get("requested_at")))
+    portal_url = html.escape(str(snapshot.get("portal_url") or ""))
+    active_profile = snapshot.get("active_profile") or {}
+    active_profile_name = html.escape(str(active_profile.get("name") or "Shared"))
+    totals = snapshot.get("totals") or {}
+    history = snapshot.get("history") or {}
+    quota = snapshot.get("quota") or {}
+    limit = quota.get("limit") or {}
+    recent_requests = list(snapshot.get("recent_requests") or [])
+    recent_failures = list(snapshot.get("recent_failures") or [])
+    top_destinations = list(history.get("top_destinations") or [])
+
+    if quota.get("exempt"):
+        quota_status_text = "Exempt from quota"
+    elif limit and not quota.get("allowed", True):
+        quota_status_text = f"Blocked for about {format_duration_seconds(quota.get('retry_after_seconds'))}"
+    elif limit:
+        quota_status_text = "Within quota"
+    else:
+        quota_status_text = "No quota configured"
+    quota_status_text = html.escape(quota_status_text)
+
+    limit_scope = "No quota"
+    if quota.get("exempt"):
+        limit_scope = "Exempt device"
+    elif limit.get("scope") == "default":
+        limit_scope = "Default quota"
+    elif limit.get("scope") == "custom":
+        limit_scope = "Custom quota"
+    limit_scope = html.escape(limit_scope)
+    limit_note = html.escape(str(limit.get("note") or ""))
+
+    range_key = str(history.get("range") or HISTORY_DEFAULT_RANGE)
+    range_links = []
+    for key, config in HISTORY_RANGE_OPTIONS.items():
+        class_name = "range-link active" if key == range_key else "range-link"
+        range_links.append(
+            f'<a class="{class_name}" href="/?range={html.escape(key)}">{html.escape(config["title"])}</a>'
+        )
+
+    quota_rows = []
+    exceeded_by_key = {
+        item.get("key"): item
+        for item in quota.get("exceeded_windows", [])
+        if isinstance(item, dict)
+    }
+    for window_key, config in CLIENT_TRAFFIC_WINDOW_CONFIG.items():
+        usage = (quota.get("usage") or {}).get(window_key) or {}
+        used_bytes = int(usage.get("total_bytes", 0))
+        limit_bytes = limit.get(
+            "max_past_hour_bytes" if window_key == "1h" else "max_past_3h_bytes"
+        )
+        if quota.get("exempt"):
+            state_text = "Exempt"
+        elif limit_bytes is None:
+            state_text = "Unlimited"
+        elif window_key in exceeded_by_key:
+            state_text = "Blocked"
+        else:
+            state_text = "OK"
+        limit_text = format_mb(limit_bytes) if limit_bytes is not None else "Unlimited"
+        quota_rows.append(
+            "<tr>"
+            f"<td>{html.escape(config['label'].title())}</td>"
+            f"<td>{html.escape(format_mb(used_bytes))}</td>"
+            f"<td>{html.escape(limit_text)}</td>"
+            f"<td>{html.escape(state_text)}</td>"
+            "</tr>"
+        )
+
+    destination_rows = []
+    for item in top_destinations:
+        destination_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('destination') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(item.get('count') or 0))}</td>"
+            f"<td>{html.escape(format_mb(int(item.get('total_bytes', 0))))}</td>"
+            "</tr>"
+        )
+    if not destination_rows:
+        destination_rows.append('<tr><td colspan="3" class="empty">No traffic recorded in this range yet.</td></tr>')
+
+    request_rows = []
+    for item in recent_requests:
+        request_rows.append(
+            "<tr>"
+            f"<td>{html.escape(format_portal_timestamp_text(item.get('timestamp')))}</td>"
+            f"<td>{html.escape(str(item.get('method') or item.get('kind') or 'request'))}</td>"
+            f"<td>{html.escape(str(item.get('destination') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(item.get('route_label') or 'direct'))}</td>"
+            f"<td>{html.escape(format_mb(int(item.get('total_bytes', 0))))}</td>"
+            "</tr>"
+        )
+    if not request_rows:
+        request_rows.append('<tr><td colspan="5" class="empty">No recent requests recorded for this device yet.</td></tr>')
+
+    failure_rows = []
+    for item in recent_failures:
+        failure_rows.append(
+            "<tr>"
+            f"<td>{html.escape(format_portal_timestamp_text(item.get('timestamp')))}</td>"
+            f"<td>{html.escape(str(item.get('context') or 'failure'))}</td>"
+            f"<td>{html.escape(str(item.get('destination') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(item.get('error') or 'unknown error'))}</td>"
+            "</tr>"
+        )
+    if not failure_rows:
+        failure_rows.append('<tr><td colspan="4" class="empty">No recent failures recorded for this device.</td></tr>')
+
+    history_summary = history.get("summary") or {}
+    history_range_title = html.escape(str(history.get("range_title") or "Selected range"))
+    history_requests = html.escape(str(history_summary.get("count") or 0))
+    history_total = html.escape(format_mb(int(history_summary.get("total_bytes", 0))))
+    total_requests = html.escape(str(totals.get("count") or 0))
+    total_data = html.escape(format_mb(int(totals.get("total_bytes", 0))))
+    active_connections = html.escape(str(totals.get("active_connections") or 0))
+    last_seen = html.escape(format_portal_timestamp_text(totals.get("last_seen_at")))
+    last_range_json_url = f"/api/client.json?range={html.escape(range_key)}"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="15">
+  <title>Your proxy usage</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f3efe7;
+      --panel: #fffdfa;
+      --ink: #14213d;
+      --muted: #5c677d;
+      --accent: #0f766e;
+      --accent-soft: #dff7f2;
+      --warn: #b45309;
+      --warn-soft: #fff4e5;
+      --border: #dfd7ca;
+      --shadow: rgba(20, 33, 61, 0.10);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.12), transparent 34%),
+        radial-gradient(circle at top right, rgba(180, 83, 9, 0.10), transparent 28%),
+        linear-gradient(180deg, #fcfbf8 0%, var(--bg) 100%);
+      color: var(--ink);
+    }}
+    main {{
+      width: min(1120px, calc(100% - 28px));
+      margin: 24px auto 48px;
+    }}
+    .hero {{
+      background: linear-gradient(135deg, rgba(15, 118, 110, 0.95), rgba(20, 33, 61, 0.92));
+      color: #f8fafc;
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: 0 26px 60px var(--shadow);
+    }}
+    .eyebrow {{
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 0.78rem;
+      opacity: 0.8;
+      margin-bottom: 10px;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.2rem);
+      line-height: 1.04;
+    }}
+    .hero p {{
+      margin: 14px 0 0;
+      max-width: 58rem;
+      line-height: 1.6;
+      color: rgba(248, 250, 252, 0.9);
+    }}
+    .hero-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }}
+    .pill {{
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+    }}
+    .layout {{
+      display: grid;
+      gap: 18px;
+      margin-top: 18px;
+    }}
+    .cards {{
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }}
+    .card, .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: 0 16px 40px rgba(20, 33, 61, 0.06);
+    }}
+    .card {{
+      padding: 18px 18px 16px;
+    }}
+    .card .label {{
+      color: var(--muted);
+      font-size: 0.88rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }}
+    .card .value {{
+      margin-top: 10px;
+      font-size: 1.65rem;
+      font-weight: 700;
+    }}
+    .card .sub {{
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }}
+    .panel {{
+      padding: 20px;
+    }}
+    .panel-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }}
+    h2 {{
+      margin: 0;
+      font-size: 1.28rem;
+    }}
+    .muted {{
+      color: var(--muted);
+    }}
+    .range-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .range-link {{
+      text-decoration: none;
+      color: var(--ink);
+      background: #f3f4f6;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-weight: 600;
+      font-size: 0.92rem;
+    }}
+    .range-link.active {{
+      background: var(--accent-soft);
+      border-color: rgba(15, 118, 110, 0.28);
+      color: var(--accent);
+    }}
+    .quota-banner {{
+      margin-bottom: 14px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: { '#fff4e5' if not quota.get('allowed', True) and limit else '#edf7f6' };
+      border: 1px solid { '#f1c48a' if not quota.get('allowed', True) and limit else '#c8e9e4' };
+      color: { '#9a3412' if not quota.get('allowed', True) and limit else '#115e59' };
+      font-weight: 600;
+      line-height: 1.55;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+    th, td {{
+      padding: 12px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }}
+    th {{
+      color: var(--muted);
+      font-size: 0.88rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }}
+    tr:last-child td {{
+      border-bottom: none;
+    }}
+    .empty {{
+      color: var(--muted);
+      text-align: center;
+      padding: 18px 12px;
+    }}
+    .two-up {{
+      display: grid;
+      gap: 18px;
+      grid-template-columns: 1.1fr 0.9fr;
+    }}
+    .note {{
+      margin-top: 14px;
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    a {{
+      color: var(--accent);
+    }}
+    @media (max-width: 860px) {{
+      .two-up {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="eyebrow">Proxy client portal</div>
+      <h1>Your device usage</h1>
+      <p>This page only shows traffic, quota state, and recent failures recorded for the device currently connected as <strong>{client_ip}</strong>. It refreshes automatically every 15 seconds.</p>
+      <div class="hero-meta">
+        <div class="pill">Client: {client_ip}</div>
+        <div class="pill">Profile: {active_profile_name}</div>
+        <div class="pill">Quota: {quota_status_text}</div>
+        <div class="pill">Updated: {requested_at}</div>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="cards">
+        <article class="card">
+          <div class="label">All-time data</div>
+          <div class="value">{total_data}</div>
+          <div class="sub">{total_requests} recorded requests</div>
+        </article>
+        <article class="card">
+          <div class="label">{history_range_title}</div>
+          <div class="value">{history_total}</div>
+          <div class="sub">{history_requests} requests in the selected range</div>
+        </article>
+        <article class="card">
+          <div class="label">Active connections</div>
+          <div class="value">{active_connections}</div>
+          <div class="sub">Open connections from this device right now</div>
+        </article>
+        <article class="card">
+          <div class="label">Last seen</div>
+          <div class="value" style="font-size:1.1rem">{last_seen}</div>
+          <div class="sub">Most recent recorded usage</div>
+        </article>
+      </section>
+
+      <section class="two-up">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Quota status</h2>
+            <span class="muted">{limit_scope}</span>
+          </div>
+          <div class="quota-banner">
+            {quota_status_text}
+            {f"<br>Retry after about {html.escape(format_duration_seconds(quota.get('retry_after_seconds')))}." if limit and not quota.get('allowed', True) else ""}
+            {f"<br>Admin note: {limit_note}" if limit_note else ""}
+          </div>
+          <table>
+            <thead>
+              <tr><th>Window</th><th>Used</th><th>Limit</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              {''.join(quota_rows)}
+            </tbody>
+          </table>
+          <p class="note">Portal URL while using the proxy: <a href="{portal_url}">{portal_url}</a>. Raw JSON: <a href="{last_range_json_url}">{last_range_json_url}</a></p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Top destinations</h2>
+            <div class="range-links">{''.join(range_links)}</div>
+          </div>
+          <table>
+            <thead>
+              <tr><th>Destination</th><th>Requests</th><th>Data</th></tr>
+            </thead>
+            <tbody>
+              {''.join(destination_rows)}
+            </tbody>
+          </table>
+        </article>
+      </section>
+
+      <section class="two-up">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Recent requests</h2>
+            <span class="muted">Latest usage log entries for this device</span>
+          </div>
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Method</th><th>Destination</th><th>Route</th><th>Data</th></tr>
+            </thead>
+            <tbody>
+              {''.join(request_rows)}
+            </tbody>
+          </table>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Recent failures</h2>
+            <span class="muted">Newest failure records for this device</span>
+          </div>
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Context</th><th>Destination</th><th>Error</th></tr>
+            </thead>
+            <tbody>
+              {''.join(failure_rows)}
+            </tbody>
+          </table>
+        </article>
+      </section>
     </div>
   </main>
 </body>

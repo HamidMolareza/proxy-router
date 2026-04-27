@@ -95,3 +95,29 @@ class UsageHistoryCache:
             proxy_type=proxy_type,
             client=client,
         )
+
+    def recent_records(
+        self,
+        *,
+        limit: int,
+        proxy_type: str | None = None,
+        client: str | None = None,
+    ):
+        target_limit = max(0, int(limit))
+        with self._lock:
+            self._load_if_needed()
+            records = list(self._records)
+
+        if target_limit == 0:
+            return []
+
+        selected = []
+        for record in reversed(records):
+            if proxy_type is not None and record.get("proxy_type") != proxy_type:
+                continue
+            if client is not None and record.get("client") != client:
+                continue
+            selected.append(record)
+            if len(selected) >= target_limit:
+                break
+        return selected

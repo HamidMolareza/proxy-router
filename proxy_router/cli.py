@@ -187,47 +187,6 @@ def build_usage_analyze_parser(prog_name: str) -> argparse.ArgumentParser:
     return parser
 
 
-def detect_candidate_client_ips():
-    candidates = []
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(("1.1.1.1", 80))
-            candidates.append(probe.getsockname()[0])
-    except OSError:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            if family == socket.AF_INET:
-                candidates.append(sockaddr[0])
-    except OSError:
-        pass
-
-    preferred = []
-    fallback = []
-    seen = set()
-
-    for candidate in candidates:
-        if not candidate or candidate.startswith("127.") or candidate in seen:
-            continue
-
-        seen.add(candidate)
-
-        try:
-            address = ipaddress.ip_address(candidate)
-        except ValueError:
-            continue
-
-        if address.is_private:
-            preferred.append(candidate)
-        else:
-            fallback.append(candidate)
-
-    return preferred or fallback
-
-
 def parse_allowed_networks(values):
     networks = []
     for value in values:
@@ -472,6 +431,7 @@ def print_startup_instructions(
         print_warning("Security note: on shared Wi-Fi, prefer --allow-client PHONE_IP")
 
     mixed_server = next((item for item in servers if item.proxy_type == "mixed"), None)
+    http_portal_server = next((item for item in servers if item.proxy_type in {"mixed", "http"}), None)
     if mixed_server:
         print()
         print_section("Phone Wi-Fi setup")
@@ -484,6 +444,14 @@ def print_startup_instructions(
         if len(client_ips) > 1:
             print_info(f"  Other detected IPv4 addresses: {', '.join(client_ips[1:])}")
         print_info("  The same port also accepts SOCKS5 for apps that support it.")
+    if http_portal_server:
+        print_info(
+            f"  Client self-service portal through the proxy: http://{CLIENT_PORTAL_PRIMARY_HOST}/"
+        )
+        if client_ips:
+            print_info(
+                f"  Direct client portal on the listener: http://{client_ips[0]}:{http_portal_server.port}/"
+            )
 
     if client_ips:
         print()

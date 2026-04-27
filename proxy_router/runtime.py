@@ -661,6 +661,8 @@ class FailureLogger:
 class SelfEndpoints:
     def __init__(self):
         self.host_aliases = {"127.0.0.1", "localhost"}
+        self.client_portal_primary_host = CLIENT_PORTAL_PRIMARY_HOST
+        self.client_portal_aliases = set(CLIENT_PORTAL_HOST_ALIASES)
         self.dashboard_port = DASHBOARD_DEFAULT_PORT
         self.dashboard_connect_host = "127.0.0.1"
         self.dashboard_url = f"http://127.0.0.1:{DASHBOARD_DEFAULT_PORT}/"
@@ -695,6 +697,12 @@ class SelfEndpoints:
         else:
             self.dashboard_url = None
         self.proxy_listener_ports = {int(port) for port in listener_ports}
+
+    def is_client_portal_host(self, host: str) -> bool:
+        return normalize_host(host) in self.client_portal_aliases
+
+    def client_portal_url(self) -> str:
+        return f"http://{self.client_portal_primary_host}/"
 
     def resolve_target_kind(self, host: str, port: int) -> str | None:
         normalized_host = normalize_host(host)

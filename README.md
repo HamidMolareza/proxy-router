@@ -46,6 +46,7 @@ If you want to use a phone on the same Wi-Fi:
 3. Set:
    - Host: your computer's LAN IP
    - Port: `8900`
+4. While that proxy is enabled on the device, open `http://proxy.router/` to see a read-only page for that device's own usage, quota status, top destinations, recent requests, and recent failures.
 
 ### Local development
 
@@ -139,6 +140,12 @@ The dashboard includes five main areas:
 - `Quotas`: default client quota, per-client quota rules, exemptions
 - `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
+Client self-service portal:
+
+- Devices using the HTTP proxy can open `http://proxy.router/` to view only their own usage and quota data
+- The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
+- This portal is separate from the admin dashboard and does not expose routing or config controls
+
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
@@ -162,7 +169,10 @@ When a client exceeds quota:
 Response behavior:
 
 - Browser-style HTTP requests receive an HTML response page
-- CONNECT/HTTPS and SOCKS5 traffic receive normal non-HTML proxy rejection behavior
+- CONNECT/HTTPS quota rejections return `429 Client Traffic Limit Reached` with `Retry-After` and `X-Proxy-Error*` headers plus a plain-text body
+- Some browsers and apps still show a generic tunnel failure for rejected CONNECT requests because HTTPS proxy CONNECT does not have a normal user-visible HTML error page
+- SOCKS5 traffic still uses standard SOCKS5 rejection codes without a text body
+- Devices can still open the self-service portal at `http://proxy.router/` even while quota-blocked, because that page is served locally by the proxy
 
 ## Useful CLI Options
 
