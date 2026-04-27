@@ -46,6 +46,49 @@ def build_client_live_update_message(server, client_ip: str, range_key: str, eve
         "snapshot": build_client_portal_snapshot(server, client_ip, range_key=range_key),
     }
 
+
+def is_retryable_upstream_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout, socket.gaierror, ConnectionError, http.client.HTTPException)):
+        return True
+
+    if isinstance(exc, OSError):
+        if exc.errno in {
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+        }:
+            return True
+        return exc.errno is None
+
+    return False
+
+
+def can_retry_http_request(method: str, body) -> bool:
+    if str(method or "").upper() in RETRYABLE_HTTP_METHODS:
+        return True
+    return body in {None, b""}
+
+
+def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_upstream_error):
+    attempts = max(1, int(UPSTREAM_RETRY_ATTEMPTS))
+    delay_seconds = float(UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation(attempt)
+        except Exception as exc:
+            if attempt >= attempts or not should_retry(exc):
+                raise
+            on_retry(attempt, attempts, delay_seconds, exc)
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, float(UPSTREAM_RETRY_MAX_DELAY_SECONDS))
+
+    raise RuntimeError("unreachable retry state")
+
+
 class PreconnectedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host, port=None, *, preconnected_socket, timeout=None):
         super().__init__(host, port=port, timeout=timeout)
@@ -972,6 +1015,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self._safe_send_error_response(response_code, message)
 
     def _open_routed_stream(self, host: str, port: int, route_decision):
+        def open_once(_attempt):
+            return self._open_routed_stream_once(host, port, route_decision)
+
+        return retry_upstream_operation(
+            open_once,
+            on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                "retrying upstream stream setup "
+                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                f"target={host}:{port} route={route_decision['route_label']} error={exc}",
+                level="WARNING",
+            ),
+        )
+
+    def _open_routed_stream_once(self, host: str, port: int, route_decision):
         connect_host = route_decision.get("connect_host", host)
         connect_port = route_decision.get("connect_port", port)
         if route_decision["action"] != "proxy":
@@ -1011,10 +1068,33 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         return upstream_socket, None
 
     def _perform_upstream_request(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
+        should_retry = lambda exc: can_retry_http_request(self.command, body) and is_retryable_upstream_error(exc)
+
+        return retry_upstream_operation(
+            lambda _attempt: self._perform_upstream_request_once(
+                scheme,
+                host,
+                port,
+                target_path,
+                body,
+                outbound_headers,
+                route_decision=route_decision,
+            ),
+            should_retry=should_retry,
+            on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                "retrying upstream HTTP request "
+                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                f"method={self.command} target={host}:{port} route={route_decision['route_label']} error={exc}",
+                level="WARNING",
+            ),
+        )
+
+    def _perform_upstream_request_once(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
         request_target = target_path
         connection_kwargs = {"timeout": self.server.timeout_seconds}
         connect_host = route_decision.get("connect_host", host)
         connect_port = route_decision.get("connect_port", port)
+        connection = None
         if route_decision["action"] == "proxy":
             upstream = route_decision["upstream"]
             if upstream is None:
@@ -1060,20 +1140,25 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             f"opening upstream request route={route_decision['route_label']} target={host}:{port} "
             f"request_target={truncate_for_log(request_target)} timeout={self.server.timeout_seconds}s"
         )
-        connection.request(self.command, request_target, body=body, headers=outbound_headers)
-        response = connection.getresponse()
-        upstream_elapsed_ms = int((time.monotonic() - upstream_started) * 1000)
-        self._debug(
-            f"upstream response status={response.status} reason={truncate_for_log(response.reason)} "
-            f"elapsed_ms={upstream_elapsed_ms}"
-        )
-        self._debug(f"upstream response headers={format_headers_for_log(response.headers)}")
-        self.server.runtime.record_upstream_route_success(
-            route_decision,
-            destination=f"{host}:{port}",
-            proxy_label=self.server.proxy_label,
-        )
-        return connection, response
+        try:
+            connection.request(self.command, request_target, body=body, headers=outbound_headers)
+            response = connection.getresponse()
+            upstream_elapsed_ms = int((time.monotonic() - upstream_started) * 1000)
+            self._debug(
+                f"upstream response status={response.status} reason={truncate_for_log(response.reason)} "
+                f"elapsed_ms={upstream_elapsed_ms}"
+            )
+            self._debug(f"upstream response headers={format_headers_for_log(response.headers)}")
+            self.server.runtime.record_upstream_route_success(
+                route_decision,
+                destination=f"{host}:{port}",
+                proxy_label=self.server.proxy_label,
+            )
+            return connection, response
+        except Exception:
+            if connection is not None:
+                connection.close()
+            raise
 
     def _write_response(
         self,
@@ -1409,35 +1494,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             upstream_owner = None
             upstream = None
             try:
-                if route_decision["action"] == "proxy":
-                    proxy = route_decision["upstream"]
-                    if proxy is None:
-                        raise OSError("router selected proxy, but no upstream proxy is configured")
-                    if proxy["type"] == "http":
-                        upstream_owner = create_http_proxy_tunnel(
-                            proxy["host"],
-                            proxy["port"],
-                            destination_host,
-                            destination_port,
-                            self.server.timeout_seconds,
-                        )
-                        upstream = upstream_owner.sock
-                    else:
-                        upstream = create_socks5_proxy_connection(
-                            proxy["host"],
-                            proxy["port"],
-                            destination_host,
-                            destination_port,
-                            self.server.timeout_seconds,
-                        )
-                else:
-                    upstream = socket.create_connection(
-                        (
-                            route_decision.get("connect_host", destination_host),
-                            route_decision.get("connect_port", destination_port),
-                        ),
-                        timeout=self.server.timeout_seconds,
-                    )
+                upstream, upstream_owner = self._open_routed_stream(
+                    destination_host,
+                    destination_port,
+                    route_decision,
+                )
 
                 bind_host, bind_port = upstream.getsockname()[:2]
                 self._send_success_reply(bind_host, bind_port)
@@ -1507,6 +1568,56 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             self._send_reply(0x01)
         finally:
             self.server.client_tracker.disconnected(client_ip)
+
+    def _open_routed_stream(self, destination_host: str, destination_port: int, route_decision):
+        def open_once(_attempt):
+            return self._open_routed_stream_once(destination_host, destination_port, route_decision)
+
+        return retry_upstream_operation(
+            open_once,
+            on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                "retrying SOCKS5 upstream stream setup "
+                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                f"target={destination_host}:{destination_port} route={route_decision['route_label']} error={exc}",
+                level="WARNING",
+            ),
+        )
+
+    def _open_routed_stream_once(self, destination_host: str, destination_port: int, route_decision):
+        if route_decision["action"] == "proxy":
+            proxy = route_decision["upstream"]
+            if proxy is None:
+                raise OSError("router selected proxy, but no upstream proxy is configured")
+            if proxy["type"] == "http":
+                upstream_owner = create_http_proxy_tunnel(
+                    proxy["host"],
+                    proxy["port"],
+                    destination_host,
+                    destination_port,
+                    self.server.timeout_seconds,
+                )
+                return upstream_owner.sock, upstream_owner
+            return (
+                create_socks5_proxy_connection(
+                    proxy["host"],
+                    proxy["port"],
+                    destination_host,
+                    destination_port,
+                    self.server.timeout_seconds,
+                ),
+                None,
+            )
+
+        return (
+            socket.create_connection(
+                (
+                    route_decision.get("connect_host", destination_host),
+                    route_decision.get("connect_port", destination_port),
+                ),
+                timeout=self.server.timeout_seconds,
+            ),
+            None,
+        )
 
     def _read_exact(self, size: int) -> bytes:
         remaining = size
@@ -2130,41 +2241,32 @@ def render_client_portal_html(snapshot) -> str:
       background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
       color: var(--ink);
     }}
-    .container-xl {{
-      width: min(1140px, 100%);
-      margin-right: auto;
-      margin-left: auto;
+    .portal-shell {{
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
     }}
-    .px-3 {{
-      padding-right: 1rem;
-      padding-left: 1rem;
-    }}
-    .py-3 {{
-      padding-top: 1rem;
-      padding-bottom: 1rem;
-    }}
-    .mb-3 {{
-      margin-bottom: 1rem;
-    }}
-    .mt-0 {{
-      margin-top: 0;
-    }}
-    .h-100 {{
-      height: 100%;
-    }}
-    .row {{
+    .metrics-grid,
+    .content-grid {{
       display: grid;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-      gap: 1rem;
+      gap: 18px;
     }}
-    .layout > .row + .row {{
-      margin-top: 1rem;
+    .metrics-grid {{
+      grid-template-columns: repeat(4, minmax(0, 1fr));
     }}
-    .row > * {{
+    .content-grid {{
+      margin-top: 18px;
+      align-items: stretch;
+    }}
+    .metrics-grid > *,
+    .content-grid > * {{
       min-width: 0;
     }}
-    .col-12 {{
-      grid-column: span 12;
+    .content-grid-primary {{
+      grid-template-columns: minmax(0, 1.25fr) minmax(360px, 0.75fr);
+    }}
+    .content-grid-even {{
+      grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
     }}
     .table {{
       width: 100%;
@@ -2227,6 +2329,7 @@ def render_client_portal_html(snapshot) -> str:
     .metric-card {{
       padding: 18px 18px 16px;
       min-height: 100%;
+      width: 100%;
     }}
     .metric-card .label {{
       color: var(--muted);
@@ -2247,6 +2350,8 @@ def render_client_portal_html(snapshot) -> str:
     }}
     .portal-card {{
       padding: 20px;
+      height: 100%;
+      min-width: 0;
     }}
     .panel-head {{
       display: flex;
@@ -2294,13 +2399,15 @@ def render_client_portal_html(snapshot) -> str:
       line-height: 1.55;
     }}
     .table-responsive {{
+      width: 100%;
+      max-width: 100%;
       border: 1px solid var(--border);
       border-radius: 14px;
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
     }}
     .portal-table {{
-      min-width: 560px;
+      min-width: 100%;
       margin-bottom: 0;
     }}
     .portal-table th,
@@ -2341,34 +2448,22 @@ def render_client_portal_html(snapshot) -> str:
     a {{
       color: var(--accent);
     }}
-    @media (min-width: 576px) {{
-      .px-sm-4 {{
-        padding-right: 1.5rem;
-        padding-left: 1.5rem;
-      }}
-      .py-sm-4 {{
-        padding-top: 1.5rem;
-        padding-bottom: 1.5rem;
-      }}
-      .mb-sm-4 {{
-        margin-bottom: 1.5rem;
-      }}
-      .col-sm-6 {{
-        grid-column: span 6;
+    @media (max-width: 1050px) {{
+      .content-grid-primary,
+      .content-grid-even {{
+        grid-template-columns: 1fr;
       }}
     }}
-    @media (min-width: 1200px) {{
-      .col-xl-3 {{
-        grid-column: span 3;
-      }}
-      .col-xl-5 {{
-        grid-column: span 5;
-      }}
-      .col-xl-7 {{
-        grid-column: span 7;
+    @media (max-width: 840px) {{
+      .metrics-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }}
     }}
     @media (max-width: 575.98px) {{
+      .portal-shell {{
+        width: min(100%, calc(100% - 32px));
+        padding: 16px 0 32px;
+      }}
       .hero {{
         border-radius: 16px;
         padding: 20px;
@@ -2382,6 +2477,9 @@ def render_client_portal_html(snapshot) -> str:
       }}
       .pill {{
         width: 100%;
+      }}
+      .metrics-grid {{
+        grid-template-columns: 1fr;
       }}
       .portal-card {{
         padding: 16px;
@@ -2399,12 +2497,15 @@ def render_client_portal_html(snapshot) -> str:
       .metric-card .value {{
         font-size: 1.4rem;
       }}
+      .portal-table {{
+        min-width: 560px;
+      }}
     }}
   </style>
 </head>
 <body>
-  <main class="container-xl px-3 px-sm-4 py-3 py-sm-4">
-    <section class="hero mb-3 mb-sm-4">
+  <main class="portal-shell">
+    <section class="hero">
       <div class="eyebrow">Proxy client portal</div>
       <h1>Your device usage</h1>
       <p>This page only shows traffic, quota state, and recent failures recorded for the device currently connected as <strong id="client-ip">{client_ip}</strong>. It updates live while this page is open.</p>
@@ -2418,29 +2519,29 @@ def render_client_portal_html(snapshot) -> str:
     </section>
 
     <div class="layout">
-      <section class="row g-3">
-        <article class="col-12 col-sm-6 col-xl-3">
+      <section class="metrics-grid">
+        <article>
           <div class="metric-card">
           <div class="label">All-time data</div>
           <div class="value" id="total-data">{total_data}</div>
           <div class="sub" id="total-requests">{total_requests} recorded requests</div>
           </div>
         </article>
-        <article class="col-12 col-sm-6 col-xl-3">
+        <article>
           <div class="metric-card">
           <div class="label" id="history-range-title">{history_range_title}</div>
           <div class="value" id="history-total">{history_total}</div>
           <div class="sub" id="history-requests">{history_requests} requests in the selected range</div>
           </div>
         </article>
-        <article class="col-12 col-sm-6 col-xl-3">
+        <article>
           <div class="metric-card">
           <div class="label">Active connections</div>
           <div class="value" id="active-connections">{active_connections}</div>
           <div class="sub">Open connections from this device right now</div>
           </div>
         </article>
-        <article class="col-12 col-sm-6 col-xl-3">
+        <article>
           <div class="metric-card">
           <div class="label">Last seen</div>
           <div class="value" id="last-seen" style="font-size:1.1rem">{last_seen}</div>
@@ -2449,9 +2550,9 @@ def render_client_portal_html(snapshot) -> str:
         </article>
       </section>
 
-      <section class="row g-3 mt-0">
-        <article class="col-12 col-xl-7">
-          <div class="portal-card h-100">
+      <section class="content-grid content-grid-primary">
+        <article>
+          <div class="portal-card">
           <div class="panel-head">
             <h2>Quota status</h2>
             <span class="muted" id="limit-scope">{limit_scope}</span>
@@ -2475,8 +2576,8 @@ def render_client_portal_html(snapshot) -> str:
           </div>
         </article>
 
-        <article class="col-12 col-xl-5">
-          <div class="portal-card h-100">
+        <article>
+          <div class="portal-card">
           <div class="panel-head">
             <h2>Top destinations</h2>
             <div class="range-links">{''.join(range_links)}</div>
@@ -2495,9 +2596,9 @@ def render_client_portal_html(snapshot) -> str:
         </article>
       </section>
 
-      <section class="row g-3 mt-0">
-        <article class="col-12 col-xl-7">
-          <div class="portal-card h-100">
+      <section class="content-grid content-grid-even">
+        <article>
+          <div class="portal-card">
           <div class="panel-head">
             <h2>Recent requests</h2>
             <span class="muted">Latest usage log entries for this device</span>
@@ -2515,8 +2616,8 @@ def render_client_portal_html(snapshot) -> str:
           </div>
         </article>
 
-        <article class="col-12 col-xl-5">
-          <div class="portal-card h-100">
+        <article>
+          <div class="portal-card">
           <div class="panel-head">
             <h2>Recent failures</h2>
             <span class="muted">Newest failure records for this device</span>

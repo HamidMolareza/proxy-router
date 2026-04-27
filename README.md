@@ -154,6 +154,7 @@ Current dashboard behaviors:
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
 - Client self-service portal state is also pushed over a WebSocket instead of a timed page refresh
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
+- Transient upstream connection/setup failures are retried briefly before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
 - `Ignore` on an automatic rule converts it into a permanent manual `Direct` rule

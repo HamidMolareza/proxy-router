@@ -97,6 +97,29 @@ const ruleActionsClass = 'flex flex-wrap gap-2 max-sm:flex-col max-sm:items-stre
 const rulePillClass = 'inline-flex items-center rounded-full border border-[#dbcdb7] bg-[#f1ece2] px-2 py-1 text-xs font-bold text-[#5a4631]'
 const autoRulePillClass = '!border-[#b9d7d8] !bg-[#e3f1f1] !text-[#13595b]'
 const ruleMetaClass = 'flex flex-col gap-1 text-sm'
+const sortableHeaderButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !text-left !text-xs !font-semibold !tracking-[0.05em] !text-[#6a6f73] !uppercase'
+
+function compareNumbers(left, right, direction) {
+  const leftValue = Number(left || 0)
+  const rightValue = Number(right || 0)
+  return direction === 'asc' ? leftValue - rightValue : rightValue - leftValue
+}
+
+function getQuotaClientSortValue(row, key) {
+  if (key === 'active') {
+    return row.activeConnections
+  }
+  if (key === 'last1h') {
+    return row.used1h
+  }
+  if (key === 'last3h') {
+    return row.used3h
+  }
+  if (key === 'total') {
+    return row.totalBytes
+  }
+  return row.client.client
+}
 
 function getTabFromHash() {
   const tabId = window.location.hash.replace(/^#/, '').trim()
@@ -1216,6 +1239,7 @@ function App() {
   const [currentRulesPage, setCurrentRulesPage] = useState(1)
   const [currentRulesSearchTerm, setCurrentRulesSearchTerm] = useState('')
   const [currentEditorProfileId, setCurrentEditorProfileId] = useState(DEFAULT_ROUTING_PROFILE_ID)
+  const [quotaDeviceSort, setQuotaDeviceSort] = useState({ key: 'active', direction: 'desc' })
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
   const [isClearingTraffic, setIsClearingTraffic] = useState(false)
   const [isSavingRouter, setIsSavingRouter] = useState(false)
@@ -1307,6 +1331,67 @@ function App() {
     dashboardSnapshot,
   )
   const historyNote = historyError || buildHistoryNote(historyData)
+  const quotaDeviceRows = dashboardSnapshot.totals_by_client.map((client) => {
+    const quota = dashboardSnapshot.client_quota_status[client.client] || {}
+    const usage = quota.usage || {}
+    const limit = quota.limit || {}
+    const used1h = Number((usage['1h'] || {}).total_bytes || 0)
+    const used3h = Number((usage['3h'] || {}).total_bytes || 0)
+    const activeConnections = Number(client.active_connections || 0)
+    const totalBytes = Number(client.total_bytes || 0)
+    const limitScope =
+      limit.scope === 'default'
+        ? 'Default'
+        : limit.scope === 'custom'
+          ? 'Custom'
+          : limit.scope === 'exempt'
+            ? 'Exempt'
+            : ''
+    const statusText = quota.limit
+      ? limit.scope === 'exempt'
+        ? limit.expires_at
+          ? `Exempt for ${formatDuration(
+              Math.max(1, Math.floor((new Date(limit.expires_at).getTime() - nowMs) / 1000)),
+            )}`
+          : 'Exempt'
+        : quota.allowed === false
+          ? `Blocked (${limitScope || 'Limit'}) for ${formatDuration(quota.retry_after_seconds)}`
+          : `Within ${limitScope || 'configured'} limit`
+      : 'No limit'
+    return {
+      activeConnections,
+      client,
+      limit,
+      quota,
+      statusText,
+      totalBytes,
+      used1h,
+      used3h,
+    }
+  })
+  const sortedQuotaDeviceRows = [...quotaDeviceRows].sort((left, right) => {
+    const compared = compareNumbers(
+      getQuotaClientSortValue(left, quotaDeviceSort.key),
+      getQuotaClientSortValue(right, quotaDeviceSort.key),
+      quotaDeviceSort.direction,
+    )
+    if (compared !== 0) {
+      return compared
+    }
+    return String(left.client.client).localeCompare(String(right.client.client))
+  })
+  function toggleQuotaDeviceSort(key) {
+    setQuotaDeviceSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'desc' ? 'asc' : 'desc',
+    }))
+  }
+  function quotaSortLabel(key) {
+    if (quotaDeviceSort.key !== key) {
+      return ''
+    }
+    return quotaDeviceSort.direction === 'asc' ? ' ↑' : ' ↓'
+  }
   const ignoredDomains = (() => {
     const items = []
     const sharedIgnored = Array.isArray(currentRouterConfig.ignored_failure_hosts)
@@ -2050,7 +2135,7 @@ function App() {
               {overviewCards.map(([label, value]) => (
                 <div className={cardClass} key={label}>
                   <div className={cardLabelClass}>{label}</div>
-                  <div className={cx(cardValueClass, label === 'Started' && 'text-sm leading-snug sm:text-base')}>
+                  <div className={cx(cardValueClass, label === 'Started' && 'text-xs leading-snug sm:text-sm')}>
                     {value}
                   </div>
                 </div>
@@ -2255,7 +2340,7 @@ function App() {
               </div>
               <div className={noteClass}>{historyNote}</div>
 
-              <div className="mt-3 grid grid-cols-1 items-start gap-4 lg:grid-cols-[minmax(0,2.1fr)_minmax(280px,1fr)]">
+              <div className="mt-3 grid grid-cols-1 gap-4">
                 <section className={subpanelClass}>
                   <h3>Traffic over time</h3>
                   {historyError ? (
@@ -2274,20 +2359,20 @@ function App() {
                   {historyError ? (
                     <div className="pt-2 text-[#6a6f73]">History data is unavailable right now.</div>
                   ) : historyData.top_destinations.length ? (
-                    <table>
+                    <table className="w-full table-fixed">
                       <thead>
                         <tr>
-                          <th>Destination</th>
-                          <th>Requests</th>
-                          <th>Total</th>
+                          <th className="w-[58%]">Destination</th>
+                          <th className="w-[18%]">Requests</th>
+                          <th className="w-[24%]">Total</th>
                         </tr>
                       </thead>
                       <tbody>
                         {historyData.top_destinations.map((item) => (
                           <tr key={item.destination}>
                             <td className="max-w-md break-words">{item.destination}</td>
-                            <td>{item.count}</td>
-                            <td>{formatMb(item.total_bytes)}</td>
+                            <td className="whitespace-nowrap">{item.count}</td>
+                            <td className="whitespace-nowrap">{formatMb(item.total_bytes)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -2314,7 +2399,7 @@ function App() {
               </div>
 
               <div className="mt-3 grid grid-cols-12 gap-4">
-                <section className={cx(subpanelClass, 'col-span-full lg:col-span-4')}>
+                <section className={cx(subpanelClass, 'col-span-full xl:col-span-5')}>
                   <h3>Profiles</h3>
                   <div className={noteClass}>Detect the current internet and VPN set, then match its saved routing profile.</div>
                   <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
@@ -2333,7 +2418,7 @@ function App() {
                   </div>
 
                   <div className={tableWrapClass}>
-                    <table>
+                    <table className="min-w-[58rem]">
                       <thead>
                         <tr>
                           <th>Enabled</th>
@@ -2360,7 +2445,7 @@ function App() {
                                   }}
                                 />
                               </td>
-                              <td>
+                              <td className="min-w-72">
                                 <input
                                   type="text"
                                   value={profile.name}
@@ -2588,7 +2673,7 @@ function App() {
                   </div>
                 </section>
 
-                <section className={cx(subpanelClass, 'col-span-full lg:col-span-8')}>
+                <section className={cx(subpanelClass, 'col-span-full xl:col-span-7')}>
                   <div className={panelHeaderClass}>
                     <h3>Rules</h3>
                     <div className={tightButtonRowClass}>
@@ -2725,7 +2810,7 @@ function App() {
                   </div>
 
                   <div className={tableWrapClass}>
-                    <table>
+                    <table className="min-w-[88rem]">
                       <thead>
                         <tr>
                           <th>Scope</th>
@@ -2745,7 +2830,7 @@ function App() {
                             const rule = entry.rule
                             return (
                               <tr key={`${entry.scope}-${entry.index}-${rule.pattern}-${rule.note}`}>
-                                <td>
+                                <td className="min-w-32">
                                   <span className={rulePillClass}>{entry.scope_label}</span>
                                 </td>
                                 <td>
@@ -2758,7 +2843,7 @@ function App() {
                                     }
                                   />
                                 </td>
-                                <td>
+                                <td className="min-w-80">
                                   <input
                                     className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     type="text"
@@ -2770,7 +2855,7 @@ function App() {
                                     }
                                   />
                                 </td>
-                                <td>
+                                <td className="min-w-44">
                                   <select
                                     className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     value={rule.match}
@@ -2784,7 +2869,7 @@ function App() {
                                     <option value="contains">Contains</option>
                                   </select>
                                 </td>
-                                <td>
+                                <td className="min-w-44">
                                   <select
                                     className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     value={rule.action}
@@ -2798,7 +2883,7 @@ function App() {
                                     <option value="block">Block</option>
                                   </select>
                                 </td>
-                                <td>
+                                <td className="min-w-36">
                                   <div className={ruleMetaClass}>
                                     <span className={cx(rulePillClass, rule.source === 'auto' && autoRulePillClass)}>
                                       {rule.source === 'auto' ? 'Auto' : 'Manual'}
@@ -2806,7 +2891,7 @@ function App() {
                                     <small>{rule.source === 'auto' ? 'Auto-managed' : 'User-managed'}</small>
                                   </div>
                                 </td>
-                                <td>
+                                <td className="min-w-40">
                                   {rule.source === 'auto' ? (
                                     <div className={ruleMetaClass}>
                                       <strong>{rule.duration}</strong>
@@ -2830,7 +2915,7 @@ function App() {
                                     </div>
                                   )}
                                 </td>
-                                <td>
+                                <td className="min-w-72">
                                   <input
                                     className={cx(rule.source === 'auto' && readOnlyInputClass)}
                                     type="text"
@@ -3185,52 +3270,55 @@ function App() {
                     <thead>
                       <tr>
                         <th>Client IP</th>
-                        <th>Active</th>
+                        <th>
+                          <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleQuotaDeviceSort('active')}>
+                            Active{quotaSortLabel('active')}
+                          </button>
+                        </th>
                         <th>Handled</th>
                         <th>Proxy types</th>
-                        <th>Last 1h</th>
+                        <th>
+                          <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleQuotaDeviceSort('last1h')}>
+                            Last 1h{quotaSortLabel('last1h')}
+                          </button>
+                        </th>
                         <th>Limit 1h</th>
-                        <th>Last 3h</th>
+                        <th>
+                          <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleQuotaDeviceSort('last3h')}>
+                            Last 3h{quotaSortLabel('last3h')}
+                          </button>
+                        </th>
                         <th>Limit 3h</th>
                         <th>Status</th>
                         <th>Upload</th>
                         <th>Download</th>
-                        <th>Total</th>
+                        <th>
+                          <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleQuotaDeviceSort('total')}>
+                            Total{quotaSortLabel('total')}
+                          </button>
+                        </th>
                         <th>Last seen</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {dashboardSnapshot.totals_by_client.map((client) => {
-                        const quota = dashboardSnapshot.client_quota_status[client.client] || {}
-                        const usage = quota.usage || {}
-                        const limit = quota.limit || {}
-                        const used1h = Number((usage['1h'] || {}).total_bytes || 0)
-                        const used3h = Number((usage['3h'] || {}).total_bytes || 0)
-                        const limitScope =
-                          limit.scope === 'default'
-                            ? 'Default'
-                            : limit.scope === 'custom'
-                              ? 'Custom'
-                              : limit.scope === 'exempt'
-                                ? 'Exempt'
-                                : ''
-                        const statusText = quota.limit
-                          ? limit.scope === 'exempt'
-                            ? limit.expires_at
-                              ? `Exempt for ${formatDuration(
-                                  Math.max(1, Math.floor((new Date(limit.expires_at).getTime() - nowMs) / 1000)),
-                                )}`
-                              : 'Exempt'
-                            : quota.allowed === false
-                              ? `Blocked (${limitScope || 'Limit'}) for ${formatDuration(
-                                  quota.retry_after_seconds,
-                                )}`
-                              : `Within ${limitScope || 'configured'} limit`
-                          : 'No limit'
+                      {sortedQuotaDeviceRows.map((row) => {
+                        const { activeConnections, client, limit, statusText, used1h, used3h } = row
+                        const activeClient = activeConnections > 0
                         return (
-                          <tr key={client.client}>
-                            <td>{client.client}</td>
-                            <td>{client.active_connections}</td>
+                          <tr className={cx(activeClient && 'bg-[#eef8f3] text-[#115e59]')} key={client.client}>
+                            <td>
+                              <span className={cx(activeClient && 'text-[#115e59]')}>{client.client}</span>
+                            </td>
+                            <td>
+                              <span
+                                className={cx(
+                                  activeClient &&
+                                    'inline-flex rounded-full bg-[#d9ece8] px-2 py-1 text-xs text-[#116466]',
+                                )}
+                              >
+                                {activeConnections}
+                              </span>
+                            </td>
                             <td>{client.count}</td>
                             <td>{(client.proxy_types || []).join(', ') || 'none yet'}</td>
                             <td>{formatMb(used1h)}</td>
