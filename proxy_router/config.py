@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
+import struct
 import subprocess
 import threading
 from datetime import datetime
@@ -11,8 +13,14 @@ from .constants import *
 from .util import *
 
 class NetworkProfileMonitor:
-    def __init__(self, poll_interval_seconds: float = NETWORK_PROFILE_POLL_INTERVAL_SECONDS):
+    def __init__(
+        self,
+        poll_interval_seconds: float = NETWORK_PROFILE_POLL_INTERVAL_SECONDS,
+        *,
+        change_callback=None,
+    ):
         self.poll_interval_seconds = max(1.0, float(poll_interval_seconds))
+        self._change_callback = change_callback
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._last_error = None
@@ -51,6 +59,18 @@ class NetworkProfileMonitor:
         with self._lock:
             return json.loads(json.dumps(self._state))
 
+    def _change_marker(self, state: dict) -> tuple:
+        return (
+            bool(state.get("available")),
+            str(state.get("signature_key") or ""),
+            str(state.get("internet_label") or ""),
+            str(state.get("route_interface") or ""),
+            str(state.get("route_gateway") or ""),
+            tuple(state.get("vpn_keys") or []),
+            tuple(state.get("vpn_labels") or []),
+            str(state.get("error") or ""),
+        )
+
     def _run(self):
         while not self._stop_event.wait(self.poll_interval_seconds):
             try:
@@ -58,13 +78,15 @@ class NetworkProfileMonitor:
             except Exception as exc:
                 detected = self._build_unavailable_state(error=repr(exc))
             with self._lock:
-                previous_key = self._state.get("signature_key")
-                current_key = detected.get("signature_key")
-                if previous_key != current_key:
+                previous_marker = self._change_marker(self._state)
+                current_marker = self._change_marker(detected)
+                if previous_marker != current_marker:
                     detected["last_changed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
                 else:
                     detected["last_changed_at"] = self._state.get("last_changed_at")
                 self._state = detected
+            if previous_marker != current_marker and callable(self._change_callback):
+                self._change_callback("network-profile")
 
     def _run_command(self, arguments: list[str]):
         executable = arguments[0]
@@ -102,10 +124,15 @@ class NetworkProfileMonitor:
         }
 
     def _detect_default_route(self) -> dict:
-        stdout = self._run_command(["ip", "-j", "route", "show", "default"])
+        try:
+            stdout = self._run_command(["ip", "-j", "route", "show", "default"])
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            return self._detect_default_route_from_procfs()
+
         payload = json.loads(stdout or "[]")
         if not isinstance(payload, list):
-            return {}
+            return self._detect_default_route_from_procfs()
+
         preferred = None
         for route in payload:
             if not isinstance(route, dict):
@@ -117,12 +144,52 @@ class NetworkProfileMonitor:
                 break
             if preferred is None:
                 preferred = route
+
         if preferred is None:
-            return {}
+            return self._detect_default_route_from_procfs()
+
         return {
             "interface": str(preferred.get("dev") or "").strip(),
             "gateway": str(preferred.get("gateway") or "").strip(),
         }
+
+    def _detect_default_route_from_procfs(self) -> dict:
+        route_file = Path("/proc/net/route")
+        try:
+            lines = route_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            interface, destination_hex, gateway_hex, flags_hex = parts[:4]
+            if destination_hex != "00000000":
+                continue
+
+            try:
+                flags = int(flags_hex, 16)
+            except ValueError:
+                continue
+
+            if not (flags & 0x2):
+                continue
+
+            gateway = ""
+            if gateway_hex != "00000000":
+                try:
+                    gateway = socket.inet_ntoa(struct.pack("<L", int(gateway_hex, 16)))
+                except (OSError, struct.error, ValueError):
+                    gateway = ""
+
+            return {
+                "interface": interface.strip(),
+                "gateway": gateway.strip(),
+            }
+
+        return {}
 
     def _detect_nmcli_connections(self) -> list[dict]:
         stdout = self._run_command(
@@ -149,6 +216,42 @@ class NetworkProfileMonitor:
             )
         return connections
 
+    def _detect_vpn_interfaces_from_sysfs(self) -> list[dict]:
+        interfaces_path = Path("/sys/class/net")
+        try:
+            entries = list(interfaces_path.iterdir())
+        except OSError:
+            return []
+
+        connections = []
+        for entry in entries:
+            interface_name = entry.name.strip()
+            if not interface_name or interface_name == "lo":
+                continue
+
+            normalized_name = interface_name.lower()
+            if not normalized_name.startswith(VPN_INTERFACE_PREFIXES):
+                continue
+
+            try:
+                operstate = (entry / "operstate").read_text(encoding="utf-8").strip().lower()
+            except OSError:
+                operstate = ""
+            if operstate and operstate not in {"up", "unknown", "dormant"}:
+                continue
+
+            connections.append(
+                {
+                    "name": interface_name,
+                    "uuid": interface_name,
+                    "device": interface_name,
+                    "type": "vpn",
+                    "is_vpn": True,
+                }
+            )
+
+        return sorted(connections, key=lambda item: item["name"])
+
     def _detect_state(self) -> dict:
         route_info = {}
         route_error = None
@@ -163,6 +266,7 @@ class NetworkProfileMonitor:
             connections = self._detect_nmcli_connections()
         except Exception as exc:
             nmcli_error = str(exc)
+            connections = self._detect_vpn_interfaces_from_sysfs()
 
         interface = route_info.get("interface", "")
         gateway = route_info.get("gateway", "")
@@ -239,12 +343,17 @@ class NetworkProfileMonitor:
 
 
 class RouterConfigManager:
-    def __init__(self, config_file: Path):
+    def __init__(self, config_file: Path, *, change_callback=None):
         self.config_file = config_file
+        self._change_callback = change_callback
         self._lock = threading.Lock()
         self._config = default_router_config()
-        self._network_monitor = NetworkProfileMonitor()
+        self._network_monitor = NetworkProfileMonitor(change_callback=self._notify_change)
         self._load()
+
+    def _notify_change(self, reason: str):
+        if callable(self._change_callback):
+            self._change_callback(reason)
 
     def shutdown(self):
         self._network_monitor.shutdown()
@@ -299,6 +408,7 @@ class RouterConfigManager:
 
         normalized = normalize_router_config(config)
         self._write_config_locked(normalized)
+        self._notify_change("router-config")
         return True
 
     def _default_profile_snapshot_locked(self):
@@ -470,7 +580,9 @@ class RouterConfigManager:
         normalized = normalize_router_config(payload)
         with self._lock:
             self._write_config_locked(normalized)
-            return json.loads(json.dumps(self._config))
+            saved = json.loads(json.dumps(self._config))
+        self._notify_change("router-config")
+        return saved
 
     def ignored_failure_hosts(self, profile_id: str | None = None):
         with self._lock:

@@ -6,6 +6,7 @@
 
 - A Python backend that accepts proxy traffic and exposes dashboard APIs
 - A React frontend that renders the dashboard and talks to the backend through `/api/*`
+- A WebSocket live-update channel at `/api/live` for pushed dashboard snapshots
 
 In Docker, the backend and dashboard use separate Dockerfiles.
 
@@ -61,9 +62,10 @@ Purpose:
 ### Dashboard traffic
 
 1. A browser opens the dashboard frontend.
-2. The frontend sends `/api/*` requests.
-3. Nginx forwards those requests to the backend dashboard API.
-4. The backend returns JSON payloads used by the React UI.
+2. The frontend opens `/api/live` for pushed dashboard snapshots and change notifications.
+3. The frontend still uses `/api/*` for filtered history queries and config writes.
+4. Nginx forwards those requests to the backend dashboard API on `127.0.0.1:18798`.
+5. The backend returns JSON payloads used by the React UI.
 
 ## Persistence Model
 
@@ -92,6 +94,13 @@ Docker build files:
 - [`Dockerfile`](../Dockerfile): Python backend image
 - [`frontend/Dockerfile`](../frontend/Dockerfile): React dashboard + Nginx image
 
+On Linux, Compose runs both containers with host networking:
+
+- the backend can observe host network changes for routing profiles
+- the proxy listener binds directly on host port `8900`
+- the dashboard frontend binds directly on host port `8798`
+- the backend dashboard API stays on host loopback `127.0.0.1:18798`
+
 ## Public Interfaces
 
 ### CLI
@@ -119,7 +128,7 @@ Common defaults:
 
 - Local backend mixed listener: `8799`
 - Local backend dashboard API: `8798`
-- Compose published proxy listener: `8901`
+- Compose proxy listener: `8900`
 - Compose published dashboard frontend: `8798`
 
 ## Design Notes

@@ -20,6 +20,7 @@ It is designed for cases where a phone or another device on the same network sho
 - `proxy_router/` contains the Python backend package.
 - `frontend/` contains the React dashboard app.
 - The backend exposes the dashboard API on `/api/*`.
+- The dashboard also opens a live WebSocket on `/api/live` for pushed updates.
 - The dashboard frontend is served separately and reverse-proxies `/api/*` to the backend.
 - Docker uses separate Dockerfiles for the backend and dashboard services
 
@@ -36,7 +37,7 @@ docker compose up -d --build
 Open:
 
 - Dashboard: `http://127.0.0.1:8798`
-- Proxy listener: `127.0.0.1:8901`
+- Proxy listener: `127.0.0.1:8900`
 
 If you want to use a phone on the same Wi-Fi:
 
@@ -44,7 +45,7 @@ If you want to use a phone on the same Wi-Fi:
 2. In the phone Wi-Fi proxy settings, choose a manual HTTP proxy.
 3. Set:
    - Host: your computer's LAN IP
-   - Port: `8901`
+   - Port: `8900`
 
 ### Local development
 
@@ -100,15 +101,21 @@ To reset stored state completely:
 
 The Compose stack publishes:
 
-- Proxy listener: `8901`
+- Proxy listener: `8900`
 - Dashboard frontend: `8798`
 
-The backend dashboard API stays internal to Compose on port `8798` and is reverse-proxied by the dashboard container at `/api/*`.
+On Linux, Compose runs both services with host networking so the backend can observe the real host route and VPN changes for routing profiles.
+
+The backend dashboard API binds only to `127.0.0.1:18798` on the host and is reverse-proxied by the dashboard container at `/api/*`.
 
 Build files:
 
 - [Dockerfile](Dockerfile) for the Python proxy/API container
 - [frontend/Dockerfile](frontend/Dockerfile) for the static React dashboard container
+
+Upstream proxy note:
+
+- In the Compose deployment, the backend uses host networking, so a host-side upstream proxy can use `127.0.0.1`.
 
 ## Routing Model
 
@@ -135,6 +142,8 @@ The dashboard includes five main areas:
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
+- Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
+- Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
 - `Ignore` on an automatic rule converts it into a permanent manual `Direct` rule

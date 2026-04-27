@@ -89,6 +89,11 @@ small {
   color: var(--warning);
 }
 
+.pill-muted {
+  background: #ece7dc;
+  color: #6a6f73;
+}
+
 .tabs {
   display: flex;
   gap: 0.55rem;

@@ -151,6 +151,7 @@ class ClientTracker:
 
     def connected(self, client_ip: str):
         self.runtime.dashboard_state.client_connected(self.proxy_label, client_ip)
+        self.runtime.notify_dashboard_update("connections")
         with self._lock:
             self._active_by_ip[client_ip] = self._active_by_ip.get(client_ip, 0) + 1
             active_count = self._active_by_ip[client_ip]
@@ -162,6 +163,7 @@ class ClientTracker:
 
     def disconnected(self, client_ip: str):
         self.runtime.dashboard_state.client_disconnected(self.proxy_label, client_ip)
+        self.runtime.notify_dashboard_update("connections")
         with self._lock:
             current = self._active_by_ip.get(client_ip, 0)
             if current <= 1:
@@ -218,6 +220,7 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
         debug,
         proxy_label,
         router_config,
+        runtime,
     ):
         self.ssl_context = ssl_context
         super().__init__(
@@ -229,6 +232,7 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
             debug=debug,
             proxy_label=proxy_label,
             router_config=router_config,
+            runtime=runtime,
         )
 
     def get_request(self):
@@ -265,7 +269,6 @@ class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServ
         self.verbose = verbose
         self.debug = debug
         self.router_config = router_config
-        self.runtime = runtime
         self.runtime = runtime
         self.client_trackers = {
             "http": ClientTracker("http", runtime),
@@ -804,6 +807,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 port,
                 self.server.timeout_seconds,
             )
+            self.server.runtime.record_upstream_route_success(
+                route_decision,
+                destination=f"{host}:{port}",
+                proxy_label=self.server.proxy_label,
+            )
             return connection.sock, connection
 
         upstream_socket = create_socks5_proxy_connection(
@@ -812,6 +820,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             host,
             port,
             self.server.timeout_seconds,
+        )
+        self.server.runtime.record_upstream_route_success(
+            route_decision,
+            destination=f"{host}:{port}",
+            proxy_label=self.server.proxy_label,
         )
         return upstream_socket, None
 
@@ -873,6 +886,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             f"elapsed_ms={upstream_elapsed_ms}"
         )
         self._debug(f"upstream response headers={format_headers_for_log(response.headers)}")
+        self.server.runtime.record_upstream_route_success(
+            route_decision,
+            destination=f"{host}:{port}",
+            proxy_label=self.server.proxy_label,
+        )
         return connection, response
 
     def _write_response(
@@ -971,6 +989,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         matched_rule = route_decision["matched_rule"] if route_decision is not None else None
         profile_id = route_decision.get("profile_id") if route_decision is not None else DEFAULT_ROUTING_PROFILE_ID
         error_message = self._describe_upstream_error(exc)
+        self.server.runtime.record_upstream_route_failure(
+            route_decision,
+            destination=destination,
+            error=error_message,
+            context=context,
+            proxy_label=self.server.proxy_label,
+        )
         self.server.runtime.record_failure(
             proxy_label=self.server.proxy_label,
             client=self.client_address[0],
@@ -1044,7 +1069,8 @@ class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.verbose = verbose
         self.debug = debug
         self.proxy_label = "socks5"
-        self.client_tracker = ClientTracker(self.proxy_label)
+        self.runtime = runtime
+        self.client_tracker = ClientTracker(self.proxy_label, runtime)
         self.router_config = router_config
 
 class Socks5RequestHandler(socketserver.BaseRequestHandler):
@@ -1234,6 +1260,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 bind_host, bind_port = upstream.getsockname()[:2]
                 self._send_success_reply(bind_host, bind_port)
                 self._log(f"connect {destination_host}:{destination_port} via {route_decision['route_label']}")
+                self.server.runtime.record_upstream_route_success(
+                    route_decision,
+                    destination=f"{destination_host}:{destination_port}",
+                    proxy_label=self.server.proxy_label,
+                )
                 stats = tunnel_bidirectional(self.request, upstream)
                 self._debug(
                     "tunnel closed "
@@ -1263,6 +1294,17 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 self._debug(f"client disconnected before SOCKS5 reply could be sent: {exc}", level="INFO")
                 return
             debug_exception(self.server.proxy_label, f"{self._client_label()} - SOCKS5 handler error", exc)
+            self.server.runtime.record_upstream_route_failure(
+                route_decision if "route_decision" in locals() else None,
+                destination=(
+                    f"{destination_host}:{destination_port}"
+                    if "destination_host" in locals()
+                    else "SOCKS5 CONNECT"
+                ),
+                error=str(exc),
+                context="SOCKS5 CONNECT",
+                proxy_label=self.server.proxy_label,
+            )
             self.server.runtime.record_failure(
                 proxy_label=self.server.proxy_label,
                 client=self.client_address[0],

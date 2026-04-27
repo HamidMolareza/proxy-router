@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import socket
 import threading
 from collections import deque
@@ -204,6 +205,319 @@ class DashboardState:
 
         return build_failure_snapshot_from_records(recent_failures, router_config_snapshot)
 
+
+class DashboardLiveUpdateHub:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._revision = 0
+        self._events = deque(maxlen=DASHBOARD_LIVE_EVENT_BACKLOG)
+
+    def current_revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def notify(self, reason: str):
+        normalized_reason = str(reason or "dashboard").strip() or "dashboard"
+        event = {
+            "revision": 0,
+            "reason": normalized_reason,
+            "history_changed": normalized_reason in {"usage", "clear"},
+            "router_config_changed": normalized_reason == "router-config",
+        }
+        with self._condition:
+            self._revision += 1
+            event["revision"] = self._revision
+            self._events.append(event)
+            self._condition.notify_all()
+
+    def wait_for_changes(self, last_revision: int, *, timeout: float):
+        with self._condition:
+            if self._revision <= last_revision:
+                self._condition.wait(timeout)
+            if self._revision <= last_revision:
+                return None
+
+            changed_events = [
+                event
+                for event in self._events
+                if int(event.get("revision", 0)) > int(last_revision)
+            ]
+            if not changed_events and self._events:
+                changed_events = [self._events[-1]]
+
+            reasons = sorted({str(event.get("reason") or "dashboard") for event in changed_events})
+            return {
+                "revision": int(changed_events[-1]["revision"]),
+                "reasons": reasons,
+                "history_changed": any(bool(event.get("history_changed")) for event in changed_events),
+                "router_config_changed": any(bool(event.get("router_config_changed")) for event in changed_events),
+            }
+
+
+def _timestamp_now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise OSError("connection closed while reading from upstream")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _describe_upstream_probe_error(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "Connection timed out."
+    if isinstance(exc, socket.gaierror):
+        return "Failed to resolve the upstream host."
+    if isinstance(exc, OSError):
+        if exc.errno == errno.ENETUNREACH:
+            return "Network is unreachable from this machine."
+        if exc.errno == errno.EHOSTUNREACH:
+            return "Upstream host is unreachable."
+        if exc.errno == errno.ECONNREFUSED:
+            return "Upstream server refused the connection."
+        if exc.errno == errno.ECONNRESET:
+            return "Upstream connection was reset."
+    return str(exc) or exc.__class__.__name__
+
+
+def _probe_upstream_connectivity(upstream_config: dict, *, timeout_seconds: int):
+    upstream_type = str(upstream_config.get("type") or "http")
+    host = str(upstream_config.get("host") or "").strip()
+    port = int(upstream_config.get("port") or 0)
+    if not host or port <= 0:
+        raise ValueError("Upstream host and port must be set before checking connectivity.")
+
+    if upstream_type == "socks5":
+        upstream = socket.create_connection((host, port), timeout=timeout_seconds)
+        upstream.settimeout(timeout_seconds)
+        try:
+            upstream.sendall(bytes([SOCKS_VERSION, 0x01, 0x00]))
+            reply = _recv_exact(upstream, 2)
+            if reply[0] != SOCKS_VERSION:
+                raise OSError("SOCKS5 upstream returned an invalid handshake reply.")
+            if reply[1] == 0xFF:
+                raise OSError("SOCKS5 upstream requires authentication, which proxy-router does not support.")
+            if reply[1] != 0x00:
+                raise OSError(f"SOCKS5 upstream rejected the no-auth handshake (method 0x{reply[1]:02x}).")
+        finally:
+            upstream.close()
+        return {
+            "status": "reachable",
+            "checked_at": _timestamp_now(),
+            "message": "SOCKS5 handshake succeeded.",
+            "protocol_verified": True,
+        }
+
+    upstream = socket.create_connection((host, port), timeout=timeout_seconds)
+    try:
+        pass
+    finally:
+        upstream.close()
+    return {
+        "status": "reachable",
+        "checked_at": _timestamp_now(),
+        "message": "TCP connection succeeded. HTTP proxy protocol will be confirmed by the first proxied request.",
+        "protocol_verified": False,
+    }
+
+
+class UpstreamProxyStatus:
+    def __init__(self, notify_callback):
+        self._lock = threading.Lock()
+        self._notify_callback = notify_callback
+        self._generation = 0
+        self._config_fingerprint = None
+        self._state = self._build_state(
+            enabled=False,
+            upstream_type="http",
+            host="127.0.0.1",
+            port=0,
+            connectivity={
+                "status": "disabled",
+                "checked_at": None,
+                "message": "Upstream proxy is disabled.",
+                "protocol_verified": False,
+            },
+        )
+
+    def _build_state(self, *, enabled, upstream_type, host, port, connectivity, last_success=None, last_failure=None):
+        return {
+            "enabled": bool(enabled),
+            "type": upstream_type,
+            "host": host,
+            "port": int(port),
+            "connectivity": {
+                "status": str(connectivity.get("status") or "unknown"),
+                "checked_at": connectivity.get("checked_at"),
+                "message": str(connectivity.get("message") or ""),
+                "protocol_verified": bool(connectivity.get("protocol_verified")),
+            },
+            "last_success": last_success,
+            "last_failure": last_failure,
+        }
+
+    def _fingerprint(self, upstream):
+        upstream_type = str(upstream.get("type") or "http").strip().lower()
+        host = str(upstream.get("host") or "").strip().lower()
+        port = int(upstream.get("port") or 0)
+        enabled = bool(upstream.get("enabled"))
+        return json.dumps(
+            {
+                "enabled": enabled,
+                "type": upstream_type,
+                "host": host,
+                "port": port,
+            },
+            sort_keys=True,
+        )
+
+    def _matches_current_locked(self, upstream) -> bool:
+        if upstream is None:
+            return False
+        return self._fingerprint(upstream) == self._config_fingerprint
+
+    def _notify(self):
+        self._notify_callback("upstream-status")
+
+    def snapshot(self):
+        with self._lock:
+            return json.loads(json.dumps(self._state))
+
+    def apply_config(self, router_config, *, timeout_seconds: int):
+        upstream = dict((router_config or {}).get("upstream") or {})
+        normalized = {
+            "enabled": bool(upstream.get("enabled")),
+            "type": "socks5" if str(upstream.get("type") or "").strip().lower() == "socks5" else "http",
+            "host": str(upstream.get("host") or "").strip(),
+            "port": int(upstream.get("port") or 0),
+        }
+        next_fingerprint = self._fingerprint(normalized)
+        with self._lock:
+            config_changed = next_fingerprint != self._config_fingerprint
+            self._config_fingerprint = next_fingerprint
+            self._generation += 1
+            generation = self._generation
+            last_success = None if config_changed else self._state.get("last_success")
+            last_failure = None if config_changed else self._state.get("last_failure")
+            if not normalized["enabled"]:
+                self._state = self._build_state(
+                    enabled=False,
+                    upstream_type=normalized["type"],
+                    host=normalized["host"],
+                    port=normalized["port"],
+                    connectivity={
+                        "status": "disabled",
+                        "checked_at": _timestamp_now(),
+                        "message": "Upstream proxy is disabled.",
+                        "protocol_verified": False,
+                    },
+                    last_success=last_success,
+                    last_failure=last_failure,
+                )
+                should_probe = False
+            elif not normalized["host"] or normalized["port"] <= 0:
+                self._state = self._build_state(
+                    enabled=True,
+                    upstream_type=normalized["type"],
+                    host=normalized["host"],
+                    port=normalized["port"],
+                    connectivity={
+                        "status": "error",
+                        "checked_at": _timestamp_now(),
+                        "message": "Upstream host and port must be set before proxy traffic can use it.",
+                        "protocol_verified": False,
+                    },
+                    last_success=last_success,
+                    last_failure=last_failure,
+                )
+                should_probe = False
+            else:
+                self._state = self._build_state(
+                    enabled=True,
+                    upstream_type=normalized["type"],
+                    host=normalized["host"],
+                    port=normalized["port"],
+                    connectivity={
+                        "status": "checking",
+                        "checked_at": None,
+                        "message": "Checking upstream connectivity…",
+                        "protocol_verified": False,
+                    },
+                    last_success=last_success,
+                    last_failure=last_failure,
+                )
+                should_probe = True
+
+        self._notify()
+
+        if not should_probe:
+            return
+
+        probe_thread = threading.Thread(
+            target=self._run_probe,
+            args=(generation, normalized, timeout_seconds),
+            daemon=True,
+        )
+        probe_thread.start()
+
+    def _run_probe(self, generation: int, upstream: dict, timeout_seconds: int):
+        try:
+            result = _probe_upstream_connectivity(upstream, timeout_seconds=timeout_seconds)
+        except Exception as exc:
+            result = {
+                "status": "error",
+                "checked_at": _timestamp_now(),
+                "message": _describe_upstream_probe_error(exc),
+                "protocol_verified": False,
+            }
+
+        with self._lock:
+            if generation != self._generation or not self._matches_current_locked(upstream):
+                return
+            self._state["connectivity"] = {
+                "status": result["status"],
+                "checked_at": result["checked_at"],
+                "message": result["message"],
+                "protocol_verified": bool(result.get("protocol_verified")),
+            }
+
+        self._notify()
+
+    def trigger_manual_check(self, router_config, *, timeout_seconds: int):
+        self.apply_config(router_config, timeout_seconds=timeout_seconds)
+
+    def record_success(self, upstream: dict | None, *, destination: str, proxy_label: str):
+        with self._lock:
+            if not self._matches_current_locked(upstream):
+                return
+            self._state["last_success"] = {
+                "timestamp": _timestamp_now(),
+                "destination": str(destination or ""),
+                "proxy_label": str(proxy_label or ""),
+            }
+        self._notify()
+
+    def record_failure(self, upstream: dict | None, *, destination: str, error: str, context: str, proxy_label: str):
+        with self._lock:
+            if not self._matches_current_locked(upstream):
+                return
+            self._state["last_failure"] = {
+                "timestamp": _timestamp_now(),
+                "destination": str(destination or ""),
+                "error": str(error or ""),
+                "context": str(context or ""),
+                "proxy_label": str(proxy_label or ""),
+            }
+        self._notify()
+
 class UsageLogger:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
@@ -362,7 +676,7 @@ class SelfEndpoints:
         client_ips,
         listener_ports,
     ):
-        aliases = {"127.0.0.1", "localhost"}
+        aliases = {"127.0.0.1", "localhost", "host.docker.internal"}
         for candidate in [bind, dashboard_bind, *client_ips]:
             if not candidate or candidate == "0.0.0.0":
                 continue
@@ -396,6 +710,7 @@ class SelfEndpoints:
 class AppRuntime:
     def __init__(self):
         self.dashboard_state = DashboardState()
+        self.live_updates = DashboardLiveUpdateHub()
         self.usage_log_path: Path | None = None
         self.failure_log_path: Path | None = None
         self.usage_logger = UsageLogger(None)
@@ -403,6 +718,7 @@ class AppRuntime:
         self.traffic_quota_manager = TrafficQuotaManager()
         self.auto_proxy_failure_manager = None
         self.self_endpoints = SelfEndpoints()
+        self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
 
     def configure_usage_log(self, log_file: Path | None):
         self.usage_logger.close()
@@ -484,11 +800,51 @@ class AppRuntime:
             self.auto_proxy_failure_manager = None
         if router_config is not None:
             self.auto_proxy_failure_manager = AutoProxyFailureManager(router_config)
+            self.refresh_upstream_status(router_config.snapshot())
+        else:
+            self.refresh_upstream_status(None)
 
     def apply_auto_proxy_probe_route(self, host: str | None, route_decision):
         if self.auto_proxy_failure_manager is None:
             return route_decision
         return self.auto_proxy_failure_manager.route_override(host, route_decision)
+
+    def notify_dashboard_update(self, reason: str):
+        self.live_updates.notify(reason)
+
+    def refresh_upstream_status(self, router_config):
+        self.upstream_status.apply_config(
+            router_config,
+            timeout_seconds=UPSTREAM_STATUS_PROBE_TIMEOUT_SECONDS,
+        )
+
+    def record_upstream_route_success(self, route_decision, *, destination: str, proxy_label: str):
+        if route_decision is None or route_decision.get("action") != "proxy":
+            return
+        self.upstream_status.record_success(
+            route_decision.get("upstream"),
+            destination=destination,
+            proxy_label=proxy_label,
+        )
+
+    def record_upstream_route_failure(
+        self,
+        route_decision,
+        *,
+        destination: str,
+        error: str,
+        context: str,
+        proxy_label: str,
+    ):
+        if route_decision is None or route_decision.get("action") != "proxy":
+            return
+        self.upstream_status.record_failure(
+            route_decision.get("upstream"),
+            destination=destination,
+            error=error,
+            context=context,
+            proxy_label=proxy_label,
+        )
 
     def record_auto_proxy_success(self, host: str | None, route_decision):
         if self.auto_proxy_failure_manager is None or route_decision is None:
@@ -545,6 +901,7 @@ class AppRuntime:
             total_bytes=uploaded_bytes + downloaded_bytes,
             timestamp=timestamp,
         )
+        self.notify_dashboard_update("usage")
 
     def record_failure(
         self,
@@ -601,6 +958,7 @@ class AppRuntime:
                 method=method,
                 profile_id=profile_id,
             )
+        self.notify_dashboard_update("failure")
 
     def clear_traffic_data(self):
         self.dashboard_state.clear_traffic_data()
@@ -609,6 +967,7 @@ class AppRuntime:
         self.traffic_quota_manager.clear()
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.clear_observations()
+        self.notify_dashboard_update("clear")
 
     def close(self):
         if self.auto_proxy_failure_manager is not None:

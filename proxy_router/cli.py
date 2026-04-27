@@ -617,7 +617,10 @@ def main():
     runtime.rehydrate_dashboard_state()
 
     try:
-        router_config = RouterConfigManager(router_config_path)
+        router_config = RouterConfigManager(
+            router_config_path,
+            change_callback=runtime.notify_dashboard_update,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         runtime.close()
         DEBUG_LOGGER.close()

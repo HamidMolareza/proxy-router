@@ -2,10 +2,6 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY proxy-router /app/proxy-router
 COPY proxy_router /app/proxy_router
 

@@ -4,15 +4,16 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: proxy-router
+    network_mode: host
     command:
       - --bind
       - 0.0.0.0
       - --mixed-port
-      - "8901"
+      - "8900"
       - --dashboard-bind
-      - 0.0.0.0
+      - 127.0.0.1
       - --dashboard-port
-      - "8798"
+      - "18798"
       - --router-config-file
       - /data/router-config.json
       - --usage-log-file
@@ -21,10 +22,6 @@ services:
       - /data/failures.log
       - --error-log-file
       - /data/error.log
-    ports:
-      - "8901:8901"
-    expose:
-      - "8798"
     volumes:
       - ./data:/data
     restart: unless-stopped
@@ -35,7 +32,7 @@ services:
         - -c
         - |
           import urllib.request
-          urllib.request.urlopen("http://127.0.0.1:8798/api/dashboard", timeout=5).read()
+          urllib.request.urlopen("http://127.0.0.1:18798/api/dashboard", timeout=5).read()
       interval: 30s
       timeout: 5s
       retries: 3
@@ -46,11 +43,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: proxy-router-dashboard
+    network_mode: host
     depends_on:
       proxy-router:
         condition: service_healthy
-    ports:
-      - "8798:8798"
     restart: unless-stopped
     healthcheck:
       test:

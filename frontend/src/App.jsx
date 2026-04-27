@@ -105,7 +105,25 @@ function emptyDashboardSnapshot() {
         name: 'Shared',
         using_fallback: true,
       },
+      upstream_status: emptyUpstreamStatus(),
     },
+  }
+}
+
+function emptyUpstreamStatus() {
+  return {
+    enabled: false,
+    type: 'http',
+    host: '127.0.0.1',
+    port: 0,
+    connectivity: {
+      status: 'disabled',
+      checked_at: null,
+      message: 'Upstream proxy is disabled.',
+      protocol_verified: false,
+    },
+    last_success: null,
+    last_failure: null,
   }
 }
 
@@ -656,6 +674,105 @@ function currentRouterRuntime(snapshot) {
   return snapshot && typeof snapshot === 'object' && snapshot.router_runtime ? snapshot.router_runtime : {}
 }
 
+function currentUpstreamStatus(snapshot) {
+  const runtime = currentRouterRuntime(snapshot)
+  const source = runtime.upstream_status && typeof runtime.upstream_status === 'object' ? runtime.upstream_status : {}
+  const connectivity = source.connectivity && typeof source.connectivity === 'object' ? source.connectivity : {}
+  const normalizeActivity = (activity) =>
+    activity && typeof activity === 'object'
+      ? {
+          timestamp: activity.timestamp ? String(activity.timestamp) : null,
+          destination: String(activity.destination || ''),
+          error: activity.error ? String(activity.error) : '',
+          context: activity.context ? String(activity.context) : '',
+          proxy_label: String(activity.proxy_label || ''),
+        }
+      : null
+
+  return {
+    enabled: Boolean(source.enabled),
+    type: source.type === 'socks5' ? 'socks5' : 'http',
+    host: String(source.host || '127.0.0.1'),
+    port: Number(source.port) || 0,
+    connectivity: {
+      status: String(connectivity.status || (source.enabled ? 'unknown' : 'disabled')),
+      checked_at: connectivity.checked_at ? String(connectivity.checked_at) : null,
+      message: String(
+        connectivity.message || (source.enabled ? 'Waiting for an upstream connectivity check.' : 'Upstream proxy is disabled.'),
+      ),
+      protocol_verified: Boolean(connectivity.protocol_verified),
+    },
+    last_success: normalizeActivity(source.last_success),
+    last_failure: normalizeActivity(source.last_failure),
+  }
+}
+
+function formatStatusDateTime(value) {
+  const parsed = parseDateText(value)
+  return parsed ? parsed.toLocaleString() : 'Unknown time'
+}
+
+function buildUpstreamConnectivityLabel(upstreamStatus) {
+  const status = String(upstreamStatus.connectivity.status || 'unknown')
+  if (status === 'disabled') {
+    return 'Disabled'
+  }
+  if (status === 'checking') {
+    return 'Checking'
+  }
+  if (status === 'reachable') {
+    return upstreamStatus.connectivity.protocol_verified ? 'Reachable' : 'TCP connected'
+  }
+  if (status === 'error') {
+    return 'Failed'
+  }
+  return 'Unknown'
+}
+
+function buildUpstreamConnectivityPillClass(upstreamStatus) {
+  const status = String(upstreamStatus.connectivity.status || 'unknown')
+  if (status === 'error') {
+    return 'pill pill-warning'
+  }
+  if (status === 'disabled') {
+    return 'pill pill-muted'
+  }
+  return 'pill'
+}
+
+function buildUpstreamTrafficHeadline(upstreamStatus) {
+  if (!upstreamStatus.enabled) {
+    return 'Not in use'
+  }
+  const lastSuccessAt = parseDateText(upstreamStatus.last_success && upstreamStatus.last_success.timestamp)
+  const lastFailureAt = parseDateText(upstreamStatus.last_failure && upstreamStatus.last_failure.timestamp)
+  if (lastSuccessAt && (!lastFailureAt || lastSuccessAt.getTime() >= lastFailureAt.getTime())) {
+    return 'Working'
+  }
+  if (lastFailureAt) {
+    return 'Failing'
+  }
+  return 'Waiting for first proxied request'
+}
+
+function buildUpstreamTrafficNotes(upstreamStatus) {
+  const notes = []
+  if (upstreamStatus.last_success && upstreamStatus.last_success.timestamp) {
+    notes.push(
+      `Last success: ${formatStatusDateTime(upstreamStatus.last_success.timestamp)} -> ${upstreamStatus.last_success.destination}`,
+    )
+  }
+  if (upstreamStatus.last_failure && upstreamStatus.last_failure.timestamp) {
+    notes.push(
+      `Last failure: ${formatStatusDateTime(upstreamStatus.last_failure.timestamp)} -> ${upstreamStatus.last_failure.destination} · ${upstreamStatus.last_failure.error}`,
+    )
+  }
+  if (!notes.length) {
+    notes.push('No proxied request has used the current upstream yet.')
+  }
+  return notes
+}
+
 function activeProfileId(snapshot) {
   const runtime = currentRouterRuntime(snapshot)
   const activeProfile = runtime.active_profile || {}
@@ -855,6 +972,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const activeProfile = runtime.active_profile || {}
   const activeProfileConfig = (config.routing_profiles || []).find((profile) => profile.id === activeProfile.id)
   const editorTargetLabel = getEditorTargetLabel(config, profileId)
+  const upstreamStatus = currentUpstreamStatus(snapshot)
   const upstreamLabel = config.upstream.enabled
     ? `${config.upstream.type}://${config.upstream.host || '?'}:${config.upstream.port || '?'}`
     : 'Disabled'
@@ -873,6 +991,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Enabled', String(enabledRules)],
     ['Default', currentTarget.default_action],
     ['Upstream', upstreamLabel],
+    ['Upstream check', buildUpstreamConnectivityLabel(upstreamStatus)],
     ['Auto proxy', autoProxyStatus],
     ['Default quota', defaultClientLimitLabel],
     ['Client limits', `${enabledClientLimits}/${config.client_traffic_limits.length}`],
@@ -925,6 +1044,11 @@ function buildRulesExportPayload(config) {
       rules: profile.rules,
     })),
   }
+}
+
+function buildLiveSocketUrl() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/api/live`
 }
 
 function createProfileId() {
@@ -1043,6 +1167,15 @@ function App() {
   const [routerSaveError, setRouterSaveError] = useState('')
   const [routerEditVersion, setRouterEditVersion] = useState(0)
   const routerEditVersionRef = useRef(0)
+  const liveSocketRef = useRef(null)
+  const liveSocketReconnectRef = useRef(null)
+  const historyRefreshTimerRef = useRef(null)
+  const activeTabRef = useRef(activeTab)
+  const historyRangeRef = useRef(historyRange)
+  const historyProxyTypeRef = useRef(historyProxyType)
+  const routerHasLocalChangesRef = useRef(false)
+  const refreshHistoryRef = useRef(null)
+  const loadRouterConfigRef = useRef(null)
 
   const safeEditorProfileId =
     currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
@@ -1096,6 +1229,7 @@ function App() {
   const overviewCards = buildOverviewCards(dashboardSnapshot)
   const usageChartPoints = buildUsageChartPoints(dashboardSnapshot)
   const profileRuntimeItems = buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot)
+  const upstreamStatus = currentUpstreamStatus(dashboardSnapshot)
   const routerSummaryItems = buildRouterSummaryItems(
     currentRouterConfig,
     safeEditorProfileId,
@@ -1238,76 +1372,154 @@ function App() {
   }, [routerEditVersion])
 
   useEffect(() => {
-    let cancelled = false
+    activeTabRef.current = activeTab
+    historyRangeRef.current = historyRange
+    historyProxyTypeRef.current = historyProxyType
+    routerHasLocalChangesRef.current = routerHasLocalChanges
+  }, [activeTab, historyRange, historyProxyType, routerHasLocalChanges])
 
-    async function refreshAll() {
-      try {
-        const response = await fetch('/api/dashboard', {
-          cache: 'no-store',
-          headers: {
-            Accept: 'application/json',
-          },
-        })
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-        const snapshot = await response.json()
-        if (!cancelled) {
-          setNowMs(Date.now())
-          setDashboardSnapshot(snapshot)
-          setStatus({
-            text: `Live updates every 2 seconds · ${new Date().toLocaleTimeString()}`,
-            warning: false,
-          })
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setStatus({
-            text: `Live updates paused: ${error.message}`,
-            warning: true,
-          })
-        }
+  useEffect(() => {
+    refreshHistoryRef.current = refreshHistory
+    loadRouterConfigRef.current = loadRouterConfig
+  })
+
+  useEffect(() => {
+    let disposed = false
+    let reconnectDelayMs = 1000
+
+    function scheduleHistoryRefresh() {
+      if (historyRefreshTimerRef.current != null) {
+        return
       }
-
-      try {
-        const params = new URLSearchParams()
-        params.set('range', historyRange)
-        if (historyProxyType !== 'all') {
-          params.set('proxy_type', historyProxyType)
+      historyRefreshTimerRef.current = window.setTimeout(() => {
+        historyRefreshTimerRef.current = null
+        const refresh = refreshHistoryRef.current
+        if (!refresh) {
+          return
         }
-
-        const response = await fetch(`/api/history?${params.toString()}`, {
-          cache: 'no-store',
-          headers: {
-            Accept: 'application/json',
-          },
-        })
-        if (!response.ok) {
-          throw new Error(`history HTTP ${response.status}`)
-        }
-        const history = await response.json()
-        if (!cancelled) {
-          setHistoryData(history)
-          setHistoryError('')
-          if (historyProxyType !== 'all' && !history.available_proxy_types.includes(historyProxyType)) {
-            setHistoryProxyType('all')
-          }
-        }
-      } catch (error) {
-        if (!cancelled) {
+        refresh(historyRangeRef.current, historyProxyTypeRef.current).catch((error) => {
           setHistoryError(`History refresh paused: ${error.message}`)
-        }
-      }
+        })
+      }, 250)
     }
 
-    refreshAll()
-    const intervalId = window.setInterval(refreshAll, 2000)
+    function connectLiveSocket() {
+      if (disposed) {
+        return
+      }
+
+      const socket = new WebSocket(buildLiveSocketUrl())
+      liveSocketRef.current = socket
+
+      socket.addEventListener('open', () => {
+        reconnectDelayMs = 1000
+        setStatus({
+          text: `Live socket connected · ${new Date().toLocaleTimeString()}`,
+          warning: false,
+        })
+      })
+
+      socket.addEventListener('message', (event) => {
+        let payload
+        try {
+          payload = JSON.parse(event.data)
+        } catch {
+          return
+        }
+
+        if (payload.type === 'heartbeat') {
+          return
+        }
+
+        if (payload.type !== 'snapshot' || !payload.snapshot) {
+          return
+        }
+
+        setNowMs(Date.now())
+        setDashboardSnapshot(payload.snapshot)
+        setStatus({
+          text: `Live socket connected · ${new Date().toLocaleTimeString()}`,
+          warning: false,
+        })
+
+        if (payload.router_config_changed && !routerHasLocalChangesRef.current && loadRouterConfigRef.current) {
+          loadRouterConfigRef.current().catch((error) => {
+            setRouterStatusOverride({
+              text: `Config refresh failed: ${error.message}`,
+              warning: true,
+            })
+          })
+        }
+
+        if (payload.history_changed && activeTabRef.current === 'history') {
+          scheduleHistoryRefresh()
+        }
+      })
+
+      socket.addEventListener('close', () => {
+        if (disposed) {
+          return
+        }
+        setStatus({
+          text: `Live socket disconnected · retrying in ${Math.round(reconnectDelayMs / 1000)}s`,
+          warning: true,
+        })
+        liveSocketReconnectRef.current = window.setTimeout(() => {
+          liveSocketReconnectRef.current = null
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 10000)
+          connectLiveSocket()
+        }, reconnectDelayMs)
+      })
+
+      socket.addEventListener('error', () => {
+        try {
+          socket.close()
+        } catch {
+          // Ignore close errors during reconnect handling.
+        }
+      })
+    }
+
+    connectLiveSocket()
 
     return () => {
-      cancelled = true
-      window.clearInterval(intervalId)
+      disposed = true
+      if (liveSocketReconnectRef.current != null) {
+        window.clearTimeout(liveSocketReconnectRef.current)
+        liveSocketReconnectRef.current = null
+      }
+      if (historyRefreshTimerRef.current != null) {
+        window.clearTimeout(historyRefreshTimerRef.current)
+        historyRefreshTimerRef.current = null
+      }
+      if (liveSocketRef.current) {
+        try {
+          liveSocketRef.current.close()
+        } catch {
+          // Ignore socket close errors during unmount.
+        }
+        liveSocketRef.current = null
+      }
     }
-  }, [historyRange, historyProxyType])
+  }, [])
+
+  useEffect(() => {
+    if (activeTab !== 'history') {
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      const refresh = refreshHistoryRef.current
+      if (!refresh) {
+        return
+      }
+      refresh(historyRange, historyProxyType).catch((error) => {
+        setHistoryError(`History refresh paused: ${error.message}`)
+      })
+    }, 0)
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [activeTab, historyRange, historyProxyType])
 
   useEffect(() => {
     if (!routerDirty) {
@@ -1609,6 +1821,36 @@ function App() {
       resetRulesPage: true,
       message: 'Profile created from the current network. Syncing automatically.',
     })
+  }
+
+  async function triggerUpstreamCheck() {
+    try {
+      const response = await fetch('/api/upstream/check', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+        },
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `upstream check HTTP ${response.status}`)
+      }
+      if (payload.status) {
+        setDashboardSnapshot((existingSnapshot) => ({
+          ...existingSnapshot,
+          router_runtime: {
+            ...currentRouterRuntime(existingSnapshot),
+            upstream_status: payload.status,
+          },
+        }))
+      }
+      setRouterStatusOverride(null)
+    } catch (error) {
+      setRouterStatusOverride({
+        text: `Could not start an upstream connectivity check: ${error.message}`,
+        warning: true,
+      })
+    }
   }
 
   async function clearTrafficData() {
@@ -2138,6 +2380,47 @@ function App() {
                         }}
                       />
                     </label>
+                  </div>
+                  <div className="router-note">
+                    In the Docker Compose deployment, proxy-router uses host networking so a host-side upstream proxy
+                    can use
+                    <strong> 127.0.0.1</strong>.
+                  </div>
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      onClick={triggerUpstreamCheck}
+                      disabled={upstreamStatus.enabled && upstreamStatus.connectivity.status === 'checking'}
+                    >
+                      {upstreamStatus.enabled && upstreamStatus.connectivity.status === 'checking'
+                        ? 'Checking upstream…'
+                        : 'Check upstream now'}
+                    </button>
+                  </div>
+                  <div className="router-summary">
+                    <div className="mini-card">
+                      <div className="mini-label">Connectivity</div>
+                      <div className="mini-value">
+                        <span className={buildUpstreamConnectivityPillClass(upstreamStatus)}>
+                          {buildUpstreamConnectivityLabel(upstreamStatus)}
+                        </span>
+                      </div>
+                      <div className="router-note">
+                        {upstreamStatus.connectivity.message}
+                        {upstreamStatus.connectivity.checked_at
+                          ? ` Checked at ${formatStatusDateTime(upstreamStatus.connectivity.checked_at)}.`
+                          : ''}
+                      </div>
+                    </div>
+                    <div className="mini-card">
+                      <div className="mini-label">Real traffic</div>
+                      <div className="mini-value">{buildUpstreamTrafficHeadline(upstreamStatus)}</div>
+                      {buildUpstreamTrafficNotes(upstreamStatus).map((note) => (
+                        <div className="router-note" key={note}>
+                          {note}
+                        </div>
+                      ))}
+                    </div>
                   </div>
 
                   <div className="router-summary">

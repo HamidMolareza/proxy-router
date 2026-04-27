@@ -13,6 +13,7 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: env.VITE_BACKEND_ORIGIN || 'http://127.0.0.1:8798',
           changeOrigin: true,
+          ws: true,
         },
       },
     },
