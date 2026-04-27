@@ -1176,6 +1176,7 @@ function App() {
   const routerHasLocalChangesRef = useRef(false)
   const refreshHistoryRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
+  const autoSelectedRulesTargetRef = useRef(false)
 
   const safeEditorProfileId =
     currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
@@ -1183,6 +1184,21 @@ function App() {
       ? currentEditorProfileId
       : DEFAULT_ROUTING_PROFILE_ID
   const currentEditorTarget = getRoutingTargetById(currentRouterConfig, safeEditorProfileId) || currentRouterConfig
+  const currentActiveProfileId = activeProfileId(dashboardSnapshot)
+  const currentActiveProfileLabel = getEditorTargetLabel(currentRouterConfig, currentActiveProfileId)
+  const activeProfileAutoRules = (() => {
+    if (!currentActiveProfileId || currentActiveProfileId === DEFAULT_ROUTING_PROFILE_ID) {
+      return []
+    }
+    const activeTarget = getRoutingTargetById(currentRouterConfig, currentActiveProfileId)
+    if (!activeTarget || !Array.isArray(activeTarget.rules)) {
+      return []
+    }
+    return activeTarget.rules.filter(
+      (rule) => rule && rule.enabled !== false && normalizeRuleSource(rule) === 'auto' && normalizeRulePattern(rule.pattern),
+    )
+  })()
+  const editorDiffersFromActiveProfile = safeEditorProfileId !== currentActiveProfileId
   const routerPersistableConfig = buildPersistableRouterConfig(currentRouterConfig)
   const savedRouterPersistableConfig = buildPersistableRouterConfig(lastSavedRouterConfig)
   const routerPersistableFingerprint = routerConfigFingerprint(routerPersistableConfig)
@@ -1382,6 +1398,32 @@ function App() {
     refreshHistoryRef.current = refreshHistory
     loadRouterConfigRef.current = loadRouterConfig
   })
+
+  useEffect(() => {
+    if (autoSelectedRulesTargetRef.current) {
+      return undefined
+    }
+    if (!currentActiveProfileId || currentActiveProfileId === DEFAULT_ROUTING_PROFILE_ID) {
+      return undefined
+    }
+    if (!getRoutingTargetById(currentRouterConfig, currentActiveProfileId)) {
+      return undefined
+    }
+    const timeoutId = window.setTimeout(() => {
+      if (currentEditorProfileId !== currentActiveProfileId) {
+        setCurrentEditorProfileId(currentActiveProfileId)
+        setCurrentRulesPage(1)
+        setRouterStatusOverride({
+          text: `Showing rules for the active profile ${currentActiveProfileLabel}. Shared rules still apply underneath it.`,
+          warning: false,
+        })
+      }
+      autoSelectedRulesTargetRef.current = true
+    }, 0)
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [currentActiveProfileId, currentActiveProfileLabel, currentEditorProfileId, currentRouterConfig])
 
   useEffect(() => {
     let disposed = false
@@ -2278,6 +2320,7 @@ function App() {
                                 <button
                                   type="button"
                                   onClick={() => {
+                                    autoSelectedRulesTargetRef.current = true
                                     setCurrentEditorProfileId(profile.id)
                                     setCurrentRulesPage(1)
                                     setRouterStatusOverride({
@@ -2505,6 +2548,7 @@ function App() {
                       <select
                         value={safeEditorProfileId}
                         onChange={(event) => {
+                          autoSelectedRulesTargetRef.current = true
                           setCurrentEditorProfileId(event.target.value || DEFAULT_ROUTING_PROFILE_ID)
                           setCurrentRulesPage(1)
                           setRouterStatusOverride(null)
@@ -2547,6 +2591,45 @@ function App() {
                       />
                     </label>
                   </div>
+
+                  {currentActiveProfileId !== DEFAULT_ROUTING_PROFILE_ID ? (
+                    <div className="router-note section-gap">
+                      Active network profile:
+                      <strong>{` ${currentActiveProfileLabel}`}</strong>
+                      {activeProfileAutoRules.length
+                        ? ` · ${activeProfileAutoRules.length} auto-detected proxy domains are currently stored there.`
+                        : ' · no auto-detected proxy domains are active there right now.'}
+                    </div>
+                  ) : null}
+
+                  {editorDiffersFromActiveProfile && currentActiveProfileId !== DEFAULT_ROUTING_PROFILE_ID ? (
+                    <div className="button-row tight-row">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          autoSelectedRulesTargetRef.current = true
+                          setCurrentEditorProfileId(currentActiveProfileId)
+                          setCurrentRulesPage(1)
+                          setRouterStatusOverride({
+                            text: `Switched the rules editor to the active profile ${currentActiveProfileLabel}.`,
+                            warning: false,
+                          })
+                        }}
+                      >
+                        Switch to active profile
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {activeProfileAutoRules.length ? (
+                    <div className="chip-list">
+                      {activeProfileAutoRules.map((rule) => (
+                        <div className="chip" key={`${currentActiveProfileId}-${rule.pattern}`}>
+                          <span>{rule.pattern}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
 
                   <div className="failure-controls top-tight">
                     <div className="muted">
