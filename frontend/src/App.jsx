@@ -184,6 +184,7 @@ function emptyDashboardSnapshot() {
         using_fallback: true,
       },
       upstream_status: emptyUpstreamStatus(),
+      https_interception_status: emptyHttpsInterceptionStatus(),
     },
   }
 }
@@ -200,6 +201,30 @@ function emptyUpstreamStatus() {
       message: 'Upstream proxy is disabled.',
       protocol_verified: false,
     },
+    last_success: null,
+    last_failure: null,
+  }
+}
+
+function emptyHttpsInterceptionStatus() {
+  return {
+    enabled: false,
+    available: true,
+    error: null,
+    mode: 'allowlist',
+    trust_policy: 'adaptive',
+    host_patterns: [],
+    bypass_patterns: [],
+    intercepted_ports: [443],
+    ca_cert_file: '',
+    ca_key_file: '',
+    cert_cache_dir: '',
+    ca_exists: false,
+    cache_exists: false,
+    ca_common_name: 'proxy-router Local HTTPS Interception CA',
+    adaptive_bypass_count: 0,
+    active_bypasses: [],
+    adaptive_bypass_ttl_seconds: 3600,
     last_success: null,
     last_failure: null,
   }
@@ -239,6 +264,13 @@ function normalizeOptionalLimitMb(value) {
     return null
   }
   return parsed
+}
+
+function parseHostPatternList(value) {
+  return String(value || '')
+    .split(/[,\s]+/)
+    .map((item) => normalizeRulePattern(item))
+    .filter((item, index, items) => item && items.indexOf(item) === index)
 }
 
 function formatLimitMb(value) {
@@ -535,6 +567,10 @@ function normalizeRouterConfig(config) {
     source.auto_proxy_failures && typeof source.auto_proxy_failures === 'object'
       ? source.auto_proxy_failures
       : {}
+  const httpsInterception =
+    source.https_interception && typeof source.https_interception === 'object'
+      ? source.https_interception
+      : {}
   const defaultClientTrafficLimit =
     source.default_client_traffic_limit && typeof source.default_client_traffic_limit === 'object'
       ? source.default_client_traffic_limit
@@ -575,6 +611,17 @@ function normalizeRouterConfig(config) {
       .filter((exemption) => !isExemptionExpired(exemption)),
     auto_proxy_failures: {
       enabled: Boolean(autoProxyFailures.enabled),
+    },
+    https_interception: {
+      enabled: Boolean(httpsInterception.enabled),
+      mode: httpsInterception.mode === 'all' ? 'all' : 'allowlist',
+      trust_policy: 'adaptive',
+      host_patterns: (Array.isArray(httpsInterception.host_patterns) ? httpsInterception.host_patterns : [])
+        .map((item) => normalizeRulePattern(item))
+        .filter((item, index, items) => item && items.indexOf(item) === index),
+      bypass_patterns: (Array.isArray(httpsInterception.bypass_patterns) ? httpsInterception.bypass_patterns : [])
+        .map((item) => normalizeRulePattern(item))
+        .filter((item, index, items) => item && items.indexOf(item) === index),
     },
     upstream: {
       enabled: Boolean(upstream.enabled),
@@ -785,6 +832,60 @@ function currentUpstreamStatus(snapshot) {
   }
 }
 
+function normalizeHttpsInterceptionActivity(activity) {
+  return activity && typeof activity === 'object'
+    ? {
+        timestamp: activity.timestamp ? String(activity.timestamp) : null,
+        client: String(activity.client || ''),
+        host: activity.host ? String(activity.host) : '',
+        pattern: activity.pattern ? String(activity.pattern) : '',
+        source: String(activity.source || ''),
+        error: activity.error ? String(activity.error) : '',
+        context: activity.context ? String(activity.context) : '',
+        expires_at: activity.expires_at ? String(activity.expires_at) : null,
+      }
+    : null
+}
+
+function currentHttpsInterceptionStatus(snapshot) {
+  const runtime = currentRouterRuntime(snapshot)
+  const source =
+    runtime.https_interception_status && typeof runtime.https_interception_status === 'object'
+      ? runtime.https_interception_status
+      : {}
+  return {
+    ...emptyHttpsInterceptionStatus(),
+    enabled: Boolean(source.enabled),
+    available: source.available !== false,
+    error: source.error ? String(source.error) : null,
+    mode: source.mode === 'all' ? 'all' : 'allowlist',
+    trust_policy: 'adaptive',
+    host_patterns: Array.isArray(source.host_patterns) ? source.host_patterns.map((item) => String(item)) : [],
+    bypass_patterns: Array.isArray(source.bypass_patterns) ? source.bypass_patterns.map((item) => String(item)) : [],
+    intercepted_ports: Array.isArray(source.intercepted_ports) ? source.intercepted_ports.map((item) => Number(item)) : [443],
+    ca_cert_file: String(source.ca_cert_file || ''),
+    ca_key_file: String(source.ca_key_file || ''),
+    cert_cache_dir: String(source.cert_cache_dir || ''),
+    ca_exists: Boolean(source.ca_exists),
+    cache_exists: Boolean(source.cache_exists),
+    ca_common_name: String(source.ca_common_name || 'proxy-router Local HTTPS Interception CA'),
+    adaptive_bypass_count: Number(source.adaptive_bypass_count) || 0,
+    active_bypasses: Array.isArray(source.active_bypasses)
+      ? source.active_bypasses.map((item) => ({
+          scope: String(item.scope || ''),
+          client: String(item.client || ''),
+          host: item.host ? String(item.host) : '',
+          pattern: String(item.pattern || ''),
+          expires_at: item.expires_at ? String(item.expires_at) : null,
+          reason: String(item.reason || ''),
+        }))
+      : [],
+    adaptive_bypass_ttl_seconds: Number(source.adaptive_bypass_ttl_seconds) || 3600,
+    last_success: normalizeHttpsInterceptionActivity(source.last_success),
+    last_failure: normalizeHttpsInterceptionActivity(source.last_failure),
+  }
+}
+
 function formatStatusDateTime(value) {
   const parsed = parseDateText(value)
   return parsed ? parsed.toLocaleString() : 'Unknown time'
@@ -848,6 +949,46 @@ function buildUpstreamTrafficNotes(upstreamStatus) {
   if (!notes.length) {
     notes.push('No proxied request has used the current upstream yet.')
   }
+  return notes
+}
+
+function buildHttpsInterceptionHeadline(status, config) {
+  if (!config.https_interception.enabled) {
+    return 'Disabled'
+  }
+  if (!status.available) {
+    return 'Unavailable'
+  }
+  if (config.https_interception.mode === 'all') {
+    return 'Adaptive sniffing for CONNECT traffic'
+  }
+  const count = config.https_interception.host_patterns.length
+  return count === 1 ? 'Adaptive sniffing for 1 host pattern' : `Adaptive sniffing for ${count} host patterns`
+}
+
+function buildHttpsInterceptionNotes(status, config) {
+  const notes = []
+  if (status.error) {
+    notes.push(status.error)
+  }
+  if (config.https_interception.enabled && config.https_interception.mode === 'allowlist' && !config.https_interception.host_patterns.length) {
+    notes.push('No host patterns are allowlisted yet.')
+  }
+  if (config.https_interception.bypass_patterns.length) {
+    notes.push(`Bypass: ${config.https_interception.bypass_patterns.join(', ')}`)
+  }
+  if (status.adaptive_bypass_count) {
+    notes.push(`${status.adaptive_bypass_count} adaptive bypass(es) are temporarily using raw CONNECT.`)
+  } else if (config.https_interception.enabled) {
+    notes.push('Adaptive fallback is ready; TLS trust failures will temporarily use raw CONNECT.')
+  }
+  if (status.last_success && status.last_success.timestamp) {
+    notes.push(`Last trusted TLS: ${formatStatusDateTime(status.last_success.timestamp)} · ${status.last_success.host || status.last_success.source || 'client'}`)
+  }
+  if (status.last_failure && status.last_failure.timestamp) {
+    notes.push(`Last TLS trust failure: ${formatStatusDateTime(status.last_failure.timestamp)} · ${status.last_failure.host || status.last_failure.source || 'client'}`)
+  }
+  notes.push(status.ca_exists ? 'CA certificate is ready.' : 'CA certificate will be generated on first use or download.')
   return notes
 }
 
@@ -1051,8 +1192,14 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const activeProfileConfig = (config.routing_profiles || []).find((profile) => profile.id === activeProfile.id)
   const editorTargetLabel = getEditorTargetLabel(config, profileId)
   const upstreamStatus = currentUpstreamStatus(snapshot)
+  const httpsStatus = currentHttpsInterceptionStatus(snapshot)
   const upstreamLabel = config.upstream.enabled
     ? `${config.upstream.type}://${config.upstream.host || '?'}:${config.upstream.port || '?'}`
+    : 'Disabled'
+  const httpsInterceptionLabel = config.https_interception.enabled
+    ? `Adaptive · ${config.https_interception.mode === 'all' ? 'all port 443 CONNECT hosts' : `${config.https_interception.host_patterns.length} allowlisted hosts`}${
+        httpsStatus.available ? '' : ' · unavailable'
+      }`
     : 'Disabled'
   const defaultClientLimitLabel = defaultClientLimit.enabled
     ? `1h ${defaultClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${defaultClientLimit.max_past_3h_mb ?? 'none'}MB`
@@ -1070,6 +1217,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Default', currentTarget.default_action],
     ['Upstream', upstreamLabel],
     ['Upstream check', buildUpstreamConnectivityLabel(upstreamStatus)],
+    ['HTTPS sniffing', httpsInterceptionLabel],
     ['Auto proxy', autoProxyStatus],
     ['Default quota', defaultClientLimitLabel],
     ['Client limits', `${enabledClientLimits}/${config.client_traffic_limits.length}`],
@@ -1245,6 +1393,8 @@ function App() {
   const [isSavingRouter, setIsSavingRouter] = useState(false)
   const [routerSaveError, setRouterSaveError] = useState('')
   const [routerEditVersion, setRouterEditVersion] = useState(0)
+  const [httpsHostPatternsText, setHttpsHostPatternsText] = useState('')
+  const [httpsBypassPatternsText, setHttpsBypassPatternsText] = useState('')
   const routerEditVersionRef = useRef(0)
   const liveSocketRef = useRef(null)
   const liveSocketReconnectRef = useRef(null)
@@ -1256,6 +1406,8 @@ function App() {
   const refreshHistoryRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
   const autoSelectedRulesTargetRef = useRef(false)
+  const httpsHostPatternsFocusedRef = useRef(false)
+  const httpsBypassPatternsFocusedRef = useRef(false)
 
   const safeEditorProfileId =
     currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
@@ -1325,6 +1477,7 @@ function App() {
   const usageChartPoints = buildUsageChartPoints(dashboardSnapshot)
   const profileRuntimeItems = buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot)
   const upstreamStatus = currentUpstreamStatus(dashboardSnapshot)
+  const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
   const routerSummaryItems = buildRouterSummaryItems(
     currentRouterConfig,
     safeEditorProfileId,
@@ -1391,6 +1544,11 @@ function App() {
       return ''
     }
     return quotaDeviceSort.direction === 'asc' ? ' ↑' : ' ↓'
+  }
+  function updateHttpsInterceptionPatterns(field, text) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    nextConfig.https_interception[field] = parseHostPatternList(text)
+    setLocalRouterConfig(nextConfig)
   }
   const ignoredDomains = (() => {
     const items = []
@@ -1533,6 +1691,15 @@ function App() {
     historyProxyTypeRef.current = historyProxyType
     routerHasLocalChangesRef.current = routerHasLocalChanges
   }, [activeTab, historyRange, historyProxyType, routerHasLocalChanges])
+
+  useEffect(() => {
+    if (!httpsHostPatternsFocusedRef.current) {
+      setHttpsHostPatternsText(currentRouterConfig.https_interception.host_patterns.join(', '))
+    }
+    if (!httpsBypassPatternsFocusedRef.current) {
+      setHttpsBypassPatternsText(currentRouterConfig.https_interception.bypass_patterns.join(', '))
+    }
+  }, [currentRouterConfig.https_interception.host_patterns, currentRouterConfig.https_interception.bypass_patterns])
 
   useEffect(() => {
     refreshHistoryRef.current = refreshHistory
@@ -2159,6 +2326,7 @@ function App() {
                     ['Time', dashboardSnapshot.latest_request.timestamp],
                     ['Proxy', dashboardSnapshot.latest_request.proxy_type],
                     ['Method', dashboardSnapshot.latest_request.method],
+                    ['Status', dashboardSnapshot.latest_request.status_code || 'n/a'],
                     ['Client', dashboardSnapshot.latest_request.client],
                     ['Destination', dashboardSnapshot.latest_request.destination],
                     ['Route', dashboardSnapshot.latest_request.route_label || 'direct'],
@@ -2259,6 +2427,7 @@ function App() {
                         <th>Time</th>
                         <th>Proxy</th>
                         <th>Method</th>
+                        <th>Status</th>
                         <th>Client</th>
                         <th>Destination</th>
                         <th>Route</th>
@@ -2271,6 +2440,7 @@ function App() {
                           <td>{request.timestamp}</td>
                           <td>{request.proxy_type}</td>
                           <td>{request.method}</td>
+                          <td>{request.status_code || 'n/a'}</td>
                           <td>{request.client}</td>
                           <td className="max-w-md break-words">{request.destination}</td>
                           <td>{request.route_label || 'direct'}</td>
@@ -2399,7 +2569,7 @@ function App() {
               </div>
 
               <div className="mt-3 grid grid-cols-12 gap-4">
-                <section className={cx(subpanelClass, 'col-span-full xl:col-span-5')}>
+                <section className={cx(subpanelClass, 'col-span-full')}>
                   <h3>Profiles</h3>
                   <div className={noteClass}>Detect the current internet and VPN set, then match its saved routing profile.</div>
                   <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
@@ -2509,8 +2679,12 @@ function App() {
                     </table>
                   </div>
 
-                  <div className={cx(noteClass, 'mt-4')}>Global upstream and routing status</div>
-                  <h3>Upstream proxy</h3>
+                </section>
+
+                <section className={cx(subpanelClass, 'order-3 col-span-full')}>
+                  <h3>Global routing</h3>
+                  <div className={noteClass}>Upstream proxy, routing status, auto-proxy policy, and ignored failure domains.</div>
+                  <h3 className="mt-4">Upstream proxy</h3>
                   <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                     <input
                       className={cx(routerHasLocalChanges && dirtyInputClass)}
@@ -2613,6 +2787,112 @@ function App() {
                     </div>
                   </div>
 
+                  <h3 className="mt-4">Automatic HTTPS sniffing</h3>
+                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                    <input
+                      className={cx(routerHasLocalChanges && dirtyInputClass)}
+                      type="checkbox"
+                      checked={currentRouterConfig.https_interception.enabled}
+                      onChange={(event) => {
+                        const nextConfig = cloneJson(currentRouterConfig)
+                        nextConfig.https_interception.enabled = event.target.checked
+                        setLocalRouterConfig(nextConfig)
+                      }}
+                    />
+                    <span>Enable adaptive HTTPS request sniffing for selected CONNECT hosts</span>
+                  </label>
+                  <div className={fieldGridClass}>
+                    <label className={fieldClass}>
+                      <span>Mode</span>
+                      <select
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        value={currentRouterConfig.https_interception.mode}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.https_interception.mode = event.target.value === 'all' ? 'all' : 'allowlist'
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      >
+                        <option value="allowlist">Allowlisted hosts</option>
+                        <option value="all">All CONNECT port 443 hosts</option>
+                      </select>
+                    </label>
+                    <label className={fieldClass}>
+                      <span>Host patterns</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="text"
+                        value={httpsHostPatternsText}
+                        placeholder="example.com, api.example.com"
+                        onChange={(event) => {
+                          setHttpsHostPatternsText(event.target.value)
+                        }}
+                        onFocus={() => {
+                          httpsHostPatternsFocusedRef.current = true
+                        }}
+                        onBlur={() => {
+                          httpsHostPatternsFocusedRef.current = false
+                          updateHttpsInterceptionPatterns('host_patterns', httpsHostPatternsText)
+                        }}
+                      />
+                    </label>
+                    <label className={fieldClass}>
+                      <span>Bypass patterns</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="text"
+                        value={httpsBypassPatternsText}
+                        placeholder="pinned.example.com"
+                        onChange={(event) => {
+                          setHttpsBypassPatternsText(event.target.value)
+                        }}
+                        onFocus={() => {
+                          httpsBypassPatternsFocusedRef.current = true
+                        }}
+                        onBlur={() => {
+                          httpsBypassPatternsFocusedRef.current = false
+                          updateHttpsInterceptionPatterns('bypass_patterns', httpsBypassPatternsText)
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
+                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                      <div className="text-xs text-[#6a6f73]">Status</div>
+                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                        {buildHttpsInterceptionHeadline(httpsInterceptionStatus, currentRouterConfig)}
+                      </div>
+                      {buildHttpsInterceptionNotes(httpsInterceptionStatus, currentRouterConfig).map((note) => (
+                        <div className={noteClass} key={note}>
+                          {note}
+                        </div>
+                      ))}
+                    </div>
+                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                      <div className="text-xs text-[#6a6f73]">Adaptive fallback</div>
+                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                        {httpsInterceptionStatus.adaptive_bypass_count
+                          ? `${httpsInterceptionStatus.adaptive_bypass_count} temporary bypass(es)`
+                          : 'No temporary bypasses'}
+                      </div>
+                      <div className={noteClass}>
+                        Apps that reject the CA temporarily fall back to raw CONNECT automatically.
+                      </div>
+                    </div>
+                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                      <div className="text-xs text-[#6a6f73]">Certificate authority</div>
+                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                        {httpsInterceptionStatus.ca_common_name}
+                      </div>
+                      <div className={noteClass}>{httpsInterceptionStatus.ca_cert_file || 'Default local CA path'}</div>
+                      <div className={tightButtonRowClass}>
+                        <button type="button" onClick={() => window.location.assign('/api/https-interception/ca.crt')}>
+                          Download CA
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
                     {routerSummaryItems.map(([label, value]) => (
                       <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3" key={label}>
@@ -2674,7 +2954,7 @@ function App() {
                   </div>
                 </section>
 
-                <section className={cx(subpanelClass, 'col-span-full xl:col-span-7')}>
+                <section className={cx(subpanelClass, 'order-2 col-span-full')}>
                   <div className={panelHeaderClass}>
                     <h3>Rules</h3>
                     <div className={tightButtonRowClass}>

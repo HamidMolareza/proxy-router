@@ -44,6 +44,7 @@ def build_proxy_parser() -> argparse.ArgumentParser:
             "  - Phone Wi-Fi settings usually support only an HTTP proxy.\n"
             "  - The mixed listener accepts both HTTP and SOCKS5 on one port.\n"
             "  - HTTPS mode here means a TLS-wrapped HTTP proxy server.\n"
+            "  - HTTPS interception is configured in the dashboard and adaptively falls back for clients/apps that reject the CA.\n"
             "  - SOCKS5 is useful for apps or tools that support it directly, even on the mixed port.\n"
             "  - On shared Wi-Fi, prefer --allow-client with your phone IP.\n"
             "  - Usage data is written to /tmp/proxy-router-usage.log by default."
@@ -104,6 +105,26 @@ def build_proxy_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--key-file",
         help="Private key file for --type https.",
+    )
+    parser.add_argument(
+        "--https-intercept-ca-cert-file",
+        default=str(DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH),
+        help=f"CA certificate file for optional HTTPS interception. Default: {DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH}",
+    )
+    parser.add_argument(
+        "--https-intercept-ca-key-file",
+        default=str(DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH),
+        help=f"CA private key file for optional HTTPS interception. Default: {DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH}",
+    )
+    parser.add_argument(
+        "--https-intercept-cert-cache-dir",
+        default=str(DEFAULT_HTTPS_INTERCEPT_CERT_CACHE_DIR),
+        help=f"Per-host certificate cache directory for optional HTTPS interception. Default: {DEFAULT_HTTPS_INTERCEPT_CERT_CACHE_DIR}",
+    )
+    parser.add_argument(
+        "--https-intercept-ca-common-name",
+        default=DEFAULT_HTTPS_INTERCEPT_CA_COMMON_NAME,
+        help=f"Common Name used when generating the HTTPS interception CA. Default: {DEFAULT_HTTPS_INTERCEPT_CA_COMMON_NAME}",
     )
     parser.add_argument(
         "--verbose",
@@ -415,6 +436,8 @@ def print_startup_instructions(
     failure_log_path: Path | None,
     error_log_path: Path | None,
     router_config_path: Path,
+    https_intercept_ca_cert_path: Path,
+    https_intercept_cert_cache_dir: Path,
     dashboard: RunningDashboard | None,
 ):
     print_section("Proxy listeners")
@@ -483,6 +506,8 @@ def print_startup_instructions(
     if error_log_path is not None:
         print_info(f"Error log file: {error_log_path}")
     print_info(f"Router config file: {router_config_path}")
+    print_info(f"HTTPS interception CA certificate: {https_intercept_ca_cert_path}")
+    print_info(f"HTTPS interception certificate cache: {https_intercept_cert_cache_dir}")
     if debug_log_path is not None:
         print_info(f"Debug log file: {debug_log_path}")
     print_success("Press Ctrl+C to stop.")
@@ -553,6 +578,9 @@ def main():
     failure_log_path = resolve_failure_log_path(args.failure_log_file)
     error_log_path = resolve_error_log_path(args.error_log_file)
     router_config_path = resolve_router_config_path(args.router_config_file)
+    https_intercept_ca_cert_path = resolve_https_intercept_ca_cert_path(args.https_intercept_ca_cert_file)
+    https_intercept_ca_key_path = resolve_https_intercept_ca_key_path(args.https_intercept_ca_key_file)
+    https_intercept_cert_cache_dir = resolve_https_intercept_cert_cache_dir(args.https_intercept_cert_cache_dir)
 
     try:
         configure_error_logger(error_log_path)
@@ -566,6 +594,12 @@ def main():
         raise SystemExit(f"Error: could not open debug log file '{debug_log_path}': {exc}") from exc
 
     runtime = AppRuntime()
+    runtime.configure_https_interception(
+        ca_cert_file=https_intercept_ca_cert_path,
+        ca_key_file=https_intercept_ca_key_path,
+        cert_cache_dir=https_intercept_cert_cache_dir,
+        ca_common_name=args.https_intercept_ca_common_name,
+    )
     try:
         runtime.configure_usage_log(usage_log_path)
     except OSError as exc:
@@ -604,6 +638,7 @@ def main():
         f"bind={args.bind} mixed_port={args.mixed_port} http_port={args.http_port} https_port={args.https_port} "
         f"socks5_port={args.socks5_port} timeout={args.timeout}s verbose={args.verbose} debug={args.debug} "
         f"usage_log={usage_log_path} failure_log={failure_log_path} error_log={error_log_path} router_config={router_config_path} "
+        f"https_intercept_ca_cert={https_intercept_ca_cert_path} https_intercept_cert_cache={https_intercept_cert_cache_dir} "
         f"dashboard={args.dashboard_bind}:{args.dashboard_port} dashboard_enabled={not args.no_dashboard} quiet={args.quiet}",
         level="INFO",
     )
@@ -645,6 +680,8 @@ def main():
         failure_log_path,
         error_log_path,
         router_config_path,
+        https_intercept_ca_cert_path,
+        https_intercept_cert_cache_dir,
         dashboard,
     )
 

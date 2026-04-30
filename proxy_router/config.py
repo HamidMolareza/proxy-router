@@ -664,6 +664,11 @@ class RouterConfigManager:
                 "stage_durations_seconds": auto_proxy_stage_durations_seconds(),
             }
 
+    def https_interception_settings(self):
+        with self._lock:
+            settings = self._config.get("https_interception", default_router_config()["https_interception"])
+            return json.loads(json.dumps(settings))
+
     def is_failure_host_ignored(self, host: str | None) -> bool:
         if not host:
             return False

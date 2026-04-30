@@ -10,9 +10,10 @@ It is designed for cases where a phone or another device on the same network sho
 - React dashboard for overview, history, routing, quotas, and failures
 - Shared and per-network routing profiles
 - Automatic direct-failure probing before temporary auto-proxy rules
+- Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA
 - Per-client traffic quotas, default quotas, and temporary or permanent exemptions
 - Docker-first deployment with persistent state under `./data`
-- Standard-library Python backend with a separate React + Vite frontend
+- Small Python backend with a separate React + Vite frontend
 
 ## Architecture
 
@@ -47,12 +48,15 @@ If you want to use a phone on the same Wi-Fi:
    - Host: your computer's LAN IP
    - Port: `8900`
 4. While that proxy is enabled on the device, open `http://proxy.router/` to see a read-only page for that device's own usage, quota status, top destinations, recent requests, and recent failures.
+5. To install the HTTPS interception CA on that device, open `http://proxy.router/ca` or use the `Install HTTPS CA` section on the portal.
+6. After installing the CA, open `https://proxy.router/ca-check` from the same device to confirm that the browser trusts the proxy-router CA.
 
 ### Local development
 
 Start the backend:
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 ./proxy-router --help
 ./proxy-router \
   --bind 0.0.0.0 \
@@ -86,6 +90,10 @@ Persisted backend files:
 
 - `./data/router-config.json`
 - `./data/router-config-auto-proxy-state.json`
+- `./data/router-config-https-interception-state.json`
+- `./data/https-interception/proxy-router-ca.crt`
+- `./data/https-interception/proxy-router-ca.key`
+- `./data/https-interception/certs/`
 - `./data/usage.log`
 - `./data/failures.log`
 - `./data/error.log`
@@ -118,6 +126,12 @@ Upstream proxy note:
 
 - In the Compose deployment, the backend uses host networking, so a host-side upstream proxy can use `127.0.0.1`.
 
+HTTPS interception note:
+
+- The backend stores the HTTPS interception CA and generated per-host certificates under `./data/https-interception`.
+- Adaptive HTTPS trust and fallback observations are stored in `./data/router-config-https-interception-state.json`.
+- Only the public CA certificate is exposed through the dashboard/API; the CA private key stays on disk.
+
 ## Routing Model
 
 - `Shared` rules apply on every network.
@@ -144,6 +158,8 @@ Client self-service portal:
 
 - Devices using the HTTP proxy can open `http://proxy.router/` to view only their own usage and quota data
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
+- Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
+- Devices can open `https://proxy.router/ca-check` after installation to confirm CA trust and clear temporary adaptive bypasses
 - This portal is separate from the admin dashboard and does not expose routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens
 - The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP; `proxy.router` pages open the socket against the direct listener address to avoid browser-specific WebSocket proxy handling
@@ -154,6 +170,9 @@ Current dashboard behaviors:
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
+- HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
+- The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
+- The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
 - Transient upstream connection/setup failures are retried briefly before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
@@ -187,6 +206,9 @@ Response behavior:
 - `--usage-log-file`: usage log path
 - `--failure-log-file`: failure log path
 - `--error-log-file`: persistent exception log path with traceback details
+- `--https-intercept-ca-cert-file`: HTTPS interception CA certificate path
+- `--https-intercept-ca-key-file`: HTTPS interception CA private key path
+- `--https-intercept-cert-cache-dir`: generated per-host certificate cache directory
 - `--dashboard-bind`: dashboard API bind address
 - `--dashboard-port`: dashboard API port
 - `--no-dashboard`: disable the dashboard API
@@ -215,12 +237,15 @@ docs/                      supporting project documentation
 
 - Binding to `0.0.0.0` exposes the listener to any reachable device unless you restrict clients.
 - On shared networks, use `--allow-client` whenever possible.
+- HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust are temporarily bypassed after TLS trust failures and can also use manual bypass patterns or SOCKS5.
+- Intercepted HTTPS records keep URL-level metadata and byte totals, not headers or bodies.
 - Do not commit secrets, private upstream credentials, or runtime data files.
 
 ## Validation
 
 ```bash
 python3 -m py_compile ./proxy-router proxy_router/*.py
+python3 -m unittest discover
 python3 ./proxy-router --help
 cd frontend && npm install && npm run build
 docker compose config

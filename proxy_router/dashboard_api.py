@@ -36,6 +36,9 @@ def build_dashboard_snapshot(server):
     snapshot = server.runtime.dashboard_state.snapshot()
     router_runtime_snapshot = server.router_config.runtime_snapshot()
     router_runtime_snapshot["upstream_status"] = server.runtime.upstream_status.snapshot()
+    router_runtime_snapshot["https_interception_status"] = server.runtime.https_interception_status(
+        server.router_config.https_interception_settings()
+    )
     active_profile = router_runtime_snapshot.get("active_profile") or {}
     active_profile_id = str(active_profile.get("id") or DEFAULT_ROUTING_PROFILE_ID)
     router_config_snapshot = server.router_config.effective_routing_snapshot(profile_id=active_profile_id)
@@ -105,6 +108,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_bytes(self, body: bytes, *, content_type: str, filename: str | None = None, status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _read_json_body(self):
         content_length = self.headers.get("Content-Length")
@@ -204,6 +218,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self.server.router_config.snapshot())
             return
 
+        if route_path in {"/api/https-interception/status", "/api/https-interception/status.json"}:
+            self._send_json(
+                self.server.runtime.https_interception_status(
+                    self.server.router_config.https_interception_settings()
+                )
+            )
+            return
+
+        if route_path in {"/api/https-interception/ca.crt", "/api/https-interception/ca.pem"}:
+            try:
+                body = self.server.runtime.https_interception.ca_certificate_pem()
+            except Exception as exc:
+                self._send_json({"error": f"failed to load HTTPS interception CA: {exc}"}, status=500)
+                return
+            self._send_bytes(
+                body,
+                content_type="application/x-x509-ca-cert",
+                filename="proxy-router-ca.crt",
+            )
+            return
+
         if route_path in {"/api/failures", "/api/failures.json"}:
             snapshot = build_dashboard_snapshot(self.server)
             self._send_json(snapshot.get("failure_summary", {}))
@@ -221,6 +256,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/dashboard",
                     "/api/history",
                     "/api/router-config",
+                    "/api/https-interception/status",
+                    "/api/https-interception/ca.crt",
                     "/api/failures",
                     "/api/traffic-data/clear",
                     "/api/upstream/check",

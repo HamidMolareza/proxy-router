@@ -614,6 +614,281 @@ class AutoProxyFailureManager:
                 self._save_state_locked()
 
 
+class HttpsInterceptionTrustManager:
+    def __init__(self, state_file: Path | None):
+        self.state_file = Path(state_file) if state_file is not None else None
+        self._lock = threading.Lock()
+        self._state = self._load_state()
+
+    def current_bypass(self, client: str | None, host: str | None):
+        client_key = self._client_key(client)
+        pattern = self._pattern_for_host(host)
+        now = datetime.now().astimezone()
+        with self._lock:
+            dirty = self._prune_locked(now)
+            client_state = self._state.get("clients", {}).get(client_key)
+            result = None
+            if client_state is not None:
+                untrusted_until = parse_datetime_text(client_state.get("untrusted_until"))
+                if untrusted_until is not None and untrusted_until > now:
+                    result = {
+                        "scope": "client",
+                        "client": client_key,
+                        "host": normalize_host(host or "") or None,
+                        "pattern": "*",
+                        "expires_at": untrusted_until.isoformat(),
+                        "reason": str(client_state.get("untrusted_reason") or "client has not trusted the CA yet"),
+                    }
+                elif pattern:
+                    bypass = client_state.get("bypasses", {}).get(pattern)
+                    if bypass is not None:
+                        expires_at = parse_datetime_text(bypass.get("expires_at"))
+                        if expires_at is not None and expires_at > now:
+                            result = {
+                                "scope": "host",
+                                "client": client_key,
+                                "host": str(bypass.get("host") or host or ""),
+                                "pattern": pattern,
+                                "expires_at": expires_at.isoformat(),
+                                "reason": str(bypass.get("error") or "recent HTTPS interception trust failure"),
+                            }
+            if dirty:
+                self._save_state_locked()
+            return result
+
+    def record_success(self, client: str | None, host: str | None, *, source: str = "intercept"):
+        client_key = self._client_key(client)
+        normalized_host = normalize_host(host or "")
+        pattern = self._pattern_for_host(normalized_host)
+        now = datetime.now().astimezone()
+        with self._lock:
+            client_state = self._client_state_locked(client_key)
+            client_state["trusted_at"] = now.isoformat()
+            client_state["untrusted_until"] = None
+            client_state["untrusted_reason"] = None
+            if source == "trust-check":
+                client_state["bypasses"] = {}
+            elif pattern:
+                client_state.setdefault("bypasses", {}).pop(pattern, None)
+            client_state["last_success"] = {
+                "timestamp": now.isoformat(timespec="milliseconds"),
+                "client": client_key,
+                "host": normalized_host or None,
+                "pattern": pattern,
+                "source": str(source or "intercept"),
+            }
+            self._save_state_locked()
+
+    def record_failure(
+        self,
+        client: str | None,
+        host: str | None,
+        *,
+        error: str,
+        context: str,
+        source: str = "intercept",
+    ):
+        client_key = self._client_key(client)
+        normalized_host = normalize_host(host or "")
+        pattern = self._pattern_for_host(normalized_host)
+        if not pattern:
+            return
+
+        now = datetime.now().astimezone()
+        expires_at = now + HTTPS_INTERCEPTION_ADAPTIVE_BYPASS_DURATION
+        reason = str(error or "HTTPS interception TLS trust failure")
+        with self._lock:
+            client_state = self._client_state_locked(client_key)
+            client_state.setdefault("bypasses", {})[pattern] = {
+                "host": normalized_host or None,
+                "pattern": pattern,
+                "created_at": now.isoformat(),
+                "expires_at": expires_at.isoformat(),
+                "error": reason,
+                "context": str(context or "HTTPS interception TLS handshake"),
+                "source": str(source or "intercept"),
+            }
+            if source == "trust-check" or not client_state.get("trusted_at"):
+                client_state["untrusted_until"] = expires_at.isoformat()
+                client_state["untrusted_reason"] = reason
+            client_state["last_failure"] = {
+                "timestamp": now.isoformat(timespec="milliseconds"),
+                "client": client_key,
+                "host": normalized_host or None,
+                "pattern": pattern,
+                "source": str(source or "intercept"),
+                "error": reason,
+                "context": str(context or "HTTPS interception TLS handshake"),
+                "expires_at": expires_at.isoformat(),
+            }
+            self._save_state_locked()
+
+    def snapshot(self):
+        now = datetime.now().astimezone()
+        with self._lock:
+            dirty = self._prune_locked(now)
+            active_bypasses = []
+            last_success = None
+            last_failure = None
+            for client, client_state in sorted(self._state.get("clients", {}).items()):
+                untrusted_until = parse_datetime_text(client_state.get("untrusted_until"))
+                if untrusted_until is not None and untrusted_until > now:
+                    active_bypasses.append(
+                        {
+                            "scope": "client",
+                            "client": client,
+                            "host": None,
+                            "pattern": "*",
+                            "expires_at": untrusted_until.isoformat(),
+                            "reason": str(client_state.get("untrusted_reason") or "client has not trusted the CA yet"),
+                        }
+                    )
+                for pattern, bypass in sorted((client_state.get("bypasses") or {}).items()):
+                    expires_at = parse_datetime_text(bypass.get("expires_at"))
+                    if expires_at is None or expires_at <= now:
+                        continue
+                    active_bypass_entry = {
+                        "scope": "host",
+                        "client": client,
+                        "host": str(bypass.get("host") or ""),
+                        "pattern": pattern,
+                        "expires_at": expires_at.isoformat(),
+                        "reason": str(bypass.get("error") or "recent HTTPS interception trust failure"),
+                    }
+                    active_bypasses.append(active_bypass_entry)
+
+                last_success = self._latest_activity(last_success, client_state.get("last_success"))
+                last_failure = self._latest_activity(last_failure, client_state.get("last_failure"))
+
+            active_bypasses.sort(key=lambda item: (item.get("expires_at") or "", item.get("client") or ""))
+            if dirty:
+                self._save_state_locked()
+            return {
+                "state_file": str(self.state_file) if self.state_file is not None else None,
+                "adaptive_bypass_ttl_seconds": int(HTTPS_INTERCEPTION_ADAPTIVE_BYPASS_DURATION.total_seconds()),
+                "adaptive_bypass_count": len(active_bypasses),
+                "active_bypasses": active_bypasses[:20],
+                "last_success": last_success,
+                "last_failure": last_failure,
+            }
+
+    def clear_observations(self):
+        with self._lock:
+            self._state = {"version": 1, "clients": {}}
+            self._save_state_locked()
+
+    def _client_key(self, client: str | None) -> str:
+        return str(client or "unknown").strip() or "unknown"
+
+    def _pattern_for_host(self, host: str | None) -> str:
+        normalized_host = normalize_host(host or "")
+        if not normalized_host:
+            return ""
+        if is_ip_address_text(normalized_host):
+            return normalized_host
+        return summarize_domain(normalized_host) or normalized_host
+
+    def _client_state_locked(self, client_key: str):
+        clients = self._state.setdefault("clients", {})
+        state = clients.get(client_key)
+        if state is None:
+            state = {
+                "trusted_at": None,
+                "untrusted_until": None,
+                "untrusted_reason": None,
+                "bypasses": {},
+                "last_success": None,
+                "last_failure": None,
+            }
+            clients[client_key] = state
+        return state
+
+    def _load_state(self):
+        if self.state_file is None:
+            return {"version": 1, "clients": {}}
+        try:
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {"version": 1, "clients": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "clients": {}}
+
+        loaded_clients = {}
+        raw_clients = payload.get("clients")
+        if isinstance(raw_clients, dict):
+            for raw_client, raw_state in raw_clients.items():
+                client = self._client_key(raw_client)
+                if not isinstance(raw_state, dict):
+                    continue
+                loaded_bypasses = {}
+                raw_bypasses = raw_state.get("bypasses")
+                if isinstance(raw_bypasses, dict):
+                    for raw_pattern, raw_bypass in raw_bypasses.items():
+                        pattern = normalize_rule_pattern(str(raw_pattern or ""))
+                        if not pattern or not isinstance(raw_bypass, dict):
+                            continue
+                        loaded_bypasses[pattern] = {
+                            "host": normalize_host(str(raw_bypass.get("host") or "")) or None,
+                            "pattern": pattern,
+                            "created_at": str(raw_bypass.get("created_at") or "").strip() or None,
+                            "expires_at": str(raw_bypass.get("expires_at") or "").strip() or None,
+                            "error": str(raw_bypass.get("error") or "").strip(),
+                            "context": str(raw_bypass.get("context") or "").strip(),
+                            "source": str(raw_bypass.get("source") or "intercept").strip() or "intercept",
+                        }
+                loaded_clients[client] = {
+                    "trusted_at": str(raw_state.get("trusted_at") or "").strip() or None,
+                    "untrusted_until": str(raw_state.get("untrusted_until") or "").strip() or None,
+                    "untrusted_reason": str(raw_state.get("untrusted_reason") or "").strip() or None,
+                    "bypasses": loaded_bypasses,
+                    "last_success": raw_state.get("last_success") if isinstance(raw_state.get("last_success"), dict) else None,
+                    "last_failure": raw_state.get("last_failure") if isinstance(raw_state.get("last_failure"), dict) else None,
+                }
+        return {"version": 1, "clients": loaded_clients}
+
+    def _save_state_locked(self):
+        if self.state_file is None:
+            return
+        serialized = {"version": 1, "clients": self._state.get("clients", {})}
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.state_file.with_name(f"{self.state_file.name}.tmp")
+        temporary_file.write_text(json.dumps(serialized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary_file.replace(self.state_file)
+
+    def _prune_locked(self, now: datetime) -> bool:
+        dirty = False
+        for client_state in self._state.get("clients", {}).values():
+            untrusted_until = parse_datetime_text(client_state.get("untrusted_until"))
+            if untrusted_until is not None and untrusted_until <= now:
+                client_state["untrusted_until"] = None
+                client_state["untrusted_reason"] = None
+                dirty = True
+            bypasses = client_state.get("bypasses")
+            if not isinstance(bypasses, dict):
+                client_state["bypasses"] = {}
+                dirty = True
+                continue
+            for pattern, bypass in list(bypasses.items()):
+                expires_at = parse_datetime_text(bypass.get("expires_at")) if isinstance(bypass, dict) else None
+                if expires_at is None or expires_at <= now:
+                    bypasses.pop(pattern, None)
+                    dirty = True
+        return dirty
+
+    def _latest_activity(self, current, candidate):
+        if not isinstance(candidate, dict):
+            return current
+        if current is None:
+            return json.loads(json.dumps(candidate))
+        current_timestamp = parse_datetime_text(current.get("timestamp"))
+        candidate_timestamp = parse_datetime_text(candidate.get("timestamp"))
+        if candidate_timestamp is None:
+            return current
+        if current_timestamp is None or candidate_timestamp > current_timestamp:
+            return json.loads(json.dumps(candidate))
+        return current
+
+
 class TrafficQuotaManager:
     def __init__(self):
         self._lock = threading.Lock()

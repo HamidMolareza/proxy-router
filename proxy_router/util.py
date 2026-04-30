@@ -6,6 +6,7 @@ import socket
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .constants import *
 from .output import debug_log
@@ -60,6 +61,10 @@ def is_auto_proxy_rule(rule, pattern: str | None = None) -> bool:
 
 def auto_proxy_state_file_path(config_file: Path) -> Path:
     return config_file.with_name(f"{config_file.stem}{AUTO_PROXY_STATE_FILE_SUFFIX}")
+
+
+def https_interception_state_file_path(config_file: Path) -> Path:
+    return config_file.with_name(f"{config_file.stem}{HTTPS_INTERCEPTION_STATE_FILE_SUFFIX}")
 
 
 def parse_datetime_text(value: str | None) -> datetime | None:
@@ -298,6 +303,56 @@ def normalize_rule_pattern(value: str) -> str:
     return pattern
 
 
+def normalize_host_pattern_list(value, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raise ValueError(f"{field_name} must be an array")
+
+    patterns = []
+    for item in raw_items:
+        normalized = normalize_rule_pattern(str(item or ""))
+        if normalized and normalized not in patterns:
+            patterns.append(normalized)
+    return patterns
+
+
+def host_matches_suffix_pattern(host: str | None, pattern: str | None) -> bool:
+    normalized_host = normalize_host(host or "")
+    normalized_pattern = normalize_rule_pattern(pattern or "")
+    if not normalized_host or not normalized_pattern:
+        return False
+    return normalized_host == normalized_pattern or normalized_host.endswith(f".{normalized_pattern}")
+
+
+def host_matches_any_suffix_pattern(host: str | None, patterns) -> bool:
+    return any(host_matches_suffix_pattern(host, pattern) for pattern in patterns or [])
+
+
+def should_intercept_https_connect(settings, host: str | None, port: int | None) -> bool:
+    if not settings or not settings.get("enabled", False):
+        return False
+
+    try:
+        normalized_port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if normalized_port not in HTTPS_INTERCEPTION_DEFAULT_PORTS:
+        return False
+
+    if host_matches_any_suffix_pattern(host, settings.get("bypass_patterns")):
+        return False
+
+    mode = str(settings.get("mode") or "allowlist").strip().lower()
+    if mode == "all":
+        return True
+    return host_matches_any_suffix_pattern(host, settings.get("host_patterns"))
+
+
 def normalize_client_limit_target(value: str) -> str:
     target = str(value).strip()
     if not target:
@@ -486,6 +541,13 @@ def default_router_config():
         "auto_proxy_failures": {
             "enabled": False,
         },
+        "https_interception": {
+            "enabled": False,
+            "mode": "allowlist",
+            "trust_policy": "adaptive",
+            "host_patterns": [],
+            "bypass_patterns": [],
+        },
         "upstream": {
             "enabled": False,
             "type": "http",
@@ -627,6 +689,12 @@ def normalize_router_config(payload):
     if not isinstance(auto_proxy_failures_payload, dict):
         raise ValueError("router auto_proxy_failures must be an object")
 
+    https_interception_payload = payload.get("https_interception") or {}
+    if https_interception_payload is None:
+        https_interception_payload = {}
+    if not isinstance(https_interception_payload, dict):
+        raise ValueError("router https_interception must be an object")
+
     default_client_traffic_limit_payload = payload.get("default_client_traffic_limit") or {}
     if default_client_traffic_limit_payload is None:
         default_client_traffic_limit_payload = {}
@@ -644,6 +712,29 @@ def normalize_router_config(payload):
     upstream_type = str(upstream_payload.get("type", default_config["upstream"]["type"])).strip().lower()
     if upstream_type not in UPSTREAM_PROXY_TYPES:
         raise ValueError(f"router upstream type must be one of: {', '.join(sorted(UPSTREAM_PROXY_TYPES))}")
+
+    https_interception_mode = str(
+        https_interception_payload.get(
+            "mode",
+            default_config["https_interception"]["mode"],
+        )
+    ).strip().lower()
+    if https_interception_mode not in HTTPS_INTERCEPTION_MODES:
+        raise ValueError(
+            "router https_interception mode must be one of: "
+            f"{', '.join(sorted(HTTPS_INTERCEPTION_MODES))}"
+        )
+    https_interception_trust_policy = str(
+        https_interception_payload.get(
+            "trust_policy",
+            default_config["https_interception"]["trust_policy"],
+        )
+    ).strip().lower()
+    if https_interception_trust_policy not in HTTPS_INTERCEPTION_TRUST_POLICIES:
+        raise ValueError(
+            "router https_interception trust_policy must be one of: "
+            f"{', '.join(sorted(HTTPS_INTERCEPTION_TRUST_POLICIES))}"
+        )
 
     upstream_host = str(upstream_payload.get("host", default_config["upstream"]["host"])).strip()
     upstream_port_raw = upstream_payload.get("port", default_config["upstream"]["port"])
@@ -833,6 +924,30 @@ def normalize_router_config(payload):
                 )
             ),
         },
+        "https_interception": {
+            "enabled": bool(
+                https_interception_payload.get(
+                    "enabled",
+                    default_config["https_interception"]["enabled"],
+                )
+            ),
+            "mode": https_interception_mode,
+            "trust_policy": https_interception_trust_policy,
+            "host_patterns": normalize_host_pattern_list(
+                https_interception_payload.get(
+                    "host_patterns",
+                    default_config["https_interception"]["host_patterns"],
+                ),
+                field_name="router https_interception host_patterns",
+            ),
+            "bypass_patterns": normalize_host_pattern_list(
+                https_interception_payload.get(
+                    "bypass_patterns",
+                    default_config["https_interception"]["bypass_patterns"],
+                ),
+                field_name="router https_interception bypass_patterns",
+            ),
+        },
         "upstream": {
             "enabled": upstream_enabled,
             "type": upstream_type,
@@ -924,6 +1039,29 @@ def format_headers_for_log(headers) -> str:
     return ", ".join(items) if items else "<none>"
 
 
+def is_sensitive_query_parameter(name: str) -> bool:
+    normalized = str(name or "").strip().lower()
+    return normalized in SENSITIVE_QUERY_PARAMETER_NAMES or "token" in normalized or "secret" in normalized
+
+
+def sanitize_target_path_for_record(target_path: str) -> str:
+    parsed = urlsplit(target_path or "/")
+    if not parsed.query:
+        return target_path or "/"
+
+    redacted_items = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        redacted_items.append((key, "redacted" if is_sensitive_query_parameter(key) else value))
+
+    return urlunsplit(("", "", parsed.path or "/", urlencode(redacted_items, doseq=True), parsed.fragment))
+
+
+def build_request_destination(scheme: str, host: str, port: int, target_path: str) -> str:
+    default_port = 443 if scheme == "https" else 80
+    authority = host if int(port) == default_port else f"{host}:{int(port)}"
+    return f"{scheme}://{authority}{sanitize_target_path_for_record(target_path)}"
+
+
 def resolve_debug_log_path(path_text: str | None) -> Path | None:
     if path_text:
         return Path(path_text).expanduser()
@@ -951,6 +1089,24 @@ def resolve_error_log_path(path_text: str | None) -> Path | None:
 def resolve_router_config_path(path_text: str | None) -> Path:
     if not path_text:
         return DEFAULT_ROUTER_CONFIG_PATH
+    return Path(path_text).expanduser()
+
+
+def resolve_https_intercept_ca_cert_path(path_text: str | None) -> Path:
+    if not path_text:
+        return DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH
+    return Path(path_text).expanduser()
+
+
+def resolve_https_intercept_ca_key_path(path_text: str | None) -> Path:
+    if not path_text:
+        return DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH
+    return Path(path_text).expanduser()
+
+
+def resolve_https_intercept_cert_cache_dir(path_text: str | None) -> Path:
+    if not path_text:
+        return DEFAULT_HTTPS_INTERCEPT_CERT_CACHE_DIR
     return Path(path_text).expanduser()
 
 

@@ -26,6 +26,7 @@ Important backend modules:
 
 - `cli.py`: argument parsing, startup, shutdown, listener wiring
 - `proxy_server.py`: HTTP, CONNECT, mixed-port, and SOCKS5 handlers
+- `certificates.py`: HTTPS interception CA and per-host certificate generation
 - `dashboard_api.py`: dashboard API server and request handlers
 - `runtime.py`: in-process runtime state, log writers, dashboard state, persistence rehydration
 - `config.py`: router config management, rule normalization, network profile matching
@@ -55,9 +56,10 @@ Purpose:
 1. A client connects to the mixed or SOCKS5 listener.
 2. The backend validates the client and evaluates quota state.
 3. Routing rules are resolved from the active config and profile context.
-4. The request is sent direct, proxied upstream, or blocked.
-5. Usage and failure events are written to persisted log files.
-6. Runtime dashboard state is updated in memory.
+4. HTTP CONNECT requests are either tunneled unchanged or, when HTTPS interception is enabled and matched, terminated with a generated host certificate.
+5. The request is sent direct, proxied upstream, or blocked.
+6. Usage and failure events are written to persisted log files.
+7. Runtime dashboard state is updated in memory.
 
 ### Dashboard traffic
 
@@ -75,6 +77,8 @@ Persisted files:
 
 - `router-config.json`: routing, upstream, quota, exemption, and profile configuration
 - `router-config-auto-proxy-state.json`: auto-proxy activation state
+- `router-config-https-interception-state.json`: adaptive HTTPS trust and fallback state
+- `https-interception/`: generated local CA and per-host certificates
 - `usage.log`: JSONL transfer summaries
 - `failures.log`: JSONL failed-request events
 - `error.log`: exception details and tracebacks
@@ -84,6 +88,7 @@ On backend startup:
 - the quota manager reloads usage history from `usage.log`
 - the dashboard runtime rebuilds totals and recent entries from `usage.log` and `failures.log`
 - the auto-proxy manager reloads its persisted state file
+- adaptive HTTPS interception reloads trusted-client observations and temporary bypasses
 
 This means the dashboard and routing-related state survive container restarts as long as `./data` is preserved.
 
@@ -119,8 +124,20 @@ Important routes:
 - `GET /api/history`
 - `GET /api/router-config`
 - `POST /api/router-config`
+- `GET /api/https-interception/status`
+- `GET /api/https-interception/ca.crt`
 - `GET /api/failures`
 - `POST /api/traffic-data/clear`
+
+### Device Portal
+
+Important proxy-local routes:
+
+- `GET http://proxy.router/`
+- `GET http://proxy.router/ca`
+- `GET http://proxy.router/ca.crt`
+- `GET https://proxy.router/ca-check`
+- `GET http://proxy.router/api/client`
 
 ### Ports
 
@@ -133,7 +150,9 @@ Common defaults:
 
 ## Design Notes
 
-- The backend intentionally stays standard-library-only.
+- The backend is mostly standard-library Python; HTTPS interception uses `cryptography` for certificate generation.
 - The dashboard frontend is separate from the backend and consumes JSON APIs.
 - The root executable is a thin shim; most backend behavior lives in `proxy_router/`.
 - Runtime state is centralized in `AppRuntime` instead of spreading service globals across the codebase.
+- HTTPS interception uses adaptive fallback: successful TLS handshakes mark a client as CA-trusted, while TLS trust failures temporarily bypass MITM for that client or host and use raw CONNECT.
+- SOCKS5 remains a raw tunnel path for apps that reject user-installed CAs or use certificate pinning.

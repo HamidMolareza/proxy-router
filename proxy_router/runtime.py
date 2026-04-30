@@ -9,8 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .constants import *
+from .certificates import HttpsCertificateManager
 from .records import build_failure_snapshot_from_records
-from .traffic import AutoProxyFailureManager, TrafficQuotaManager
+from .traffic import AutoProxyFailureManager, HttpsInterceptionTrustManager, TrafficQuotaManager
 from .util import *
 
 class DashboardState:
@@ -70,6 +71,7 @@ class DashboardState:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        status_code: int | None = None,
     ):
         with self._lock:
             summary = self._totals_by_proxy.setdefault(proxy_label, empty_usage_summary())
@@ -107,6 +109,7 @@ class DashboardState:
                     "route_label": route_label or "direct",
                     "matched_rule": matched_rule,
                     "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
+                    "status_code": status_code,
                 }
             )
 
@@ -125,6 +128,7 @@ class DashboardState:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        status_code: int | None = None,
     ):
         with self._lock:
             self._recent_failures.appendleft(
@@ -542,6 +546,7 @@ class UsageLogger:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        status_code: int | None = None,
     ):
         if self._stream is None:
             return
@@ -562,6 +567,8 @@ class UsageLogger:
             event["method"] = method
         if matched_rule is not None:
             event["matched_rule"] = matched_rule
+        if status_code is not None:
+            event["status_code"] = int(status_code)
 
         with self._lock:
             self._stream.write(json.dumps(event, sort_keys=True) + "\n")
@@ -711,6 +718,15 @@ class SelfEndpoints:
     def client_portal_url(self) -> str:
         return f"http://{self.client_portal_primary_host}/"
 
+    def client_portal_ca_install_url(self) -> str:
+        return f"http://{self.client_portal_primary_host}/ca"
+
+    def client_portal_ca_certificate_url(self) -> str:
+        return f"http://{self.client_portal_primary_host}/ca.crt"
+
+    def client_portal_ca_check_url(self) -> str:
+        return f"https://{self.client_portal_primary_host}/ca-check"
+
     def client_portal_live_url(self, port: int) -> str:
         return f"ws://{self.client_portal_direct_host}:{int(port)}/api/client/live"
 
@@ -737,6 +753,12 @@ class AppRuntime:
         self.auto_proxy_failure_manager = None
         self.self_endpoints = SelfEndpoints()
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
+        self.https_interception = HttpsCertificateManager(
+            ca_cert_file=DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH,
+            ca_key_file=DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH,
+            cert_cache_dir=DEFAULT_HTTPS_INTERCEPT_CERT_CACHE_DIR,
+        )
+        self.https_interception_trust = HttpsInterceptionTrustManager(None)
 
     def configure_usage_log(self, log_file: Path | None):
         self.usage_logger.close()
@@ -752,6 +774,21 @@ class AppRuntime:
         self.traffic_quota_manager = TrafficQuotaManager()
         self.traffic_quota_manager.load_from_log(log_file)
 
+    def configure_https_interception(
+        self,
+        *,
+        ca_cert_file: Path,
+        ca_key_file: Path,
+        cert_cache_dir: Path,
+        ca_common_name: str,
+    ):
+        self.https_interception = HttpsCertificateManager(
+            ca_cert_file=ca_cert_file,
+            ca_key_file=ca_key_file,
+            cert_cache_dir=cert_cache_dir,
+            ca_common_name=ca_common_name,
+        )
+
     def rehydrate_dashboard_state(self):
         self.dashboard_state.clear_traffic_data()
 
@@ -766,6 +803,11 @@ class AppRuntime:
             timestamp = str(record.get("timestamp") or "").strip()
             if not client or not timestamp:
                 continue
+            status_code = record.get("status_code")
+            try:
+                normalized_status_code = int(status_code) if status_code is not None else None
+            except (TypeError, ValueError):
+                normalized_status_code = None
             self.dashboard_state.record_request(
                 proxy_label=str(record.get("proxy_type") or "unknown"),
                 kind=str(record.get("kind") or "http"),
@@ -778,6 +820,7 @@ class AppRuntime:
                 route_label=str(record.get("route_label") or "direct"),
                 matched_rule=record.get("matched_rule") if isinstance(record.get("matched_rule"), dict) else None,
                 profile_id=str(record.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID),
+                status_code=normalized_status_code,
             )
 
         failure_records, _ = load_failure_records(
@@ -818,14 +861,52 @@ class AppRuntime:
             self.auto_proxy_failure_manager = None
         if router_config is not None:
             self.auto_proxy_failure_manager = AutoProxyFailureManager(router_config)
+            self.https_interception_trust = HttpsInterceptionTrustManager(
+                https_interception_state_file_path(router_config.config_file)
+            )
             self.refresh_upstream_status(router_config.snapshot())
         else:
+            self.https_interception_trust = HttpsInterceptionTrustManager(None)
             self.refresh_upstream_status(None)
 
     def apply_auto_proxy_probe_route(self, host: str | None, route_decision):
         if self.auto_proxy_failure_manager is None:
             return route_decision
         return self.auto_proxy_failure_manager.route_override(host, route_decision)
+
+    def https_interception_status(self, settings=None):
+        status = self.https_interception.status(settings)
+        status.update(self.https_interception_trust.snapshot())
+        status["trust_policy"] = str((settings or {}).get("trust_policy") or "adaptive")
+        return status
+
+    def https_interception_adaptive_bypass(self, client: str | None, host: str | None, settings=None):
+        trust_policy = str((settings or {}).get("trust_policy") or "adaptive").strip().lower()
+        if trust_policy != "adaptive":
+            return None
+        return self.https_interception_trust.current_bypass(client, host)
+
+    def record_https_interception_success(self, client: str | None, host: str | None, *, source: str = "intercept"):
+        self.https_interception_trust.record_success(client, host, source=source)
+        self.notify_dashboard_update("https-interception")
+
+    def record_https_interception_failure(
+        self,
+        client: str | None,
+        host: str | None,
+        *,
+        error: str,
+        context: str,
+        source: str = "intercept",
+    ):
+        self.https_interception_trust.record_failure(
+            client,
+            host,
+            error=error,
+            context=context,
+            source=source,
+        )
+        self.notify_dashboard_update("https-interception")
 
     def notify_dashboard_update(self, reason: str):
         self.live_updates.notify(reason)
@@ -886,6 +967,7 @@ class AppRuntime:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        status_code: int | None = None,
     ):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.usage_logger.record(
@@ -900,6 +982,7 @@ class AppRuntime:
             route_label=route_label,
             matched_rule=matched_rule,
             profile_id=profile_id,
+            status_code=status_code,
         )
         self.dashboard_state.record_request(
             proxy_label=proxy_label,
@@ -913,6 +996,7 @@ class AppRuntime:
             route_label=route_label,
             matched_rule=matched_rule,
             profile_id=profile_id,
+            status_code=status_code,
         )
         self.traffic_quota_manager.record_usage(
             client=client,
@@ -985,6 +1069,7 @@ class AppRuntime:
         self.traffic_quota_manager.clear()
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.clear_observations()
+        self.https_interception_trust.clear_observations()
         self.notify_dashboard_update("clear")
 
     def close(self):

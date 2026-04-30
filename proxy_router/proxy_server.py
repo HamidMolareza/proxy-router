@@ -336,6 +336,20 @@ class ProtocolServerView:
         self.server_address = server.server_address
 
 
+class InterceptedHTTPSProtocolView:
+    def __init__(self, server):
+        self.allowed_networks = server.allowed_networks
+        self.timeout_seconds = server.timeout_seconds
+        self.verbose = server.verbose
+        self.debug = server.debug
+        self.proxy_label = "https"
+        self.client_tracker = server.client_tracker
+        self.router_config = server.router_config
+        self.runtime = server.runtime
+        self.history_cache = server.history_cache
+        self.server_address = server.server_address
+
+
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -408,6 +422,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         request_started = time.monotonic()
         try:
             host, port = split_host_port(self.path, 443)
+            if self._is_client_portal_https_trust_check_target(host, port):
+                self._handle_client_portal_https_request(host, port, request_started=request_started)
+                return
             if self._is_client_portal_connect_target(host, port):
                 self._handle_client_portal_connect_request(host, port)
                 return
@@ -431,6 +448,23 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_decision=route_decision,
                 )
                 return
+            https_interception_settings = self.server.router_config.https_interception_settings()
+            if should_intercept_https_connect(https_interception_settings, host, port):
+                adaptive_bypass = self.server.runtime.https_interception_adaptive_bypass(
+                    self.client_address[0],
+                    host,
+                    https_interception_settings,
+                )
+                if adaptive_bypass is None:
+                    self._handle_intercepted_connect(host, port, route_decision, request_started=request_started)
+                    return
+                self._debug(
+                    "HTTPS interception adaptive bypass "
+                    f"scope={adaptive_bypass.get('scope')} host={host} expires_at={adaptive_bypass.get('expires_at')}"
+                )
+                self._log_http_event(
+                    f"CONNECT {host}:{port} using raw tunnel after adaptive HTTPS bypass"
+                )
             upstream_owner = None
             upstream = None
             try:
@@ -573,6 +607,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return False
         return int(port) == 80 or int(port) in self.server.runtime.self_endpoints.proxy_listener_ports
 
+    def _is_client_portal_https_trust_check_target(self, host: str, port: int) -> bool:
+        if not self.server.runtime.self_endpoints.is_client_portal_host(host):
+            return False
+        return int(port) == 443
+
     def _handle_client_portal_connect_request(self, host: str, port: int):
         self._debug(f"CONNECT client portal tunnel target={host}:{port}")
         self.send_response(200, "Connection Established")
@@ -603,6 +642,152 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
         finally:
             self.close_connection = True
+
+    def _handle_client_portal_https_request(self, host: str, port: int, *, request_started: float):
+        try:
+            tls_context = self.server.runtime.https_interception.server_ssl_context(host or CLIENT_PORTAL_PRIMARY_HOST)
+        except Exception as exc:
+            self._send_gateway_error(
+                exc,
+                context="HTTPS CA trust check certificate setup",
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                route_decision=None,
+            )
+            return
+
+        self._debug(f"HTTPS CA trust check for CONNECT {host}:{port}")
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+
+        tls_connection = None
+        try:
+            try:
+                tls_connection = tls_context.wrap_socket(self.connection, server_side=True)
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError, OSError) as exc:
+                message = f"HTTPS CA trust check TLS handshake failed: {exc}"
+                self._debug(message, level="WARNING")
+                self.server.runtime.record_https_interception_failure(
+                    self.client_address[0],
+                    host,
+                    error=message,
+                    context="HTTPS CA trust check",
+                    source="trust-check",
+                )
+                self.server.runtime.record_failure(
+                    proxy_label="https",
+                    client=self.client_address[0],
+                    method="CONNECT",
+                    destination=f"{host}:{port}",
+                    host=None,
+                    port=port,
+                    error=message,
+                    context="HTTPS CA trust check",
+                    route_label="local",
+                    matched_rule=None,
+                    profile_id=DEFAULT_ROUTING_PROFILE_ID,
+                )
+                return
+
+            self.server.runtime.record_https_interception_success(
+                self.client_address[0],
+                host,
+                source="trust-check",
+            )
+            portal_server = InterceptedHTTPSProtocolView(self.server)
+            ClientPortalHTTPSRequestHandler(tls_connection, self.client_address, portal_server)
+            duration_ms = int((time.monotonic() - request_started) * 1000)
+            self._debug(f"HTTPS CA trust check session closed target={host}:{port} duration_ms={duration_ms}")
+        finally:
+            self.close_connection = True
+            if tls_connection is not None:
+                try:
+                    tls_connection.close()
+                except OSError:
+                    pass
+
+    def _handle_intercepted_connect(self, host: str, port: int, route_decision, *, request_started: float):
+        try:
+            tls_context = self.server.runtime.https_interception.server_ssl_context(host)
+        except Exception as exc:
+            self._send_gateway_error(
+                exc,
+                context="HTTPS interception certificate setup",
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                route_decision=route_decision,
+            )
+            return
+
+        self._debug(f"HTTPS interception enabled for CONNECT {host}:{port}")
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+
+        tls_connection = None
+        try:
+            try:
+                tls_connection = tls_context.wrap_socket(self.connection, server_side=True)
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError, OSError) as exc:
+                message = f"HTTPS interception TLS handshake failed: {exc}"
+                self._debug(message, level="WARNING")
+                self.server.runtime.record_https_interception_failure(
+                    self.client_address[0],
+                    host,
+                    error=message,
+                    context="HTTPS interception TLS handshake",
+                    source="intercept",
+                )
+                self.server.runtime.record_failure(
+                    proxy_label="https",
+                    client=self.client_address[0],
+                    method="CONNECT",
+                    destination=f"{host}:{port}",
+                    host=host,
+                    port=port,
+                    error=message,
+                    context="HTTPS interception TLS handshake",
+                    route_label=route_decision["route_label"],
+                    matched_rule=route_decision["matched_rule"],
+                    profile_id=route_decision.get("profile_id"),
+                )
+                return
+
+            self.server.runtime.record_https_interception_success(
+                self.client_address[0],
+                host,
+                source="intercept",
+            )
+            intercepted_server = InterceptedHTTPSProtocolView(self.server)
+            InterceptedHTTPSRequestHandler(tls_connection, self.client_address, intercepted_server)
+            duration_ms = int((time.monotonic() - request_started) * 1000)
+            self._debug(f"HTTPS interception session closed target={host}:{port} duration_ms={duration_ms}")
+        except ssl.SSLError as exc:
+            message = f"HTTPS interception TLS handshake failed: {exc}"
+            self._debug(message, level="WARNING")
+            self.server.runtime.record_failure(
+                proxy_label="https",
+                client=self.client_address[0],
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                error=message,
+                context="HTTPS interception TLS handshake",
+                route_label=route_decision["route_label"],
+                matched_rule=route_decision["matched_rule"],
+                profile_id=route_decision.get("profile_id"),
+            )
+        finally:
+            self.close_connection = True
+            if tls_connection is not None:
+                try:
+                    tls_connection.close()
+                except OSError:
+                    pass
 
     def _handle_client_portal_live_websocket(self, *, range_key: str):
         websocket_key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -656,7 +841,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_client_portal_request(self, scheme: str, host: str, port: int, target_path: str) -> bool:
-        if self.command not in {"GET", "HEAD"} or scheme != "http":
+        if self.command not in {"GET", "HEAD"} or scheme not in {"http", "https"}:
             return False
 
         self_target_kind = self.server.runtime.self_endpoints.resolve_target_kind(host, port)
@@ -670,6 +855,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         html_paths = {"/", "/index.html", "/client", "/client/"}
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
         live_paths = {"/api/client/live", "/client.live"}
+        ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
+        ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
+        ca_check_paths = {"/ca-check", "/ca-check/"}
 
         if route_path == "/favicon.ico":
             self._send_body_response(204, "No Content", None, content_type="image/x-icon")
@@ -689,6 +877,60 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self._handle_client_portal_live_websocket(range_key=range_key)
             except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
                 return True
+            return True
+
+        if route_path in ca_cert_paths:
+            try:
+                body = self.server.runtime.https_interception.ca_certificate_pem()
+            except Exception as exc:
+                self._send_body_response(
+                    500,
+                    "Internal Server Error",
+                    f"Failed to generate HTTPS interception CA certificate: {exc}\n".encode("utf-8"),
+                    content_type="text/plain; charset=utf-8",
+                )
+                return True
+            self._log_http_event(f"served HTTPS interception CA certificate {route_path} for {self.client_address[0]}")
+            self._send_body_response(
+                200,
+                "OK",
+                body,
+                content_type="application/x-x509-ca-cert",
+                extra_headers={
+                    "Content-Disposition": 'attachment; filename="proxy-router-ca.crt"',
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+            return True
+
+        if route_path in ca_check_paths:
+            payload = build_client_portal_snapshot(
+                self.server,
+                self.client_address[0],
+                range_key=range_key,
+            )
+            self._log_http_event(f"served HTTPS CA trust check page {route_path} for {self.client_address[0]}")
+            self._send_body_response(
+                200,
+                "OK",
+                render_ca_trust_check_html(payload, trusted=scheme == "https").encode("utf-8"),
+                content_type="text/html; charset=utf-8",
+            )
+            return True
+
+        if route_path in ca_html_paths:
+            payload = build_client_portal_snapshot(
+                self.server,
+                self.client_address[0],
+                range_key=range_key,
+            )
+            self._log_http_event(f"served HTTPS interception CA install page {route_path} for {self.client_address[0]}")
+            self._send_body_response(
+                200,
+                "OK",
+                render_ca_install_html(payload).encode("utf-8"),
+                content_type="text/html; charset=utf-8",
+            )
             return True
 
         if route_path not in html_paths and route_path not in json_paths:
@@ -810,11 +1052,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._debug(f"request-line={truncate_for_log(self.requestline)}")
             self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             scheme, host, port, target_path = self._extract_target()
+            destination = build_request_destination(scheme, host, port, target_path)
             if self._handle_client_portal_request(scheme, host, port, target_path):
                 return
             if not self._check_client_traffic_limit(
                 method=self.command,
-                destination=f"{scheme}://{host}:{port}{target_path}",
+                destination=destination,
                 host=host,
                 port=port,
             ):
@@ -824,12 +1067,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 host, port
             )
             self._log_http_event(
-                f"{self.command} {scheme}://{host}:{port}{target_path} via {route_decision['route_label']}"
+                f"{self.command} {destination} via {route_decision['route_label']}"
             )
             if route_decision["action"] in {"reject", "block"}:
                 self._reject_routed_request(
                     method=self.command,
-                    destination=f"{scheme}://{host}:{port}{target_path}",
+                    destination=destination,
                     host=host,
                     port=port,
                     route_decision=route_decision,
@@ -853,17 +1096,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 connection,
                 response,
                 request_started=request_started,
-                target_description=f"{scheme}://{host}:{port}{target_path}",
+                target_description=destination,
                 target_host=host,
                 target_port=port,
                 request_body_bytes=request_body_bytes,
                 method=self.command,
+                kind="https" if scheme == "https" else "http",
                 route_decision=route_decision,
             )
         except Exception as exc:
             destination = "forward request"
             if {"scheme", "host", "port", "target_path"} <= locals().keys():
-                destination = f"{scheme}://{host}:{port}{target_path}"
+                destination = build_request_destination(scheme, host, port, target_path)
             self._send_gateway_error(
                 exc,
                 context="forward request",
@@ -1141,11 +1385,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 raise OSError("router selected proxy, but no upstream proxy is configured")
 
             if upstream["type"] == "http":
-                connection_class = http.client.HTTPConnection
-                connection = connection_class(upstream["host"], upstream["port"], **connection_kwargs)
-                default_port = 443 if scheme == "https" else 80
-                authority = host if port == default_port else f"{host}:{port}"
-                request_target = f"{scheme}://{authority}{target_path}"
+                if scheme == "https":
+                    connection = http.client.HTTPSConnection(
+                        upstream["host"],
+                        upstream["port"],
+                        context=ssl.create_default_context(),
+                        **connection_kwargs,
+                    )
+                    connection.set_tunnel(host, port)
+                    request_target = target_path
+                else:
+                    connection = http.client.HTTPConnection(upstream["host"], upstream["port"], **connection_kwargs)
+                    authority = host if port == 80 else f"{host}:{port}"
+                    request_target = f"{scheme}://{authority}{target_path}"
             else:
                 upstream_socket = create_socks5_proxy_connection(
                     upstream["host"],
@@ -1211,6 +1463,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         target_port: int | None,
         request_body_bytes: int,
         method: str,
+        kind: str,
         route_decision,
     ):
         bytes_written = 0
@@ -1261,7 +1514,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         finally:
             self.server.runtime.record_usage(
                 proxy_label=self.server.proxy_label,
-                kind="http",
+                kind=kind,
                 client=self.client_address[0],
                 destination=target_description,
                 uploaded_bytes=request_body_bytes,
@@ -1270,7 +1523,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 route_label=route_decision["route_label"],
                 matched_rule=route_decision["matched_rule"],
                 profile_id=route_decision.get("profile_id"),
+                status_code=response.status,
             )
+            self.close_connection = True
             if response.status != 403:
                 self.server.runtime.record_auto_proxy_success(target_host, route_decision)
             response.close()
@@ -1352,6 +1607,71 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return "Upstream connection was reset."
 
         return f"Proxy error: {exc}"
+
+
+class InterceptedHTTPSRequestHandler(ProxyRequestHandler):
+    def handle(self):
+        BaseHTTPRequestHandler.handle(self)
+
+    def _extract_target(self):
+        self._debug(f"intercepted-https raw-path={truncate_for_log(self.path)}")
+        parsed = urlsplit(self.path)
+
+        if parsed.scheme and parsed.netloc:
+            scheme = parsed.scheme.lower()
+            host, port = split_host_port(parsed.netloc, 443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            return scheme, host, port, path
+
+        host_header = self.headers.get("Host", "").strip()
+        if not host_header:
+            raise ValueError("missing Host header")
+
+        host, port = split_host_port(host_header, 443)
+        self._debug(f"intercepted HTTPS origin-form request using Host header {truncate_for_log(host_header)}")
+        return "https", host, port, self.path or "/"
+
+
+class ClientPortalHTTPSRequestHandler(ProxyRequestHandler):
+    def handle(self):
+        BaseHTTPRequestHandler.handle(self)
+
+    def _forward_http_request(self):
+        try:
+            scheme, host, port, target_path = self._extract_target()
+            if self._handle_client_portal_request(scheme, host, port, target_path):
+                return
+            self._send_body_response(
+                404,
+                "Not Found",
+                b"Not Found\n",
+                content_type="text/plain; charset=utf-8",
+            )
+        finally:
+            self.close_connection = True
+
+    def _extract_target(self):
+        self._debug(f"client-portal-https raw-path={truncate_for_log(self.path)}")
+        parsed = urlsplit(self.path)
+
+        if parsed.scheme and parsed.netloc:
+            scheme = parsed.scheme.lower()
+            host, port = split_host_port(parsed.netloc, 443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            return scheme, host, port, path
+
+        host_header = self.headers.get("Host", "").strip()
+        if not host_header:
+            raise ValueError("missing Host header")
+
+        host, port = split_host_port(host_header, 443)
+        self._debug(f"client portal HTTPS origin-form request using Host header {truncate_for_log(host_header)}")
+        return "https", host, port, self.path or "/"
+
 
 class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
@@ -1780,7 +2100,13 @@ def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
         "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "client": client_ip,
         "portal_url": server.runtime.self_endpoints.client_portal_url(),
+        "ca_install_url": server.runtime.self_endpoints.client_portal_ca_install_url(),
+        "ca_certificate_url": server.runtime.self_endpoints.client_portal_ca_certificate_url(),
+        "ca_check_url": server.runtime.self_endpoints.client_portal_ca_check_url(),
         "client_live_url": server.runtime.self_endpoints.client_portal_live_url(listener_port),
+        "https_interception_status": server.runtime.https_interception_status(
+            server.router_config.https_interception_settings()
+        ),
         "history": history,
         "totals": client_totals,
         "recent_requests": recent_requests,
@@ -1929,10 +2255,352 @@ def format_portal_timestamp_text(value) -> str:
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
 
+def render_ca_install_html(snapshot) -> str:
+    ca_certificate_url = html.escape(str(snapshot.get("ca_certificate_url") or "/ca.crt"))
+    ca_check_url = html.escape(str(snapshot.get("ca_check_url") or f"https://{CLIENT_PORTAL_PRIMARY_HOST}/ca-check"))
+    portal_url = html.escape(str(snapshot.get("portal_url") or f"http://{CLIENT_PORTAL_PRIMARY_HOST}/"))
+    status = snapshot.get("https_interception_status") or {}
+    ca_common_name = html.escape(str(status.get("ca_common_name") or DEFAULT_HTTPS_INTERCEPT_CA_COMMON_NAME))
+    ca_file = html.escape(str(status.get("ca_cert_file") or "default CA path"))
+    ca_ready_text = "Ready to download" if status.get("ca_exists") else "Will be generated when downloaded"
+    ca_ready_text = html.escape(ca_ready_text)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install proxy-router CA</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --accent: #0f766e;
+      --accent-dark: #0b5f58;
+      --border: #dfe6ef;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+      color: var(--ink);
+    }}
+    main {{
+      width: min(980px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 26px;
+      box-shadow: 0 18px 50px rgba(23, 32, 51, 0.10);
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: clamp(1.9rem, 7vw, 3rem);
+      line-height: 1.05;
+    }}
+    p, li {{
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    .actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 12px 0 8px;
+    }}
+    .button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 12px 18px;
+      border-radius: 10px;
+      background: var(--accent);
+      color: white;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .button:active {{ background: var(--accent-dark); }}
+    .button.secondary {{
+      background: #fff;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+    }}
+    .meta {{
+      margin: 16px 0;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    }}
+    .pill {{
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #eef7f5;
+      border: 1px solid #c8e9e4;
+      overflow-wrap: anywhere;
+    }}
+    .steps {{
+      margin-top: 18px;
+      padding: 16px;
+      border-radius: 14px;
+      background: #fbfcfe;
+      border: 1px solid var(--border);
+    }}
+    .guide-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 14px;
+      margin-top: 12px;
+    }}
+    .guide-card {{
+      min-width: 0;
+      padding: 14px;
+      border-radius: 14px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+    }}
+    .guide-card h3 {{
+      margin: 0 0 8px;
+    }}
+    .guide-card ol {{
+      margin: 0;
+      padding-left: 20px;
+    }}
+    code {{
+      color: var(--ink);
+      background: #eef2f7;
+      border-radius: 6px;
+      padding: 2px 5px;
+    }}
+    pre {{
+      margin: 10px 0 0;
+      padding: 10px;
+      overflow-x: auto;
+      border-radius: 10px;
+      background: #eef2f7;
+      color: var(--ink);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }}
+    pre code {{
+      padding: 0;
+      background: transparent;
+    }}
+    @media (max-width: 520px) {{
+      body {{ padding: 14px; }}
+      main {{ padding: 20px; }}
+      .button {{ width: 100%; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Install proxy-router CA</h1>
+    <p>Install this certificate on your device only if you want proxy-router to inspect HTTPS requests for hosts you enable in the dashboard.</p>
+    <div class="actions">
+      <a class="button" href="{ca_certificate_url}">Download CA certificate</a>
+      <a class="button secondary" href="{ca_check_url}">Check certificate trust</a>
+    </div>
+    <div class="meta">
+      <div class="pill"><strong>Name:</strong><br>{ca_common_name}</div>
+      <div class="pill"><strong>Status:</strong><br>{ca_ready_text}</div>
+      <div class="pill"><strong>File:</strong><br>{ca_file}</div>
+    </div>
+    <section class="steps">
+      <h2>Install guide</h2>
+      <div class="guide-grid">
+        <article class="guide-card">
+          <h3>Android</h3>
+          <ol>
+            <li>Download <code>proxy-router-ca.crt</code>.</li>
+            <li>Open Settings, then search for <code>CA certificate</code> or <code>Install certificate</code>.</li>
+            <li>Choose <code>CA certificate</code>, select the downloaded file, and name it <code>proxy-router</code>.</li>
+            <li>Keep the Wi-Fi HTTP proxy pointed at this computer.</li>
+            <li>Open the trust check. Compatible browsers and apps can then use adaptive HTTPS sniffing.</li>
+          </ol>
+          <p>Some Android apps do not trust user-installed CAs or use certificate pinning. Those apps are automatically bypassed after a TLS trust failure.</p>
+        </article>
+        <article class="guide-card">
+          <h3>Ubuntu / Debian Linux</h3>
+          <ol>
+            <li>Download <code>proxy-router-ca.crt</code>.</li>
+            <li>Install it into the system CA store.</li>
+          </ol>
+          <pre><code>sudo cp ~/Downloads/proxy-router-ca.crt /usr/local/share/ca-certificates/proxy-router-ca.crt
+sudo update-ca-certificates</code></pre>
+          <p>Firefox may use its own certificate store. If needed, import the CA from Firefox Settings, Privacy and Security, Certificates, Authorities.</p>
+        </article>
+        <article class="guide-card">
+          <h3>Other Linux</h3>
+          <ol>
+            <li>Download <code>proxy-router-ca.crt</code>.</li>
+            <li>Install it using your distribution CA trust tool.</li>
+          </ol>
+          <p>For Fedora/RHEL, copy it under <code>/etc/pki/ca-trust/source/anchors/</code> and run <code>sudo update-ca-trust</code>.</p>
+          <p>Apps with private certificate stores may still need a separate import.</p>
+        </article>
+        <article class="guide-card">
+          <h3>Windows</h3>
+          <ol>
+            <li>Download <code>proxy-router-ca.crt</code>.</li>
+            <li>Open <code>Manage user certificates</code>.</li>
+            <li>Import the file into <code>Trusted Root Certification Authorities</code>.</li>
+            <li>Restart browsers or apps that were already open.</li>
+          </ol>
+        </article>
+        <article class="guide-card">
+          <h3>macOS</h3>
+          <ol>
+            <li>Download <code>proxy-router-ca.crt</code>.</li>
+            <li>Open it in Keychain Access.</li>
+            <li>Add it to the login or System keychain.</li>
+            <li>Open the certificate, expand Trust, and set SSL trust to <code>Always Trust</code>.</li>
+          </ol>
+        </article>
+        <article class="guide-card">
+          <h3>iOS / iPadOS</h3>
+          <ol>
+            <li>Download the certificate in Safari.</li>
+            <li>Install the downloaded profile from Settings.</li>
+            <li>Open Settings, General, About, Certificate Trust Settings.</li>
+            <li>Enable full trust for the proxy-router CA.</li>
+          </ol>
+        </article>
+      </div>
+      <p>After installing the CA, open the trust check. Apps that reject user certificates or use certificate pinning can use the automatic fallback or SOCKS5 without HTTPS interception.</p>
+    </section>
+    <p><a href="{portal_url}">Back to device portal</a></p>
+  </main>
+</body>
+</html>"""
+
+
+def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
+    portal_url = html.escape(str(snapshot.get("portal_url") or f"http://{CLIENT_PORTAL_PRIMARY_HOST}/"))
+    ca_install_url = html.escape(str(snapshot.get("ca_install_url") or "/ca"))
+    ca_check_url = html.escape(str(snapshot.get("ca_check_url") or f"https://{CLIENT_PORTAL_PRIMARY_HOST}/ca-check"))
+    status = snapshot.get("https_interception_status") or {}
+    bypass_count = int(status.get("adaptive_bypass_count") or 0)
+    title = "Certificate trust confirmed" if trusted else "Certificate trust check"
+    message = (
+        "This browser completed a TLS handshake with the proxy-router CA. Adaptive HTTPS sniffing can now try compatible HTTPS requests for this device."
+        if trusted
+        else "Open this check over HTTPS after installing the CA. If the browser blocks the page, the CA is not trusted yet on this device."
+    )
+    action_html = (
+        f'<a class="button" href="{portal_url}">Back to device portal</a>'
+        if trusted
+        else f'<a class="button" href="{ca_check_url}">Open HTTPS trust check</a>'
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --accent: #0f766e;
+      --border: #dfe6ef;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+      color: var(--ink);
+    }}
+    main {{
+      width: min(700px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 26px;
+      box-shadow: 0 18px 50px rgba(23, 32, 51, 0.10);
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: clamp(1.9rem, 7vw, 3rem);
+      line-height: 1.05;
+    }}
+    p {{
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    .button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      margin-top: 10px;
+      padding: 12px 18px;
+      border-radius: 10px;
+      background: var(--accent);
+      color: white;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .meta {{
+      margin: 16px 0;
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    }}
+    .pill {{
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #eef7f5;
+      border: 1px solid #c8e9e4;
+      overflow-wrap: anywhere;
+    }}
+    @media (max-width: 520px) {{
+      body {{ padding: 14px; }}
+      main {{ padding: 20px; }}
+      .button {{ width: 100%; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{html.escape(title)}</h1>
+    <p>{html.escape(message)}</p>
+    <div class="meta">
+      <div class="pill"><strong>Device:</strong><br>{html.escape(str(snapshot.get("client") or "unknown"))}</div>
+      <div class="pill"><strong>Adaptive bypasses:</strong><br>{bypass_count}</div>
+    </div>
+    {action_html}
+    <p><a href="{ca_install_url}">Certificate install guide</a></p>
+  </main>
+</body>
+</html>"""
+
+
 def render_client_portal_html(snapshot) -> str:
     client_ip = html.escape(str(snapshot.get("client") or "unknown"))
     requested_at = html.escape(format_portal_timestamp_text(snapshot.get("requested_at")))
     portal_url = html.escape(str(snapshot.get("portal_url") or ""))
+    ca_install_url = html.escape(str(snapshot.get("ca_install_url") or "/ca"))
+    ca_certificate_url = html.escape(str(snapshot.get("ca_certificate_url") or "/ca.crt"))
+    ca_check_url = html.escape(str(snapshot.get("ca_check_url") or f"https://{CLIENT_PORTAL_PRIMARY_HOST}/ca-check"))
+    https_status = snapshot.get("https_interception_status") or {}
+    ca_status_text = "CA ready" if https_status.get("ca_exists") else "CA will be generated on download"
+    ca_status_text = html.escape(ca_status_text)
     active_profile = snapshot.get("active_profile") or {}
     active_profile_name = html.escape(str(active_profile.get("name") or "Shared"))
     totals = snapshot.get("totals") or {}
@@ -2491,6 +3159,48 @@ def render_client_portal_html(snapshot) -> str:
       font-weight: 600;
       line-height: 1.55;
     }}
+    .install-panel {{
+      margin-top: 18px;
+      background: #eef7f5;
+      border: 1px solid #c8e9e4;
+      border-radius: 18px;
+      padding: 20px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+    }}
+    .install-panel h2 {{
+      margin: 0 0 8px;
+    }}
+    .install-panel p {{
+      margin: 0;
+      color: #325f5a;
+      line-height: 1.55;
+    }}
+    .install-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }}
+    .install-button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      text-decoration: none;
+      font-weight: 700;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }}
+    .install-button.secondary {{
+      background: #fff;
+      color: var(--accent);
+    }}
     .table-responsive {{
       width: 100%;
       max-width: 100%;
@@ -2574,6 +3284,15 @@ def render_client_portal_html(snapshot) -> str:
       .metrics-grid {{
         grid-template-columns: 1fr;
       }}
+      .install-panel {{
+        grid-template-columns: 1fr;
+      }}
+      .install-actions {{
+        justify-content: stretch;
+      }}
+      .install-button {{
+        width: 100%;
+      }}
       .portal-card {{
         padding: 16px;
       }}
@@ -2609,6 +3328,18 @@ def render_client_portal_html(snapshot) -> str:
         <div class="pill">Updated: <span id="updated-at">{requested_at}</span></div>
       </div>
       <div class="live-status" id="live-status">Connecting live updates…</div>
+    </section>
+
+    <section class="install-panel">
+      <div>
+        <h2>Install HTTPS CA</h2>
+        <p>Download and install the proxy-router CA on this device to allow automatic HTTPS request sniffing for compatible apps. {ca_status_text}.</p>
+      </div>
+      <div class="install-actions">
+        <a class="install-button" href="{ca_certificate_url}">Download CA</a>
+        <a class="install-button secondary" href="{ca_install_url}">Install guide</a>
+        <a class="install-button secondary" href="{ca_check_url}">Check trust</a>
+      </div>
     </section>
 
     <div class="layout">

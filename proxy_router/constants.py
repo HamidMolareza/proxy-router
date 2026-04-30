@@ -51,6 +51,11 @@ DEFAULT_USAGE_LOG_PATH = Path("/tmp/proxy-router-usage.log")
 DEFAULT_FAILURE_LOG_PATH = Path("/tmp/proxy-router-failures.log")
 DEFAULT_ERROR_LOG_PATH = Path("/tmp/proxy-router-errors.log")
 DEFAULT_ROUTER_CONFIG_PATH = Path.home() / ".config" / "proxy-router" / "router-config.json"
+DEFAULT_HTTPS_INTERCEPT_DIR = Path.home() / ".config" / "proxy-router" / "https-interception"
+DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH = DEFAULT_HTTPS_INTERCEPT_DIR / "proxy-router-ca.crt"
+DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH = DEFAULT_HTTPS_INTERCEPT_DIR / "proxy-router-ca.key"
+DEFAULT_HTTPS_INTERCEPT_CERT_CACHE_DIR = DEFAULT_HTTPS_INTERCEPT_DIR / "certs"
+DEFAULT_HTTPS_INTERCEPT_CA_COMMON_NAME = "proxy-router Local HTTPS Interception CA"
 DEFAULT_AUTO_PROXY_FAILURE_THRESHOLD = 2
 AUTO_PROXY_REPEAT_FAILURE_THRESHOLD = 1
 AUTO_PROXY_STAGE_DURATIONS = (
@@ -63,6 +68,9 @@ AUTO_PROXY_STAGE_DURATIONS = (
 AUTO_PROXY_RULE_NOTE_PREFIX = "auto-proxy:"
 AUTO_PROXY_PROBE_ROUTE_LABEL_PREFIX = "proxy:auto-probe:"
 AUTO_PROXY_STATE_FILE_SUFFIX = "-auto-proxy-state.json"
+HTTPS_INTERCEPTION_STATE_FILE_SUFFIX = "-https-interception-state.json"
+HTTPS_INTERCEPTION_TRUST_POLICIES = {"adaptive"}
+HTTPS_INTERCEPTION_ADAPTIVE_BYPASS_DURATION = timedelta(hours=1)
 RULE_SOURCES = {"manual", "auto"}
 RULE_DURATION_SECONDS = {
     "1h": 3600,
@@ -123,6 +131,23 @@ DEFAULT_ROUTE_ACTIONS = {"direct", "proxy"}
 RULE_ROUTE_ACTIONS = {"direct", "proxy", "block"}
 RULE_MATCH_TYPES = {"exact", "suffix", "contains"}
 UPSTREAM_PROXY_TYPES = {"http", "socks5"}
+HTTPS_INTERCEPTION_MODES = {"allowlist", "all"}
+HTTPS_INTERCEPTION_DEFAULT_PORTS = {443}
+SENSITIVE_QUERY_PARAMETER_NAMES = {
+    "access_token",
+    "api_key",
+    "auth",
+    "authorization",
+    "code",
+    "key",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "sig",
+    "signature",
+    "token",
+}
 CLIENT_TRAFFIC_WINDOW_CONFIG = {
     "1h": {
         "window": timedelta(hours=1),

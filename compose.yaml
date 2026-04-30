@@ -22,6 +22,12 @@ services:
       - /data/failures.log
       - --error-log-file
       - /data/error.log
+      - --https-intercept-ca-cert-file
+      - /data/https-interception/proxy-router-ca.crt
+      - --https-intercept-ca-key-file
+      - /data/https-interception/proxy-router-ca.key
+      - --https-intercept-cert-cache-dir
+      - /data/https-interception/certs
     volumes:
       - ./data:/data
     restart: unless-stopped
