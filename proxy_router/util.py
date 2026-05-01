@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import ipaddress
+import importlib
+import io
 import json
 import hashlib
 import hmac
+import re
 import secrets
 import socket
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -1215,6 +1219,261 @@ def format_headers_for_log(headers) -> str:
     return ", ".join(items) if items else "<none>"
 
 
+def headers_for_record(headers) -> list[dict[str, str]]:
+    if headers is None:
+        return []
+    if hasattr(headers, "items"):
+        iterable = headers.items()
+    else:
+        iterable = headers
+
+    items = []
+    for key, value in iterable:
+        name = str(key or "")
+        if not name:
+            continue
+        items.append(
+            {
+                "name": name,
+                "value": redact_header_value(name, str(value or "")),
+            }
+        )
+    return items
+
+
+def header_value(headers, name: str) -> str:
+    expected = str(name or "").strip().lower()
+    if not expected or headers is None:
+        return ""
+    if hasattr(headers, "items"):
+        iterable = headers.items()
+    else:
+        iterable = headers
+    for key, value in iterable:
+        if str(key or "").strip().lower() == expected:
+            return str(value or "")
+    return ""
+
+
+_SENSITIVE_TEXT_FIELD_PATTERN = re.compile(
+    r'(?i)("?(?:access_token|api_key|authorization|auth|code|key|password|passwd|pwd|secret|sig|signature|token)"?\s*[:=]\s*)'
+    r'("?)[^"&\s,}]+("?)'
+)
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def redact_text_for_record(value: str) -> str:
+    text = str(value or "")
+    text = _BEARER_TOKEN_PATTERN.sub("Bearer <redacted>", text)
+    return _SENSITIVE_TEXT_FIELD_PATTERN.sub(r"\1\2<redacted>\3", text)
+
+
+def is_textual_content_type(content_type: str | None) -> bool:
+    normalized = str(content_type or "").split(";", 1)[0].strip().lower()
+    if not normalized:
+        return False
+    if normalized.startswith("text/"):
+        return True
+    return normalized in {
+        "application/graphql",
+        "application/javascript",
+        "application/json",
+        "application/ld+json",
+        "application/problem+json",
+        "application/x-www-form-urlencoded",
+        "application/xml",
+        "image/svg+xml",
+    } or normalized.endswith("+json") or normalized.endswith("+xml")
+
+
+def _content_type_charset(content_type: str | None) -> str:
+    for part in str(content_type or "").split(";")[1:]:
+        key, separator, value = part.strip().partition("=")
+        if separator and key.strip().lower() == "charset":
+            return value.strip().strip("\"'")
+    return ""
+
+
+def _looks_like_binary_text(text: str) -> bool:
+    if not text:
+        return False
+    probe = text[:4096]
+    replacement_count = probe.count("\ufffd")
+    control_count = sum(1 for char in probe if ord(char) < 32 and char not in "\r\n\t")
+    suspicious_count = replacement_count + control_count
+    return suspicious_count > max(4, len(probe) // 50)
+
+
+def _content_encoding_tokens(content_encoding: str | None) -> list[str]:
+    tokens = []
+    for item in str(content_encoding or "").split(","):
+        token = item.strip().lower()
+        if token and token not in {"identity", "none"}:
+            tokens.append(token)
+    return tokens
+
+
+def _optional_module(name: str):
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+def _decompress_zlib_stream(data: bytes, *, wbits: int, preview_limit: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits)
+    return decompressor.decompress(data, max(0, int(preview_limit)) + 1)
+
+
+def _decompress_brotli(data: bytes, *, preview_limit: int) -> tuple[bytes | None, str | None]:
+    brotli_module = _optional_module("brotli")
+    if brotli_module is None:
+        return None, "unsupported content-encoding: br"
+    try:
+        if hasattr(brotli_module, "Decompressor"):
+            decompressor = brotli_module.Decompressor()
+            if hasattr(decompressor, "process"):
+                return bytes(decompressor.process(data))[: max(0, int(preview_limit)) + 1], None
+        return bytes(brotli_module.decompress(data))[: max(0, int(preview_limit)) + 1], None
+    except Exception as exc:  # pragma: no cover - depends on optional brotli implementation
+        return None, f"could not decode br body: {exc}"
+
+
+def _decompress_zstandard(data: bytes, *, preview_limit: int) -> tuple[bytes | None, str | None]:
+    zstandard_module = _optional_module("zstandard")
+    if zstandard_module is None:
+        return None, "unsupported content-encoding: zstd"
+    try:
+        decompressor = zstandard_module.ZstdDecompressor()
+        with decompressor.stream_reader(io.BytesIO(data)) as reader:
+            return reader.read(max(0, int(preview_limit)) + 1), None
+    except Exception as exc:  # pragma: no cover - depends on optional zstandard implementation
+        return None, f"could not decode zstd body: {exc}"
+
+
+def _decode_content_encoded_preview(
+    body: bytes,
+    *,
+    content_encoding: str | None,
+    preview_limit: int,
+) -> tuple[bytes | None, bool, str | None]:
+    decoded = body
+    decoded_any = False
+    for encoding in reversed(_content_encoding_tokens(content_encoding)):
+        try:
+            if encoding in {"gzip", "x-gzip"}:
+                decoded = _decompress_zlib_stream(decoded, wbits=16 + zlib.MAX_WBITS, preview_limit=preview_limit)
+            elif encoding == "deflate":
+                try:
+                    decoded = _decompress_zlib_stream(decoded, wbits=zlib.MAX_WBITS, preview_limit=preview_limit)
+                except zlib.error:
+                    decoded = _decompress_zlib_stream(decoded, wbits=-zlib.MAX_WBITS, preview_limit=preview_limit)
+            elif encoding == "br":
+                decoded_body, error = _decompress_brotli(decoded, preview_limit=preview_limit)
+                if error:
+                    return None, decoded_any, error
+                decoded = decoded_body or b""
+            elif encoding in {"zstd", "zstandard"}:
+                decoded_body, error = _decompress_zstandard(decoded, preview_limit=preview_limit)
+                if error:
+                    return None, decoded_any, error
+                decoded = decoded_body or b""
+            else:
+                return None, decoded_any, f"unsupported content-encoding: {encoding}"
+        except zlib.error as exc:
+            return None, decoded_any, f"could not decode {encoding} body: {exc}"
+        decoded_any = True
+    return decoded, decoded_any, None
+
+
+def _decode_text_preview(preview_bytes: bytes, *, content_type: str | None, textual_hint: bool) -> str | None:
+    charsets = []
+    charset = _content_type_charset(content_type)
+    if charset:
+        charsets.append(charset)
+    charsets.append("utf-8")
+
+    for charset_name in dict.fromkeys(charsets):
+        try:
+            text = preview_bytes.decode(charset_name)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        if _looks_like_binary_text(text):
+            return None
+        return text
+
+    if not textual_hint:
+        return None
+
+    text = preview_bytes.decode(charsets[0], errors="replace")
+    if _looks_like_binary_text(text):
+        return None
+    return text
+
+
+def body_preview_for_record(
+    body: bytes | None,
+    *,
+    content_type: str | None = None,
+    content_encoding: str | None = None,
+    total_bytes: int | None = None,
+    preview_limit: int = HTTPS_TRAFFIC_BODY_PREVIEW_BYTES,
+):
+    body_bytes = body or b""
+    full_size = len(body_bytes) if total_bytes is None else max(0, int(total_bytes or 0))
+    effective_preview_limit = max(0, int(preview_limit))
+    preview = {
+        "captured_bytes": 0,
+        "total_bytes": full_size,
+        "truncated": full_size > len(body_bytes),
+        "content_type": str(content_type or ""),
+        "content_encoding": str(content_encoding or ""),
+        "decoded": False,
+        "decode_error": None,
+        "text": None,
+        "omitted_reason": None,
+    }
+    if not body_bytes:
+        preview["text"] = ""
+        return preview
+
+    decoded_bytes = body_bytes
+    decoded_any = False
+    decode_error = None
+    if _content_encoding_tokens(content_encoding):
+        decoded_body, decoded_any, decode_error = _decode_content_encoded_preview(
+            body_bytes,
+            content_encoding=content_encoding,
+            preview_limit=effective_preview_limit,
+        )
+        if decoded_body is None:
+            preview["decode_error"] = decode_error
+            preview["omitted_reason"] = decode_error or "encoded body"
+            return preview
+        decoded_bytes = decoded_body
+
+    preview_bytes = decoded_bytes[:effective_preview_limit]
+    preview["captured_bytes"] = len(preview_bytes)
+    preview["decoded"] = decoded_any
+    preview["decode_error"] = decode_error
+    preview["truncated"] = bool(preview["truncated"] or len(decoded_bytes) > len(preview_bytes))
+    if not preview_bytes:
+        preview["text"] = ""
+        return preview
+
+    textual = is_textual_content_type(content_type)
+    if not textual:
+        decoded_probe = _decode_text_preview(preview_bytes, content_type=content_type, textual_hint=False)
+        textual = decoded_probe is not None
+    decoded_text = _decode_text_preview(preview_bytes, content_type=content_type, textual_hint=textual)
+    if decoded_text is None:
+        preview["omitted_reason"] = "binary content"
+        return preview
+
+    preview["text"] = redact_text_for_record(decoded_text)
+    return preview
+
+
 def is_sensitive_query_parameter(name: str) -> bool:
     normalized = str(name or "").strip().lower()
     return normalized in SENSITIVE_QUERY_PARAMETER_NAMES or "token" in normalized or "secret" in normalized
@@ -1253,6 +1512,12 @@ def resolve_usage_log_path(path_text: str | None) -> Path | None:
 def resolve_failure_log_path(path_text: str | None) -> Path | None:
     if not path_text:
         return DEFAULT_FAILURE_LOG_PATH
+    return Path(path_text).expanduser()
+
+
+def resolve_https_traffic_log_path(path_text: str | None) -> Path | None:
+    if not path_text:
+        return DEFAULT_HTTPS_TRAFFIC_LOG_PATH
     return Path(path_text).expanduser()
 
 
@@ -1426,6 +1691,11 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         "--failure-log-file",
         default=str(DEFAULT_FAILURE_LOG_PATH),
         help=f"Failure log file path for failed requests. Default: {DEFAULT_FAILURE_LOG_PATH}",
+    )
+    parser.add_argument(
+        "--https-traffic-log-file",
+        default=str(DEFAULT_HTTPS_TRAFFIC_LOG_PATH),
+        help=f"JSONL log file path for intercepted HTTPS request/response summaries. Default: {DEFAULT_HTTPS_TRAFFIC_LOG_PATH}",
     )
     parser.add_argument(
         "--router-config-file",
@@ -1859,15 +2129,18 @@ def summarize_history_records(
     buckets = {}
     destinations = {}
     available_proxy_types = set()
+    available_clients = set()
     selected_timestamps = []
 
     for record in records:
-        record_proxy_type = record.get("proxy_type", "unknown")
+        record_proxy_type = str(record.get("proxy_type", "unknown") or "unknown")
+        record_client = str(record.get("client", "unknown") or "unknown")
         available_proxy_types.add(record_proxy_type)
+        available_clients.add(record_client)
 
         if proxy_type is not None and record_proxy_type != proxy_type:
             continue
-        if client is not None and record.get("client") != client:
+        if client is not None and record_client != client:
             continue
 
         timestamp = parse_usage_timestamp(record.get("timestamp"))
@@ -1964,6 +2237,7 @@ def summarize_history_records(
         "top_destinations": top_destinations,
         "invalid_lines": invalid_lines,
         "available_proxy_types": sorted(available_proxy_types),
+        "available_clients": sorted(available_clients),
         "has_log_data": bool(records),
         "matched_records": summary["count"],
         "time_range": {

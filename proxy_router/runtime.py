@@ -4,6 +4,7 @@ import json
 import errno
 import socket
 import threading
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ class DashboardState:
         self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
         self._active_by_proxy = {}
         self._active_by_client = {}
+        self._identity_by_client_ip = {}
         self._totals_by_proxy = {}
         self._totals_by_route = {}
         self._totals_by_client = {}
@@ -38,12 +40,22 @@ class DashboardState:
             self._recent_requests.clear()
             self._recent_failures.clear()
 
-    def client_connected(self, proxy_label: str, client_ip: str):
+    def _increment_active_client_locked(self, client: str):
+        self._active_by_client[client] = self._active_by_client.get(client, 0) + 1
+
+    def _decrement_active_client_locked(self, client: str):
+        current_client_count = self._active_by_client.get(client, 0)
+        if current_client_count <= 1:
+            self._active_by_client.pop(client, None)
+        else:
+            self._active_by_client[client] = current_client_count - 1
+
+    def client_connected(self, proxy_label: str, client: str):
         with self._lock:
             self._active_by_proxy[proxy_label] = self._active_by_proxy.get(proxy_label, 0) + 1
-            self._active_by_client[client_ip] = self._active_by_client.get(client_ip, 0) + 1
+            self._increment_active_client_locked(client)
 
-    def client_disconnected(self, proxy_label: str, client_ip: str):
+    def client_disconnected(self, proxy_label: str, client: str):
         with self._lock:
             current_proxy_count = self._active_by_proxy.get(proxy_label, 0)
             if current_proxy_count <= 1:
@@ -51,11 +63,14 @@ class DashboardState:
             else:
                 self._active_by_proxy[proxy_label] = current_proxy_count - 1
 
-            current_client_count = self._active_by_client.get(client_ip, 0)
-            if current_client_count <= 1:
-                self._active_by_client.pop(client_ip, None)
-            else:
-                self._active_by_client[client_ip] = current_client_count - 1
+            self._decrement_active_client_locked(client)
+
+    def client_reidentified(self, previous_client: str, next_client: str):
+        if not previous_client or not next_client or previous_client == next_client:
+            return
+        with self._lock:
+            self._decrement_active_client_locked(previous_client)
+            self._increment_active_client_locked(next_client)
 
     def record_request(
         self,
@@ -98,6 +113,8 @@ class DashboardState:
             client_summary["total_bytes"] += uploaded_bytes + downloaded_bytes
             client_summary["proxy_types"].add(proxy_label)
             client_summary["last_seen_at"] = timestamp
+            if client_ip and client and client != client_ip:
+                self._identity_by_client_ip[str(client_ip)] = str(client)
 
             self._recent_requests.appendleft(
                 {
@@ -205,6 +222,7 @@ class DashboardState:
             )
             recent_requests = list(self._recent_requests)
             recent_failures = list(self._recent_failures)
+            identity_by_client_ip = dict(self._identity_by_client_ip)
 
         return {
             "started_at": self.started_at,
@@ -214,6 +232,7 @@ class DashboardState:
             "totals_by_client": totals_by_client,
             "active_by_proxy": active_by_proxy,
             "active_by_client": active_by_client,
+            "identity_by_client_ip": identity_by_client_ip,
             "recent_requests": recent_requests,
             "latest_request": recent_requests[0] if recent_requests else None,
             "recent_failures": recent_failures,
@@ -243,6 +262,7 @@ class DashboardLiveUpdateHub:
             "revision": 0,
             "reason": normalized_reason,
             "history_changed": normalized_reason in {"usage", "clear"},
+            "https_traffic_changed": normalized_reason in {"https-traffic", "clear"},
             "router_config_changed": normalized_reason == "router-config",
         }
         with self._condition:
@@ -271,6 +291,7 @@ class DashboardLiveUpdateHub:
                 "revision": int(changed_events[-1]["revision"]),
                 "reasons": reasons,
                 "history_changed": any(bool(event.get("history_changed")) for event in changed_events),
+                "https_traffic_changed": any(bool(event.get("https_traffic_changed")) for event in changed_events),
                 "router_config_changed": any(bool(event.get("router_config_changed")) for event in changed_events),
             }
 
@@ -624,6 +645,46 @@ class UsageLogger:
             self.log_file.write_text("", encoding="utf-8")
 
 
+class HttpsTrafficLogger:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._stream = None
+
+        if self.log_file is not None:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+
+    def record(self, event):
+        if self._stream is None:
+            return
+
+        with self._lock:
+            self._stream.write(json.dumps(event, sort_keys=True) + "\n")
+            self._stream.flush()
+
+    def close(self):
+        if self._stream is None:
+            return
+
+        with self._lock:
+            self._stream.close()
+            self._stream = None
+
+    def clear_data(self):
+        if self.log_file is None:
+            return
+
+        with self._lock:
+            if self._stream is not None:
+                self._stream.seek(0)
+                self._stream.truncate(0)
+                self._stream.flush()
+                return
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file.write_text("", encoding="utf-8")
+
+
 class FailureLogger:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
@@ -787,8 +848,10 @@ class AppRuntime:
         self.live_updates = DashboardLiveUpdateHub()
         self.usage_log_path: Path | None = None
         self.failure_log_path: Path | None = None
+        self.https_traffic_log_path: Path | None = None
         self.usage_logger = UsageLogger(None)
         self.failure_logger = FailureLogger(None)
+        self.https_traffic_logger = HttpsTrafficLogger(None)
         self.traffic_quota_manager = TrafficQuotaManager()
         self.auto_proxy_failure_manager = None
         self.self_endpoints = SelfEndpoints()
@@ -809,6 +872,11 @@ class AppRuntime:
         self.failure_logger.close()
         self.failure_log_path = log_file
         self.failure_logger = FailureLogger(log_file)
+
+    def configure_https_traffic_log(self, log_file: Path | None):
+        self.https_traffic_logger.close()
+        self.https_traffic_log_path = log_file
+        self.https_traffic_logger = HttpsTrafficLogger(log_file)
 
     def configure_traffic_quota_manager(self, log_file: Path | None):
         self.traffic_quota_manager = TrafficQuotaManager()
@@ -921,6 +989,15 @@ class AppRuntime:
         if self.auto_proxy_failure_manager is None:
             return route_decision
         return self.auto_proxy_failure_manager.route_override(host, route_decision)
+
+    def build_auto_proxy_status_probe_route(self, host: str | None, route_decision, *, status_code: int | None):
+        if self.auto_proxy_failure_manager is None:
+            return None
+        return self.auto_proxy_failure_manager.status_probe_route(
+            host,
+            route_decision,
+            status_code=status_code,
+        )
 
     def https_interception_status(self, settings=None):
         status = self.https_interception.status(settings)
@@ -1065,6 +1142,77 @@ class AppRuntime:
         )
         self.notify_dashboard_update("usage")
 
+    def record_https_traffic(
+        self,
+        *,
+        client: str,
+        client_ip: str | None,
+        client_auth_type: str | None,
+        client_auth_username: str | None,
+        client_auth_label: str | None,
+        method: str,
+        scheme: str,
+        host: str,
+        port: int,
+        path: str,
+        destination: str,
+        route_label: str | None,
+        matched_rule: dict | None,
+        profile_id: str | None,
+        status_code: int,
+        reason: str | None,
+        request_headers,
+        request_body_preview,
+        request_body_bytes: int,
+        response_headers,
+        response_body_preview,
+        response_body_bytes: int,
+        duration_ms: int,
+    ):
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        event = {
+            "id": uuid.uuid4().hex,
+            "timestamp": timestamp,
+            "client": client,
+            "client_ip": client_ip,
+            "client_auth_type": client_auth_type,
+            "client_auth_username": client_auth_username,
+            "client_auth_label": client_auth_label,
+            "method": method,
+            "scheme": scheme,
+            "host": host,
+            "port": int(port),
+            "path": sanitize_target_path_for_record(path),
+            "destination": destination,
+            "route_label": route_label or "direct",
+            "matched_rule": matched_rule,
+            "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
+            "status_code": int(status_code),
+            "reason": str(reason or ""),
+            "duration_ms": int(duration_ms),
+            "request": {
+                "headers": request_headers,
+                "body_bytes": int(request_body_bytes or 0),
+                "body_preview": request_body_preview,
+            },
+            "response": {
+                "headers": response_headers,
+                "body_bytes": int(response_body_bytes or 0),
+                "body_preview": response_body_preview,
+                "content_type": next(
+                    (
+                        item.get("value", "")
+                        for item in response_headers
+                        if str(item.get("name") or "").lower() == "content-type"
+                    ),
+                    "",
+                ),
+            },
+        }
+        event["total_bytes"] = event["request"]["body_bytes"] + event["response"]["body_bytes"]
+        self.https_traffic_logger.record(event)
+        self.notify_dashboard_update("https-traffic")
+
     def record_failure(
         self,
         *,
@@ -1138,6 +1286,7 @@ class AppRuntime:
         self.dashboard_state.clear_traffic_data()
         self.usage_logger.clear_data()
         self.failure_logger.clear_data()
+        self.https_traffic_logger.clear_data()
         self.traffic_quota_manager.clear()
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.clear_observations()
@@ -1150,3 +1299,4 @@ class AppRuntime:
             self.auto_proxy_failure_manager = None
         self.usage_logger.close()
         self.failure_logger.close()
+        self.https_traffic_logger.close()

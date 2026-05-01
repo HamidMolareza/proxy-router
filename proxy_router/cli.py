@@ -47,7 +47,8 @@ def build_proxy_parser() -> argparse.ArgumentParser:
             "  - HTTPS interception is configured in the dashboard and adaptively falls back for clients/apps that reject the CA.\n"
             "  - SOCKS5 is useful for apps or tools that support it directly, even on the mixed port.\n"
             "  - On shared Wi-Fi, prefer --allow-client with your phone IP.\n"
-            "  - Usage data is written to /tmp/proxy-router-usage.log by default."
+            "  - Usage data is written to /tmp/proxy-router-usage.log by default.\n"
+            "  - Intercepted HTTPS analyzer data is written to /tmp/proxy-router-https-traffic.log by default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -154,6 +155,11 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         "--failure-log-file",
         default=str(DEFAULT_FAILURE_LOG_PATH),
         help=f"Failure log file path for failed requests. Default: {DEFAULT_FAILURE_LOG_PATH}",
+    )
+    parser.add_argument(
+        "--https-traffic-log-file",
+        default=str(DEFAULT_HTTPS_TRAFFIC_LOG_PATH),
+        help=f"JSONL log file path for intercepted HTTPS request/response summaries. Default: {DEFAULT_HTTPS_TRAFFIC_LOG_PATH}",
     )
     parser.add_argument(
         "--error-log-file",
@@ -434,6 +440,7 @@ def print_startup_instructions(
     debug_log_path: Path | None,
     usage_log_path: Path | None,
     failure_log_path: Path | None,
+    https_traffic_log_path: Path | None,
     error_log_path: Path | None,
     router_config_path: Path,
     https_intercept_ca_cert_path: Path,
@@ -503,6 +510,8 @@ def print_startup_instructions(
         print_info(f"Analyze totals later with: {Path(sys.argv[0]).name} usage-analyze {usage_log_path}")
     if failure_log_path is not None:
         print_info(f"Failure log file: {failure_log_path}")
+    if https_traffic_log_path is not None:
+        print_info(f"HTTPS traffic JSONL log file: {https_traffic_log_path}")
     if error_log_path is not None:
         print_info(f"Error log file: {error_log_path}")
     print_info(f"Router config file: {router_config_path}")
@@ -576,6 +585,7 @@ def main():
     debug_log_path = resolve_debug_log_path(args.debug_log_file) if args.debug else None
     usage_log_path = resolve_usage_log_path(args.usage_log_file)
     failure_log_path = resolve_failure_log_path(args.failure_log_file)
+    https_traffic_log_path = resolve_https_traffic_log_path(args.https_traffic_log_file)
     error_log_path = resolve_error_log_path(args.error_log_file)
     router_config_path = resolve_router_config_path(args.router_config_file)
     https_intercept_ca_cert_path = resolve_https_intercept_ca_cert_path(args.https_intercept_ca_cert_file)
@@ -614,6 +624,14 @@ def main():
         DEBUG_LOGGER.close()
         ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not open failure log file '{failure_log_path}': {exc}") from exc
+
+    try:
+        runtime.configure_https_traffic_log(https_traffic_log_path)
+    except OSError as exc:
+        runtime.close()
+        DEBUG_LOGGER.close()
+        ERROR_LOGGER.close()
+        raise SystemExit(f"Error: could not open HTTPS traffic log file '{https_traffic_log_path}': {exc}") from exc
 
     runtime.configure_traffic_quota_manager(usage_log_path)
     runtime.rehydrate_dashboard_state()
@@ -678,6 +696,7 @@ def main():
         debug_log_path,
         usage_log_path,
         failure_log_path,
+        https_traffic_log_path,
         error_log_path,
         router_config_path,
         https_intercept_ca_cert_path,

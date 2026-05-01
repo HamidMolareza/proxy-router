@@ -12,9 +12,11 @@ const TAB_DEFINITIONS = [
   { id: 'overview', label: 'Overview' },
   { id: 'history', label: 'History' },
   { id: 'routing', label: 'Routing' },
+  { id: 'https', label: 'HTTPS' },
   { id: 'quotas', label: 'Quotas' },
   { id: 'failures', label: 'Failures' },
 ]
+const HTTPS_TRAFFIC_SORT_OPTIONS = ['timestamp', 'status_code', 'method', 'host', 'client', 'total_bytes', 'duration_ms']
 const COMMON_SECOND_LEVEL_DOMAIN_LABELS = new Set([
   'ac',
   'co',
@@ -236,11 +238,13 @@ function emptyHistoryData() {
     range: '24h',
     range_title: 'Last 24 hours',
     proxy_type: 'all',
+    client: 'all',
     summary: emptyUsageSummary(),
     series: [],
     top_destinations: [],
     invalid_lines: 0,
     available_proxy_types: [],
+    available_clients: [],
     time_range: {
       from: null,
       to: null,
@@ -248,8 +252,41 @@ function emptyHistoryData() {
   }
 }
 
+function emptyHttpsTrafficData() {
+  return {
+    items: [],
+    total: 0,
+    limit: 200,
+    invalid_lines: 0,
+    log_file: '',
+    filters: {
+      client: 'all',
+      host: '',
+      method: 'all',
+      status_code: '',
+      search: '',
+      sort: 'timestamp',
+      direction: 'desc',
+    },
+    available_clients: [],
+    available_hosts: [],
+    available_methods: [],
+  }
+}
+
 function formatMb(byteCount) {
   return `${(Number(byteCount || 0) / BYTES_IN_MB).toFixed(2)} MB`
+}
+
+function formatBytes(byteCount) {
+  const value = Number(byteCount || 0)
+  if (value < 1000) {
+    return `${value} B`
+  }
+  if (value < BYTES_IN_MB) {
+    return `${(value / 1000).toFixed(1)} KB`
+  }
+  return formatMb(value)
 }
 
 function formatPercent(numerator, denominator) {
@@ -968,6 +1005,148 @@ function formatStatusDateTime(value) {
   return parsed ? parsed.toLocaleString() : 'Unknown time'
 }
 
+function formatDurationMs(value) {
+  const duration = Number(value || 0)
+  if (duration < 1000) {
+    return `${duration} ms`
+  }
+  return `${(duration / 1000).toFixed(2)} s`
+}
+
+function normalizeHttpsTrafficFilters(filters) {
+  const source = filters && typeof filters === 'object' ? filters : {}
+  const sort = HTTPS_TRAFFIC_SORT_OPTIONS.includes(source.sort) ? source.sort : 'timestamp'
+  const direction = source.direction === 'asc' ? 'asc' : 'desc'
+  return {
+    client: source.client && source.client !== 'all' ? String(source.client) : 'all',
+    host: String(source.host || ''),
+    method: source.method && source.method !== 'all' ? String(source.method).toUpperCase() : 'all',
+    status_code: String(source.status_code || ''),
+    search: String(source.search || ''),
+    sort,
+    direction,
+  }
+}
+
+function bodyPreviewText(preview) {
+  if (!preview || typeof preview !== 'object') {
+    return ''
+  }
+  if (preview.text != null) {
+    const text = String(preview.text)
+    if (looksLikeBinaryText(text)) {
+      return '[body preview looks binary or encoded; capture a new request after decoder support is active]'
+    }
+    return text
+  }
+  if (preview.omitted_reason) {
+    return `[${preview.omitted_reason}]`
+  }
+  return ''
+}
+
+function looksLikeBinaryText(value) {
+  const text = String(value || '')
+  if (!text) {
+    return false
+  }
+  const probe = text.slice(0, 4096)
+  let suspicious = 0
+  for (const char of probe) {
+    const code = char.charCodeAt(0)
+    if (char === '\ufffd' || (code < 32 && char !== '\r' && char !== '\n' && char !== '\t')) {
+      suspicious += 1
+    }
+  }
+  return suspicious > Math.max(4, Math.floor(probe.length / 50))
+}
+
+function previewContentType(preview) {
+  return String((preview && preview.content_type) || '').split(';', 1)[0].trim().toLowerCase()
+}
+
+function bodyPreviewFormat(preview, text) {
+  const contentType = previewContentType(preview)
+  const trimmed = String(text || '').trim()
+  if (contentType === 'application/json' || contentType.endsWith('+json') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return 'json'
+  }
+  if (contentType === 'application/xml' || contentType.endsWith('+xml') || contentType === 'image/svg+xml' || trimmed.startsWith('<')) {
+    return 'xml'
+  }
+  return 'text'
+}
+
+function beautyJsonText(text) {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2)
+  } catch {
+    return ''
+  }
+}
+
+function beautyXmlText(text) {
+  const source = String(text || '').trim()
+  if (!source.startsWith('<')) {
+    return ''
+  }
+  let depth = 0
+  return source
+    .replace(/>\s*</g, '><')
+    .replace(/(>)(<)(\/*)/g, '$1\n$2$3')
+    .split('\n')
+    .map((line) => {
+      const trimmed = line.trim()
+      if (!trimmed) {
+        return ''
+      }
+      if (/^<\//.test(trimmed)) {
+        depth = Math.max(0, depth - 1)
+      }
+      const formatted = `${'  '.repeat(depth)}${trimmed}`
+      if (/^<[^!?/][^>]*[^/]>\s*$/.test(trimmed) && !/^<[^>]+>.*<\/[^>]+>$/.test(trimmed)) {
+        depth += 1
+      }
+      return formatted
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+function bodyPreviewView(preview) {
+  const raw = bodyPreviewText(preview)
+  const text = raw || '[empty body]'
+  const format = raw ? bodyPreviewFormat(preview, raw) : 'text'
+  const beauty = format === 'json' ? beautyJsonText(raw) : format === 'xml' ? beautyXmlText(raw) : ''
+  const meta = []
+  if (preview && preview.content_type) {
+    meta.push(preview.content_type)
+  }
+  if (preview && preview.content_encoding) {
+    meta.push(preview.decoded ? `decoded from ${preview.content_encoding}` : `encoded: ${preview.content_encoding}`)
+  }
+  if (preview && preview.truncated) {
+    meta.push('truncated')
+  }
+  if (preview && preview.decode_error) {
+    meta.push(preview.decode_error)
+  }
+  return {
+    raw: text,
+    beauty: beauty || text,
+    hasBeauty: Boolean(beauty),
+    format,
+    meta: meta.join(' · '),
+  }
+}
+
+function headersToText(headers) {
+  if (!Array.isArray(headers) || !headers.length) {
+    return ''
+  }
+  return headers.map((item) => `${item.name}: ${item.value}`).join('\n')
+}
+
 function formatClientAuthSummary(event) {
   if (!event || !event.client_auth_type || event.client_auth_type === 'anonymous') {
     return 'anonymous'
@@ -1218,8 +1397,10 @@ function buildOverviewCards(snapshot) {
 
 function buildHistoryCards(history) {
   const summary = history.summary || emptyUsageSummary()
+  const client = history.client && history.client !== 'all' ? history.client : 'All clients'
   return [
     ['Range', history.range_title || 'History'],
+    ['Client', client],
     ['Matched requests', String(summary.count || 0)],
     ['Total traffic', formatMb(summary.total_bytes || 0)],
     ['Upload', formatMb(summary.uploaded_bytes || 0)],
@@ -1465,12 +1646,93 @@ function BucketChart({ series, emptyMessage, ariaLabel }) {
   )
 }
 
+function CopyableCodeBox({ title, text, emptyText = '[empty]', maxHeightClass = 'max-h-80', onCopy }) {
+  const value = String(text || '')
+  const displayValue = value || emptyText
+  return (
+    <section className="min-w-0">
+      <div className="mt-3 flex items-center justify-between gap-2">
+        <h3 className="text-sm">{title}</h3>
+        <button
+          className="!min-h-0 !px-2 !py-1 !text-xs"
+          type="button"
+          onClick={() => onCopy(title, displayValue)}
+        >
+          Copy
+        </button>
+      </div>
+      <pre
+        className={cx(
+          'mt-2 overflow-auto rounded-[8px] border border-[#e8e0d1] bg-white p-3 text-xs whitespace-pre-wrap',
+          maxHeightClass,
+        )}
+      >
+        {displayValue}
+      </pre>
+    </section>
+  )
+}
+
+function BodyPreviewBox({ title, preview, mode, onModeChange, onCopy }) {
+  const view = bodyPreviewView(preview)
+  const activeMode = view.hasBeauty && mode === 'beauty' ? 'beauty' : 'raw'
+  const bodyText = activeMode === 'beauty' ? view.beauty : view.raw
+
+  return (
+    <section className="min-w-0">
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm">{title}</h3>
+          {view.meta ? <div className="mt-1 text-xs text-[#6a6f73]">{view.meta}</div> : null}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {view.hasBeauty ? (
+            <div className="flex rounded-[8px] border border-[#d8d1c2] bg-[#f6f4ed] p-1">
+              {['raw', 'beauty'].map((item) => (
+                <button
+                  className={cx(
+                    '!min-h-0 !border-0 !px-2 !py-1 !text-xs',
+                    activeMode === item ? '!bg-white !font-bold' : '!bg-transparent',
+                  )}
+                  key={item}
+                  type="button"
+                  onClick={() => onModeChange(item)}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <button
+            className="!min-h-0 !px-2 !py-1 !text-xs"
+            type="button"
+            onClick={() => onCopy(`${title} ${activeMode}`, bodyText)}
+          >
+            Copy
+          </button>
+        </div>
+      </div>
+      <pre className="mt-2 max-h-96 overflow-auto rounded-[8px] border border-[#e8e0d1] bg-white p-3 text-xs whitespace-pre-wrap">
+        {bodyText}
+      </pre>
+    </section>
+  )
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState(getTabFromHash())
   const [dashboardSnapshot, setDashboardSnapshot] = useState(emptyDashboardSnapshot())
   const [historyData, setHistoryData] = useState(emptyHistoryData())
   const [historyRange, setHistoryRange] = useState('24h')
   const [historyProxyType, setHistoryProxyType] = useState('all')
+  const [historyClient, setHistoryClient] = useState('all')
+  const [httpsTrafficData, setHttpsTrafficData] = useState(emptyHttpsTrafficData())
+  const [httpsTrafficFilters, setHttpsTrafficFilters] = useState(() => normalizeHttpsTrafficFilters({}))
+  const [httpsTrafficError, setHttpsTrafficError] = useState('')
+  const [httpsTrafficDetail, setHttpsTrafficDetail] = useState(null)
+  const [httpsTrafficDetailError, setHttpsTrafficDetailError] = useState('')
+  const [httpsBodyViewModes, setHttpsBodyViewModes] = useState({ request: 'beauty', response: 'beauty' })
+  const [copyStatus, setCopyStatus] = useState('')
   const [status, setStatus] = useState({ text: 'Connecting to live dashboard…', warning: false })
   const [historyError, setHistoryError] = useState('')
   const [nowMs, setNowMs] = useState(() => Date.now())
@@ -1495,8 +1757,13 @@ function App() {
   const activeTabRef = useRef(activeTab)
   const historyRangeRef = useRef(historyRange)
   const historyProxyTypeRef = useRef(historyProxyType)
+  const historyClientRef = useRef(historyClient)
+  const httpsTrafficRefreshTimerRef = useRef(null)
+  const httpsTrafficFiltersRef = useRef(httpsTrafficFilters)
+  const copyStatusTimerRef = useRef(null)
   const routerHasLocalChangesRef = useRef(false)
   const refreshHistoryRef = useRef(null)
+  const refreshHttpsTrafficRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
   const autoSelectedRulesTargetRef = useRef(false)
   const httpsHostPatternsFocusedRef = useRef(false)
@@ -1577,6 +1844,8 @@ function App() {
     dashboardSnapshot,
   )
   const historyNote = historyError || buildHistoryNote(historyData)
+  const httpsTrafficRows = Array.isArray(httpsTrafficData.items) ? httpsTrafficData.items : []
+  const httpsTrafficSelectedId = httpsTrafficDetail && httpsTrafficDetail.id ? httpsTrafficDetail.id : ''
   const quotaDeviceRows = dashboardSnapshot.totals_by_client.map((client) => {
     const quota = dashboardSnapshot.client_quota_status[client.client] || {}
     const usage = quota.usage || {}
@@ -1712,7 +1981,11 @@ function App() {
     }
   }
 
-  async function refreshHistory(rangeValue = historyRange, proxyTypeValue = historyProxyType) {
+  async function refreshHistory(
+    rangeValue = historyRange,
+    proxyTypeValue = historyProxyType,
+    clientValue = historyClient,
+  ) {
     const params = new URLSearchParams()
     params.set('range', rangeValue)
     const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -1722,6 +1995,9 @@ function App() {
     params.set('timezone_offset_minutes', String(-new Date().getTimezoneOffset()))
     if (proxyTypeValue !== 'all') {
       params.set('proxy_type', proxyTypeValue)
+    }
+    if (clientValue !== 'all') {
+      params.set('client', clientValue)
     }
 
     const response = await fetch(`/api/history?${params.toString()}`, {
@@ -1738,6 +2014,124 @@ function App() {
     setHistoryError('')
     if (proxyTypeValue !== 'all' && !history.available_proxy_types.includes(proxyTypeValue)) {
       setHistoryProxyType('all')
+    }
+    if (clientValue !== 'all' && !(history.available_clients || []).includes(clientValue)) {
+      setHistoryClient('all')
+    }
+  }
+
+  async function refreshHttpsTraffic(filterValue = httpsTrafficFilters) {
+    const filters = normalizeHttpsTrafficFilters(filterValue)
+    const params = new URLSearchParams()
+    params.set('sort', filters.sort)
+    params.set('direction', filters.direction)
+    params.set('limit', '200')
+    if (filters.client !== 'all') {
+      params.set('client', filters.client)
+    }
+    if (filters.host) {
+      params.set('host', filters.host)
+    }
+    if (filters.method !== 'all') {
+      params.set('method', filters.method)
+    }
+    if (filters.status_code) {
+      params.set('status_code', filters.status_code)
+    }
+    if (filters.search) {
+      params.set('search', filters.search)
+    }
+
+    const response = await fetch(`/api/https-traffic?${params.toString()}`, {
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`HTTPS traffic HTTP ${response.status}`)
+    }
+    const payload = await response.json()
+    setHttpsTrafficData({
+      ...emptyHttpsTrafficData(),
+      ...payload,
+      filters,
+      available_clients: Array.isArray(payload.available_clients) ? payload.available_clients : [],
+      available_hosts: Array.isArray(payload.available_hosts) ? payload.available_hosts : [],
+      available_methods: Array.isArray(payload.available_methods) ? payload.available_methods : [],
+      items: Array.isArray(payload.items) ? payload.items : [],
+    })
+    setHttpsTrafficError('')
+    if (filters.client !== 'all' && !(payload.available_clients || []).includes(filters.client)) {
+      setHttpsTrafficFilters((current) => ({ ...current, client: 'all' }))
+    }
+  }
+
+  async function loadHttpsTrafficDetail(requestId) {
+    if (!requestId) {
+      setHttpsTrafficDetail(null)
+      return
+    }
+    const response = await fetch(`/api/https-traffic/${encodeURIComponent(requestId)}`, {
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`HTTPS traffic detail HTTP ${response.status}`)
+    }
+    setHttpsTrafficDetail(await response.json())
+    setHttpsTrafficDetailError('')
+  }
+
+  function updateHttpsTrafficFilters(patch) {
+    setHttpsTrafficFilters((current) => normalizeHttpsTrafficFilters({ ...current, ...patch }))
+  }
+
+  function toggleHttpsTrafficSort(key) {
+    updateHttpsTrafficFilters({
+      sort: key,
+      direction: httpsTrafficFilters.sort === key && httpsTrafficFilters.direction === 'desc' ? 'asc' : 'desc',
+    })
+  }
+
+  function httpsTrafficSortLabel(key) {
+    if (httpsTrafficFilters.sort !== key) {
+      return ''
+    }
+    return httpsTrafficFilters.direction === 'asc' ? ' ↑' : ' ↓'
+  }
+
+  async function copyTextToClipboard(label, text) {
+    const value = String(text || '')
+    if (!value) {
+      return
+    }
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(value)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = value
+        textarea.setAttribute('readonly', 'readonly')
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopyStatus(`${label} copied`)
+      if (copyStatusTimerRef.current != null) {
+        window.clearTimeout(copyStatusTimerRef.current)
+      }
+      copyStatusTimerRef.current = window.setTimeout(() => {
+        setCopyStatus('')
+        copyStatusTimerRef.current = null
+      }, 1800)
+    } catch (error) {
+      setCopyStatus(`Copy failed: ${error.message}`)
     }
   }
 
@@ -1787,8 +2181,10 @@ function App() {
     activeTabRef.current = activeTab
     historyRangeRef.current = historyRange
     historyProxyTypeRef.current = historyProxyType
+    historyClientRef.current = historyClient
+    httpsTrafficFiltersRef.current = httpsTrafficFilters
     routerHasLocalChangesRef.current = routerHasLocalChanges
-  }, [activeTab, historyRange, historyProxyType, routerHasLocalChanges])
+  }, [activeTab, historyRange, historyProxyType, historyClient, httpsTrafficFilters, routerHasLocalChanges])
 
   useEffect(() => {
     if (!httpsHostPatternsFocusedRef.current) {
@@ -1801,6 +2197,7 @@ function App() {
 
   useEffect(() => {
     refreshHistoryRef.current = refreshHistory
+    refreshHttpsTrafficRef.current = refreshHttpsTraffic
     loadRouterConfigRef.current = loadRouterConfig
   })
 
@@ -1844,8 +2241,24 @@ function App() {
         if (!refresh) {
           return
         }
-        refresh(historyRangeRef.current, historyProxyTypeRef.current).catch((error) => {
+        refresh(historyRangeRef.current, historyProxyTypeRef.current, historyClientRef.current).catch((error) => {
           setHistoryError(`History refresh paused: ${error.message}`)
+        })
+      }, 250)
+    }
+
+    function scheduleHttpsTrafficRefresh() {
+      if (httpsTrafficRefreshTimerRef.current != null) {
+        return
+      }
+      httpsTrafficRefreshTimerRef.current = window.setTimeout(() => {
+        httpsTrafficRefreshTimerRef.current = null
+        const refresh = refreshHttpsTrafficRef.current
+        if (!refresh) {
+          return
+        }
+        refresh(httpsTrafficFiltersRef.current).catch((error) => {
+          setHttpsTrafficError(`HTTPS traffic refresh paused: ${error.message}`)
         })
       }, 250)
     }
@@ -1901,6 +2314,9 @@ function App() {
         if (payload.history_changed && activeTabRef.current === 'history') {
           scheduleHistoryRefresh()
         }
+        if (payload.https_traffic_changed && activeTabRef.current === 'https') {
+          scheduleHttpsTrafficRefresh()
+        }
       })
 
       socket.addEventListener('close', () => {
@@ -1939,6 +2355,14 @@ function App() {
         window.clearTimeout(historyRefreshTimerRef.current)
         historyRefreshTimerRef.current = null
       }
+      if (httpsTrafficRefreshTimerRef.current != null) {
+        window.clearTimeout(httpsTrafficRefreshTimerRef.current)
+        httpsTrafficRefreshTimerRef.current = null
+      }
+      if (copyStatusTimerRef.current != null) {
+        window.clearTimeout(copyStatusTimerRef.current)
+        copyStatusTimerRef.current = null
+      }
       if (liveSocketRef.current) {
         try {
           liveSocketRef.current.close()
@@ -1959,14 +2383,32 @@ function App() {
       if (!refresh) {
         return
       }
-      refresh(historyRange, historyProxyType).catch((error) => {
+      refresh(historyRange, historyProxyType, historyClient).catch((error) => {
         setHistoryError(`History refresh paused: ${error.message}`)
       })
     }, 0)
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [activeTab, historyRange, historyProxyType])
+  }, [activeTab, historyRange, historyProxyType, historyClient])
+
+  useEffect(() => {
+    if (activeTab !== 'https') {
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      const refresh = refreshHttpsTrafficRef.current
+      if (!refresh) {
+        return
+      }
+      refresh(httpsTrafficFilters).catch((error) => {
+        setHttpsTrafficError(`HTTPS traffic refresh paused: ${error.message}`)
+      })
+    }, 0)
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [activeTab, httpsTrafficFilters])
 
   useEffect(() => {
     if (!routerDirty) {
@@ -2362,6 +2804,10 @@ function App() {
       } else {
         await refreshHistory()
       }
+      setHttpsTrafficData(emptyHttpsTrafficData())
+      setHttpsTrafficDetail(null)
+      setHttpsTrafficError('')
+      setHttpsTrafficDetailError('')
       setStatus({
         text: `Traffic data cleared · ${new Date().toLocaleTimeString()}`,
         warning: false,
@@ -2630,6 +3076,17 @@ function App() {
                     {historyData.available_proxy_types.map((proxyType) => (
                       <option key={proxyType} value={proxyType}>
                         {proxyType}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={controlClass}>
+                  <span>Client</span>
+                  <select value={historyClient} onChange={(event) => setHistoryClient(event.target.value)}>
+                    <option value="all">All clients</option>
+                    {(historyData.available_clients || []).map((client) => (
+                      <option key={client} value={client}>
+                        {client}
                       </option>
                     ))}
                   </select>
@@ -2920,112 +3377,6 @@ function App() {
                           {note}
                         </div>
                       ))}
-                    </div>
-                  </div>
-
-                  <h3 className="mt-4">Automatic HTTPS sniffing</h3>
-                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
-                    <input
-                      className={cx(routerHasLocalChanges && dirtyInputClass)}
-                      type="checkbox"
-                      checked={currentRouterConfig.https_interception.enabled}
-                      onChange={(event) => {
-                        const nextConfig = cloneJson(currentRouterConfig)
-                        nextConfig.https_interception.enabled = event.target.checked
-                        setLocalRouterConfig(nextConfig)
-                      }}
-                    />
-                    <span>Enable adaptive HTTPS request sniffing for selected CONNECT hosts</span>
-                  </label>
-                  <div className={fieldGridClass}>
-                    <label className={fieldClass}>
-                      <span>Mode</span>
-                      <select
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        value={currentRouterConfig.https_interception.mode}
-                        onChange={(event) => {
-                          const nextConfig = cloneJson(currentRouterConfig)
-                          nextConfig.https_interception.mode = event.target.value === 'all' ? 'all' : 'allowlist'
-                          setLocalRouterConfig(nextConfig)
-                        }}
-                      >
-                        <option value="allowlist">Allowlisted hosts</option>
-                        <option value="all">All CONNECT port 443 hosts</option>
-                      </select>
-                    </label>
-                    <label className={fieldClass}>
-                      <span>Host patterns</span>
-                      <input
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        type="text"
-                        value={httpsHostPatternsText}
-                        placeholder="example.com, api.example.com"
-                        onChange={(event) => {
-                          setHttpsHostPatternsText(event.target.value)
-                        }}
-                        onFocus={() => {
-                          httpsHostPatternsFocusedRef.current = true
-                        }}
-                        onBlur={() => {
-                          httpsHostPatternsFocusedRef.current = false
-                          updateHttpsInterceptionPatterns('host_patterns', httpsHostPatternsText)
-                        }}
-                      />
-                    </label>
-                    <label className={fieldClass}>
-                      <span>Bypass patterns</span>
-                      <input
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        type="text"
-                        value={httpsBypassPatternsText}
-                        placeholder="pinned.example.com"
-                        onChange={(event) => {
-                          setHttpsBypassPatternsText(event.target.value)
-                        }}
-                        onFocus={() => {
-                          httpsBypassPatternsFocusedRef.current = true
-                        }}
-                        onBlur={() => {
-                          httpsBypassPatternsFocusedRef.current = false
-                          updateHttpsInterceptionPatterns('bypass_patterns', httpsBypassPatternsText)
-                        }}
-                      />
-                    </label>
-                  </div>
-                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
-                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
-                      <div className="text-xs text-[#6a6f73]">Status</div>
-                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
-                        {buildHttpsInterceptionHeadline(httpsInterceptionStatus, currentRouterConfig)}
-                      </div>
-                      {buildHttpsInterceptionNotes(httpsInterceptionStatus, currentRouterConfig).map((note) => (
-                        <div className={noteClass} key={note}>
-                          {note}
-                        </div>
-                      ))}
-                    </div>
-                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
-                      <div className="text-xs text-[#6a6f73]">Adaptive fallback</div>
-                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
-                        {httpsInterceptionStatus.adaptive_bypass_count
-                          ? `${httpsInterceptionStatus.adaptive_bypass_count} temporary bypass(es)`
-                          : 'No temporary bypasses'}
-                      </div>
-                      <div className={noteClass}>
-                        Apps that reject the CA temporarily fall back to raw CONNECT automatically.
-                      </div>
-                    </div>
-                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
-                      <div className="text-xs text-[#6a6f73]">Certificate authority</div>
-                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
-                        {httpsInterceptionStatus.ca_common_name}
-                      </div>
-                      <div className={noteClass}>{httpsInterceptionStatus.ca_cert_file || 'Default local CA path'}</div>
-                      <div className={tightButtonRowClass}>
-                        <button type="button" onClick={() => window.location.assign('/api/https-interception/ca.crt')}>
-                          Download CA
-                        </button>
-                      </div>
                     </div>
                   </div>
 
@@ -3383,6 +3734,358 @@ function App() {
                       </tbody>
                     </table>
                   </div>
+                </section>
+              </div>
+            </section>
+          </section>
+        </section>
+      ) : null}
+
+      {activeTab === 'https' ? (
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
+                <div>
+                  <h2>HTTPS</h2>
+                  <div className={noteClass}>Interception controls, CA status, and captured request analysis.</div>
+                </div>
+                <div className="flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:items-center sm:flex-wrap">
+                  <div className={cx(pillClass, !currentRouterConfig.https_interception.enabled && mutedPillClass)}>
+                    {buildHttpsInterceptionHeadline(httpsInterceptionStatus, currentRouterConfig)}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      refreshHttpsTraffic(httpsTrafficFilters).catch((error) => {
+                        setHttpsTrafficError(`HTTPS traffic refresh failed: ${error.message}`)
+                      })
+                    }}
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(160px,1fr))] sm:gap-3">
+                <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                  <div className="text-xs text-[#6a6f73]">Captured requests</div>
+                  <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                    {httpsTrafficData.total || httpsTrafficRows.length}
+                  </div>
+                  <div className={noteClass}>
+                    {httpsTrafficData.log_file ? `JSONL: ${httpsTrafficData.log_file}` : 'HTTPS traffic log is not configured.'}
+                  </div>
+                </div>
+                <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                  <div className="text-xs text-[#6a6f73]">Adaptive fallback</div>
+                  <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                    {httpsInterceptionStatus.adaptive_bypass_count
+                      ? `${httpsInterceptionStatus.adaptive_bypass_count} bypass(es)`
+                      : 'No temporary bypasses'}
+                  </div>
+                  <div className={noteClass}>Apps that reject the CA temporarily fall back to raw CONNECT.</div>
+                </div>
+                <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                  <div className="text-xs text-[#6a6f73]">Certificate authority</div>
+                  <div className="mt-1 [overflow-wrap:anywhere] font-bold">{httpsInterceptionStatus.ca_common_name}</div>
+                  <div className={noteClass}>{httpsInterceptionStatus.ca_cert_file || 'Default local CA path'}</div>
+                  <div className={tightButtonRowClass}>
+                    <button type="button" onClick={() => window.location.assign('/api/https-interception/ca.crt')}>
+                      Download CA
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-12 gap-4">
+                <section className={cx(subpanelClass, 'col-span-full lg:col-span-5')}>
+                  <h3>Sniffing config</h3>
+                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                    <input
+                      className={cx(routerHasLocalChanges && dirtyInputClass)}
+                      type="checkbox"
+                      checked={currentRouterConfig.https_interception.enabled}
+                      onChange={(event) => {
+                        const nextConfig = cloneJson(currentRouterConfig)
+                        nextConfig.https_interception.enabled = event.target.checked
+                        setLocalRouterConfig(nextConfig)
+                      }}
+                    />
+                    <span>Enable adaptive HTTPS request sniffing</span>
+                  </label>
+                  <div className={fieldGridClass}>
+                    <label className={fieldClass}>
+                      <span>Mode</span>
+                      <select
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        value={currentRouterConfig.https_interception.mode}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.https_interception.mode = event.target.value === 'all' ? 'all' : 'allowlist'
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      >
+                        <option value="allowlist">Allowlisted hosts</option>
+                        <option value="all">All CONNECT port 443 hosts</option>
+                      </select>
+                    </label>
+                    <label className={fieldClass}>
+                      <span>Host patterns</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="text"
+                        value={httpsHostPatternsText}
+                        placeholder="example.com, api.example.com"
+                        onChange={(event) => {
+                          setHttpsHostPatternsText(event.target.value)
+                        }}
+                        onFocus={() => {
+                          httpsHostPatternsFocusedRef.current = true
+                        }}
+                        onBlur={() => {
+                          httpsHostPatternsFocusedRef.current = false
+                          updateHttpsInterceptionPatterns('host_patterns', httpsHostPatternsText)
+                        }}
+                      />
+                    </label>
+                    <label className={fieldClass}>
+                      <span>Bypass patterns</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="text"
+                        value={httpsBypassPatternsText}
+                        placeholder="pinned.example.com"
+                        onChange={(event) => {
+                          setHttpsBypassPatternsText(event.target.value)
+                        }}
+                        onFocus={() => {
+                          httpsBypassPatternsFocusedRef.current = true
+                        }}
+                        onBlur={() => {
+                          httpsBypassPatternsFocusedRef.current = false
+                          updateHttpsInterceptionPatterns('bypass_patterns', httpsBypassPatternsText)
+                        }}
+                      />
+                    </label>
+                  </div>
+                  {buildHttpsInterceptionNotes(httpsInterceptionStatus, currentRouterConfig).map((note) => (
+                    <div className={noteClass} key={note}>
+                      {note}
+                    </div>
+                  ))}
+                </section>
+
+                <section className={cx(subpanelClass, 'col-span-full lg:col-span-7')}>
+                  <h3>Captured traffic</h3>
+                  <div className={controlsClass}>
+                    <label className={controlClass}>
+                      <span>Client</span>
+                      <select
+                        value={httpsTrafficFilters.client}
+                        onChange={(event) => updateHttpsTrafficFilters({ client: event.target.value })}
+                      >
+                        <option value="all">All clients</option>
+                        {(httpsTrafficData.available_clients || []).map((client) => (
+                          <option key={client} value={client}>
+                            {client}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className={controlClass}>
+                      <span>Method</span>
+                      <select
+                        value={httpsTrafficFilters.method}
+                        onChange={(event) => updateHttpsTrafficFilters({ method: event.target.value })}
+                      >
+                        <option value="all">All methods</option>
+                        {(httpsTrafficData.available_methods || []).map((method) => (
+                          <option key={method} value={method}>
+                            {method}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className={controlClass}>
+                      <span>Status</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={httpsTrafficFilters.status_code}
+                        placeholder="403"
+                        onChange={(event) => updateHttpsTrafficFilters({ status_code: event.target.value.trim() })}
+                      />
+                    </label>
+                    <label className={controlClass}>
+                      <span>Host</span>
+                      <input
+                        type="search"
+                        value={httpsTrafficFilters.host}
+                        placeholder="api.example.com"
+                        onChange={(event) => updateHttpsTrafficFilters({ host: event.target.value })}
+                      />
+                    </label>
+                    <label className={controlClass}>
+                      <span>Search</span>
+                      <input
+                        type="search"
+                        value={httpsTrafficFilters.search}
+                        placeholder="Path, client, host"
+                        onChange={(event) => updateHttpsTrafficFilters({ search: event.target.value })}
+                      />
+                    </label>
+                  </div>
+
+                  {httpsTrafficError ? <div className={noteClass}>{httpsTrafficError}</div> : null}
+                  <div className={noteClass}>
+                    Showing {httpsTrafficRows.length} of {httpsTrafficData.total || 0} matched records.
+                    {httpsTrafficData.invalid_lines ? ` ${httpsTrafficData.invalid_lines} invalid log line(s) skipped.` : ''}
+                  </div>
+
+                  <div className={cx(tableWrapClass, 'max-h-[34rem] overflow-auto [&_thead]:sticky [&_thead]:top-0 [&_thead]:z-10 [&_thead]:bg-[#fffdf8]')}>
+                    <table className="min-w-[74rem]">
+                      <thead>
+                        <tr>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('timestamp')}>
+                              Time{httpsTrafficSortLabel('timestamp')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('client')}>
+                              Client{httpsTrafficSortLabel('client')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('method')}>
+                              Method{httpsTrafficSortLabel('method')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('status_code')}>
+                              Status{httpsTrafficSortLabel('status_code')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('host')}>
+                              Host{httpsTrafficSortLabel('host')}
+                            </button>
+                          </th>
+                          <th>Path</th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('total_bytes')}>
+                              Size{httpsTrafficSortLabel('total_bytes')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('duration_ms')}>
+                              Duration{httpsTrafficSortLabel('duration_ms')}
+                            </button>
+                          </th>
+                          <th>Route</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {httpsTrafficRows.length ? (
+                          httpsTrafficRows.map((item) => (
+                            <tr
+                              key={item.id}
+                              className={cx(
+                                'cursor-pointer',
+                                httpsTrafficSelectedId === item.id && 'bg-[#e7f3f0]',
+                              )}
+                              onClick={() => {
+                                loadHttpsTrafficDetail(item.id).catch((error) => {
+                                  setHttpsTrafficDetailError(`Detail load failed: ${error.message}`)
+                                })
+                              }}
+                            >
+                              <td>{formatStatusDateTime(item.timestamp)}</td>
+                              <td>{item.client}</td>
+                              <td>{item.method}</td>
+                              <td>{item.status_code || 'n/a'}</td>
+                              <td className="max-w-64 break-words">{item.host}</td>
+                              <td className="max-w-md break-words">{item.path || '/'}</td>
+                              <td>{formatBytes(item.total_bytes)}</td>
+                              <td>{formatDurationMs(item.duration_ms)}</td>
+                              <td>{item.route_label || 'direct'}</td>
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td colSpan="9" className="pt-2 text-[#6a6f73]">
+                              {httpsTrafficError ? 'HTTPS traffic is unavailable right now.' : 'No intercepted HTTPS requests matched this filter.'}
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+
+                <section className={cx(subpanelClass, 'col-span-full')}>
+                  <div className={panelHeaderClass}>
+                    <div>
+                      <h3>Request detail</h3>
+                      <div className={noteClass}>
+                        {httpsTrafficDetail
+                          ? `${httpsTrafficDetail.method} ${httpsTrafficDetail.destination}`
+                          : 'Select a captured request to inspect its redacted metadata and body previews.'}
+                      </div>
+                    </div>
+                    {httpsTrafficDetail ? (
+                      <button type="button" onClick={() => setHttpsTrafficDetail(null)}>
+                        Close detail
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {httpsTrafficDetailError ? <div className={noteClass}>{httpsTrafficDetailError}</div> : null}
+                  {copyStatus ? <div className={noteClass}>{copyStatus}</div> : null}
+                  {httpsTrafficDetail ? (
+                    <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                      <section className="min-w-0">
+                        <h3>Request</h3>
+                        <div className={noteClass}>
+                          Client {httpsTrafficDetail.client} · {formatClientAuthSummary(httpsTrafficDetail)} ·{' '}
+                          {formatBytes((httpsTrafficDetail.request || {}).body_bytes)}
+                        </div>
+                        <CopyableCodeBox
+                          title="Request headers"
+                          text={headersToText((httpsTrafficDetail.request || {}).headers)}
+                          onCopy={copyTextToClipboard}
+                        />
+                        <BodyPreviewBox
+                          title="Request body"
+                          preview={(httpsTrafficDetail.request || {}).body_preview}
+                          mode={httpsBodyViewModes.request}
+                          onModeChange={(mode) => setHttpsBodyViewModes((current) => ({ ...current, request: mode }))}
+                          onCopy={copyTextToClipboard}
+                        />
+                      </section>
+                      <section className="min-w-0">
+                        <h3>Response</h3>
+                        <div className={noteClass}>
+                          HTTP {httpsTrafficDetail.status_code} {httpsTrafficDetail.reason || ''} ·{' '}
+                          {formatBytes((httpsTrafficDetail.response || {}).body_bytes)} ·{' '}
+                          {formatDurationMs(httpsTrafficDetail.duration_ms)}
+                        </div>
+                        <CopyableCodeBox
+                          title="Response headers"
+                          text={headersToText((httpsTrafficDetail.response || {}).headers)}
+                          onCopy={copyTextToClipboard}
+                        />
+                        <BodyPreviewBox
+                          title="Response body"
+                          preview={(httpsTrafficDetail.response || {}).body_preview}
+                          mode={httpsBodyViewModes.response}
+                          onModeChange={(mode) => setHttpsBodyViewModes((current) => ({ ...current, response: mode }))}
+                          onCopy={copyTextToClipboard}
+                        />
+                      </section>
+                    </div>
+                  ) : null}
                 </section>
               </div>
             </section>
@@ -3823,7 +4526,7 @@ function App() {
             </section>
 
             <section className={cx(panelClass, 'col-span-full')}>
-              <h2>By device</h2>
+              <h2>By client</h2>
               {dashboardSnapshot.totals_by_client.length ? (
                 <div className={tableWrapClass}>
                   <table>

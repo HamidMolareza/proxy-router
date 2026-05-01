@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .constants import *
 from .output import DEBUG_LOGGER, debug_log
-from .records import UsageHistoryCache, build_failure_snapshot_from_records
+from .records import HttpsTrafficCache, UsageHistoryCache, build_failure_snapshot_from_records
 from .util import first_query_value, normalize_history_filter
 
 
@@ -24,6 +24,7 @@ class ThreadedDashboardServer(socketserver.ThreadingMixIn, HTTPServer):
         self.runtime = runtime
         self.dashboard_state = runtime.dashboard_state
         self.history_cache = UsageHistoryCache(runtime.usage_log_path)
+        self.https_traffic_cache = HttpsTrafficCache(runtime.https_traffic_log_path)
         self.router_config = router_config
 
 
@@ -89,6 +90,7 @@ def build_live_update_message(server, event_summary, *, initial: bool = False):
         "initial": initial,
         "reasons": reasons,
         "history_changed": False if initial else bool(event_summary.get("history_changed")),
+        "https_traffic_changed": False if initial else bool(event_summary.get("https_traffic_changed")),
         "router_config_changed": False if initial else bool(event_summary.get("router_config_changed")),
         "snapshot": build_dashboard_snapshot(server),
     }
@@ -243,6 +245,35 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if route_path in {"/api/https-traffic", "/api/https-traffic.json"}:
+            query = parse_qs(parsed.query)
+            limit_text = first_query_value(query, "limit")
+            try:
+                limit = int(limit_text) if limit_text else None
+            except ValueError:
+                limit = None
+            payload = self.server.https_traffic_cache.query(
+                client=normalize_history_filter(first_query_value(query, "client")),
+                host=first_query_value(query, "host"),
+                method=normalize_history_filter(first_query_value(query, "method")),
+                status_code=first_query_value(query, "status_code"),
+                search=first_query_value(query, "search"),
+                sort=first_query_value(query, "sort"),
+                direction=first_query_value(query, "direction"),
+                limit=limit,
+            )
+            self._send_json(payload)
+            return
+
+        if route_path.startswith("/api/https-traffic/"):
+            request_id = route_path.rsplit("/", 1)[-1]
+            detail = self.server.https_traffic_cache.detail(request_id)
+            if detail is None:
+                self._send_json({"error": "HTTPS traffic record not found"}, status=404)
+                return
+            self._send_json(detail)
+            return
+
         if route_path in {"/api/failures", "/api/failures.json"}:
             snapshot = build_dashboard_snapshot(self.server)
             self._send_json(snapshot.get("failure_summary", {}))
@@ -262,6 +293,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/router-config",
                     "/api/https-interception/status",
                     "/api/https-interception/ca.crt",
+                    "/api/https-traffic",
                     "/api/failures",
                     "/api/traffic-data/clear",
                     "/api/upstream/check",
@@ -278,6 +310,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             try:
                 self.server.runtime.clear_traffic_data()
                 self.server.history_cache.clear()
+                self.server.https_traffic_cache.clear()
             except OSError as exc:
                 self._send_json({"error": f"failed to clear traffic data: {exc}"}, status=500)
                 return

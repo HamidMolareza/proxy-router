@@ -7,10 +7,10 @@ It is designed for cases where a phone or another device on the same network sho
 ## Highlights
 
 - Mixed HTTP + SOCKS5 listener on one port for simple device setup
-- React dashboard for overview, history, routing, quotas, and failures
+- React dashboard for overview, history, HTTPS analysis, routing, quotas, and failures
 - Shared and per-network routing profiles
 - Automatic direct-failure probing before temporary auto-proxy rules
-- Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA
+- Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA and JSONL analyzer logs
 - Optional HTTP/SOCKS proxy authentication for stable per-device identities
 - Per-client traffic quotas, default quotas, and temporary or permanent exemptions
 - Docker-first deployment with persistent state under `./data`
@@ -97,9 +97,10 @@ Persisted backend files:
 - `./data/https-interception/certs/`
 - `./data/usage.log`
 - `./data/failures.log`
+- `./data/https-traffic.log`
 - `./data/error.log`
 
-On startup, the backend rebuilds dashboard totals, recent requests, recent failures, quota history, and auto-proxy state from these persisted files.
+On startup, the backend rebuilds dashboard totals, recent requests, recent failures, HTTPS traffic analysis, quota history, and auto-proxy state from these persisted files.
 
 To reset stored state completely:
 
@@ -131,6 +132,7 @@ HTTPS interception note:
 
 - The backend stores the HTTPS interception CA and generated per-host certificates under `./data/https-interception`.
 - Adaptive HTTPS trust and fallback observations are stored in `./data/router-config-https-interception-state.json`.
+- Intercepted HTTPS request/response metadata and bounded body previews are written to `./data/https-traffic.log` as JSONL for dashboard review or external analyzers.
 - Only the public CA certificate is exposed through the dashboard/API; the CA private key stays on disk.
 
 ## Routing Model
@@ -147,11 +149,12 @@ Typical setup:
 
 ## Dashboard
 
-The dashboard includes five main areas:
+The dashboard includes six main areas:
 
 - `Overview`: current activity, totals, recent traffic, active clients
-- `History`: time-bucketed usage history and top destinations
+- `History`: time-bucketed usage history and top destinations filtered by range, proxy type, and client
 - `Routing`: upstream settings, rules, routing profiles, auto-proxy controls
+- `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
 - `Quotas`: optional proxy authentication, default client quota, per-client quota rules, exemptions
 - `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
@@ -168,10 +171,13 @@ Client self-service portal:
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
+- History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
+- The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
+- Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried once through the upstream proxy when auto-proxy is available; a temporary proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
@@ -184,6 +190,7 @@ Current dashboard behaviors:
 
 - Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally.
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
+- The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
 - Client limit and exemption targets can be `user:<username>`, a single IP address, or a CIDR range.
 - Specific client limits override the default client quota.
 - Exemptions override both custom and default limits.
@@ -214,6 +221,7 @@ Response behavior:
 - `--https-intercept-ca-cert-file`: HTTPS interception CA certificate path
 - `--https-intercept-ca-key-file`: HTTPS interception CA private key path
 - `--https-intercept-cert-cache-dir`: generated per-host certificate cache directory
+- `--https-traffic-log-file`: intercepted HTTPS analyzer JSONL log path
 - `--dashboard-bind`: dashboard API bind address
 - `--dashboard-port`: dashboard API port
 - `--no-dashboard`: disable the dashboard API
@@ -245,7 +253,7 @@ docs/                      supporting project documentation
 - Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected.
 - Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; do not commit runtime config or data files.
 - HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust are temporarily bypassed after TLS trust failures and can also use manual bypass patterns or SOCKS5.
-- Intercepted HTTPS records keep URL-level metadata and byte totals, not headers or bodies.
+- Intercepted HTTPS analyzer records include redacted headers and bounded text body previews. Sensitive headers and token-like text fields are redacted, common compressed bodies are decoded for preview when possible, binary bodies are omitted, and previews are truncated, but the log can still contain private application data.
 - Do not commit secrets, private upstream credentials, or runtime data files.
 
 ## Validation
@@ -254,7 +262,7 @@ docs/                      supporting project documentation
 python3 -m py_compile ./proxy-router proxy_router/*.py
 python3 -m unittest discover
 python3 ./proxy-router --help
-cd frontend && npm install && npm run build
+cd frontend && npm install && npm run lint && npm run build
 docker compose config
 ```
 

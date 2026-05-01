@@ -20,6 +20,8 @@ services:
       - /data/usage.log
       - --failure-log-file
       - /data/failures.log
+      - --https-traffic-log-file
+      - /data/https-traffic.log
       - --error-log-file
       - /data/error.log
       - --https-intercept-ca-cert-file

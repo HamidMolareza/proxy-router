@@ -56,6 +56,7 @@ SENSITIVE_HEADER_NAMES = {
 MAX_DEBUG_VALUE_LENGTH = 512
 DEFAULT_USAGE_LOG_PATH = Path("/tmp/proxy-router-usage.log")
 DEFAULT_FAILURE_LOG_PATH = Path("/tmp/proxy-router-failures.log")
+DEFAULT_HTTPS_TRAFFIC_LOG_PATH = Path("/tmp/proxy-router-https-traffic.log")
 DEFAULT_ERROR_LOG_PATH = Path("/tmp/proxy-router-errors.log")
 DEFAULT_ROUTER_CONFIG_PATH = Path.home() / ".config" / "proxy-router" / "router-config.json"
 DEFAULT_HTTPS_INTERCEPT_DIR = Path.home() / ".config" / "proxy-router" / "https-interception"
@@ -102,6 +103,9 @@ CLIENT_PORTAL_HOST_ALIASES = (
 )
 RECENT_REQUEST_LIMIT = 25
 RECENT_FAILURE_LIMIT = 200
+HTTPS_TRAFFIC_BODY_PREVIEW_BYTES = 64 * 1024
+HTTPS_TRAFFIC_QUERY_LIMIT = 200
+HTTPS_TRAFFIC_MAX_QUERY_LIMIT = 1000
 FAILURE_PAGE_SIZE = 10
 DASHBOARD_LIVE_HEARTBEAT_SECONDS = 30.0
 DASHBOARD_LIVE_EVENT_BACKLOG = 256

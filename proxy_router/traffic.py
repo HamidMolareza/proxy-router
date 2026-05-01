@@ -170,6 +170,47 @@ class AutoProxyFailureManager:
         probe_decision["auto_proxy_pattern"] = pattern
         return probe_decision
 
+    def status_probe_route(self, host: str | None, route_decision, *, status_code: int | None = None):
+        try:
+            normalized_status_code = int(status_code or 0)
+        except (TypeError, ValueError):
+            return None
+        if normalized_status_code != 403:
+            return None
+
+        pattern = summarize_domain(host) or normalize_host(host or "")
+        if not pattern or is_ip_address_text(pattern):
+            return None
+        if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        upstream = route_decision.get("upstream")
+        if upstream is None:
+            return None
+
+        profile_id = str(route_decision.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID)
+        evaluation = self.router_config.auto_proxy_evaluation(host, profile_id=profile_id)
+        if not evaluation["eligible"]:
+            return None
+        resolved_profile_id = evaluation.get("profile_id") or profile_id
+
+        with self._lock:
+            state = self._profile_domains_locked(resolved_profile_id, create=True).setdefault(
+                pattern,
+                self._default_state(),
+            )
+            state["probe_pending"] = False
+            state["probe_in_flight"] = True
+            self._save_state_locked()
+
+        probe_decision = dict(route_decision)
+        probe_decision["action"] = "proxy"
+        probe_decision["route_label"] = build_auto_proxy_probe_route_label(upstream)
+        probe_decision["matched_rule"] = None
+        probe_decision["profile_id"] = resolved_profile_id
+        probe_decision["auto_proxy_probe"] = True
+        probe_decision["auto_proxy_pattern"] = pattern
+        return probe_decision
+
     def manual_review_failures(self, *, profile_id: str | None = None):
         review_failures = []
         active_profile_id = self._resolved_profile_id(profile_id)

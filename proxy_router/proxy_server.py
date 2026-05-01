@@ -36,14 +36,14 @@ def encode_websocket_text_frame(payload_text: str) -> bytes:
     return header + payload
 
 
-def build_client_live_update_message(server, client_ip: str, range_key: str, event_summary, *, initial: bool = False):
+def build_client_live_update_message(server, client: str, range_key: str, event_summary, *, initial: bool = False):
     revision = 0 if initial else int(event_summary.get("revision", 0))
     return {
         "type": "client_snapshot",
         "revision": revision,
         "initial": initial,
         "reasons": [] if initial else list(event_summary.get("reasons") or []),
-        "snapshot": build_client_portal_snapshot(server, client_ip, range_key=range_key),
+        "snapshot": build_client_portal_snapshot(server, client, range_key=range_key),
     }
 
 
@@ -225,8 +225,8 @@ class ClientTracker:
         self._lock = threading.Lock()
         self._active_by_ip = {}
 
-    def connected(self, client_ip: str):
-        self.runtime.dashboard_state.client_connected(self.proxy_label, client_ip)
+    def connected(self, client_ip: str, *, client: str | None = None):
+        self.runtime.dashboard_state.client_connected(self.proxy_label, client or client_ip)
         self.runtime.notify_dashboard_update("connections")
         with self._lock:
             self._active_by_ip[client_ip] = self._active_by_ip.get(client_ip, 0) + 1
@@ -237,8 +237,8 @@ class ClientTracker:
             f"client connected: {client_ip} (active for IP: {active_count}, total: {total_count})",
         )
 
-    def disconnected(self, client_ip: str):
-        self.runtime.dashboard_state.client_disconnected(self.proxy_label, client_ip)
+    def disconnected(self, client_ip: str, *, client: str | None = None):
+        self.runtime.dashboard_state.client_disconnected(self.proxy_label, client or client_ip)
         self.runtime.notify_dashboard_update("connections")
         with self._lock:
             current = self._active_by_ip.get(client_ip, 0)
@@ -253,6 +253,10 @@ class ClientTracker:
             self.proxy_label,
             f"client disconnected: {client_ip} (active for IP: {active_count}, total: {total_count})",
         )
+
+    def reidentified(self, previous_client: str, next_client: str):
+        self.runtime.dashboard_state.client_reidentified(previous_client, next_client)
+        self.runtime.notify_dashboard_update("connections")
 
 
 class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -334,6 +338,7 @@ class ProtocolServerView:
         self.runtime = server.runtime
         self.history_cache = server.history_cache
         self.server_address = server.server_address
+        self.https_interception_capture = False
 
 
 class InterceptedHTTPSProtocolView:
@@ -349,6 +354,7 @@ class InterceptedHTTPSProtocolView:
         self.history_cache = server.history_cache
         self.server_address = server.server_address
         self.client_identity = client_identity
+        self.https_interception_capture = True
 
 
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -403,11 +409,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             debug_log(self.server.proxy_label, f"{self._client_label()} - {message}", level=level)
 
     def handle(self):
-        self.server.client_tracker.connected(self.client_address[0])
+        self._dashboard_client_id = self.client_address[0]
+        self.server.client_tracker.connected(self.client_address[0], client=self._dashboard_client_id)
         try:
             super().handle()
         finally:
-            self.server.client_tracker.disconnected(self.client_address[0])
+            self.server.client_tracker.disconnected(
+                self.client_address[0],
+                client=getattr(self, "_dashboard_client_id", self.client_address[0]),
+            )
 
     def log_message(self, fmt, *args):
         if self.server.verbose:
@@ -435,6 +445,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _set_client_identity(self, identity):
+        self._proxy_client_identity = identity
+        previous_client = getattr(self, "_dashboard_client_id", self.client_address[0])
+        next_client = str((identity or {}).get("id") or self.client_address[0])
+        if previous_client != next_client:
+            self.server.client_tracker.reidentified(previous_client, next_client)
+            self._dashboard_client_id = next_client
+
+    def _build_http_basic_identity(self, settings):
+        header = str(self.headers.get("Proxy-Authorization") or "").strip()
+        if not header:
+            return None
+
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "basic" or not token.strip():
+            return None
+        try:
+            decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            return None
+
+        try:
+            authenticated = authenticate_client_auth_credentials(settings, username, password)
+        except ValueError:
+            authenticated = None
+        if authenticated is None:
+            return None
+        return {
+            "id": authenticated["id"],
+            "ip": self.client_address[0],
+            "auth_type": "basic",
+            "username": authenticated["username"],
+            "label": authenticated["label"],
+        }
+
+    def _apply_optional_http_client_identity(self):
+        settings = self.server.router_config.client_auth_settings()
+        if not settings.get("enabled", False):
+            self._set_client_identity(self._anonymous_client_identity())
+            return
+        identity = self._build_http_basic_identity(settings) or self._anonymous_client_identity()
+        self._set_client_identity(identity)
+
     def _send_proxy_auth_required(self, settings, *, error: str | None = None):
         realm = sanitize_http_header_value(str((settings or {}).get("realm") or DEFAULT_CLIENT_AUTH_REALM))
         body = b"Proxy authentication required\n"
@@ -451,13 +507,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _authenticate_http_client(self) -> bool:
         settings = self.server.router_config.client_auth_settings()
         if not settings.get("enabled", False):
-            self._proxy_client_identity = self._anonymous_client_identity()
+            self._set_client_identity(self._anonymous_client_identity())
             return True
 
         header = str(self.headers.get("Proxy-Authorization") or "").strip()
         if not header:
             if settings.get("allow_anonymous", True):
-                self._proxy_client_identity = self._anonymous_client_identity()
+                self._set_client_identity(self._anonymous_client_identity())
                 return True
             self._send_proxy_auth_required(settings)
             return False
@@ -484,13 +540,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._send_proxy_auth_required(settings, error="Invalid proxy authentication credentials")
             return False
 
-        self._proxy_client_identity = {
-            "id": authenticated["id"],
-            "ip": self.client_address[0],
-            "auth_type": "basic",
-            "username": authenticated["username"],
-            "label": authenticated["label"],
-        }
+        self._set_client_identity(
+            {
+                "id": authenticated["id"],
+                "ip": self.client_address[0],
+                "auth_type": "basic",
+                "username": authenticated["username"],
+                "label": authenticated["label"],
+            }
+        )
         return True
 
     def do_CONNECT(self):
@@ -888,7 +946,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
 
-    def _handle_client_portal_live_websocket(self, *, range_key: str):
+    def _handle_client_portal_live_websocket(self, *, range_key: str, client: str | None = None):
         websocket_key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
         if not websocket_key:
             self.send_error(400, "Missing Sec-WebSocket-Key header")
@@ -908,12 +966,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-        client_ip = self.client_address[0]
+        client_id = client or self.client_address[0]
         last_revision = self.server.runtime.live_updates.current_revision()
         self._send_websocket_json(
             build_client_live_update_message(
                 self.server,
-                client_ip,
+                client_id,
                 range_key,
                 {"revision": last_revision},
                 initial=True,
@@ -936,7 +994,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
             last_revision = int(event_summary["revision"])
             self._send_websocket_json(
-                build_client_live_update_message(self.server, client_ip, range_key, event_summary)
+                build_client_live_update_message(self.server, client_id, range_key, event_summary)
             )
 
     def _handle_client_portal_request(self, scheme: str, host: str, port: int, target_path: str) -> bool:
@@ -963,6 +1021,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return True
 
         range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
+        self._apply_optional_http_client_identity()
+        portal_client_id = self._client_id()
         if route_path in live_paths:
             if not self._is_websocket_upgrade():
                 self._send_body_response(
@@ -973,7 +1033,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
                 return True
             try:
-                self._handle_client_portal_live_websocket(range_key=range_key)
+                self._handle_client_portal_live_websocket(range_key=range_key, client=portal_client_id)
             except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
                 return True
             return True
@@ -1005,8 +1065,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if route_path in ca_check_paths:
             payload = build_client_portal_snapshot(
                 self.server,
-                self.client_address[0],
+                portal_client_id,
                 range_key=range_key,
+                client_ip=self.client_address[0],
             )
             self._log_http_event(f"served HTTPS CA trust check page {route_path} for {self.client_address[0]}")
             self._send_body_response(
@@ -1020,8 +1081,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if route_path in ca_html_paths:
             payload = build_client_portal_snapshot(
                 self.server,
-                self.client_address[0],
+                portal_client_id,
                 range_key=range_key,
+                client_ip=self.client_address[0],
             )
             self._log_http_event(f"served HTTPS interception CA install page {route_path} for {self.client_address[0]}")
             self._send_body_response(
@@ -1045,8 +1107,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         payload = build_client_portal_snapshot(
             self.server,
-            self.client_address[0],
+            portal_client_id,
             range_key=range_key,
+            client_ip=self.client_address[0],
         )
         self._log_http_event(f"served client portal {route_path} for {self.client_address[0]}")
         if route_path in json_paths or str(first_query_value(query, "format") or "").strip().lower() == "json":
@@ -1171,6 +1234,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             body, outbound_headers, body_details, request_body_bytes = self._prepare_outbound_body_and_headers(
                 host, port
             )
+            request_content_type = outbound_headers.get("Content-Type") or outbound_headers.get("content-type")
+            request_content_encoding = header_value(outbound_headers, "Content-Encoding")
+            request_headers_for_record = headers_for_record(outbound_headers)
+            request_body_preview = body_preview_for_record(
+                body,
+                content_type=request_content_type,
+                content_encoding=request_content_encoding,
+                total_bytes=request_body_bytes,
+            )
             self._log_http_event(
                 f"{self.command} {destination} via {route_decision['route_label']}"
             )
@@ -1197,6 +1269,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 outbound_headers,
                 route_decision=route_decision,
             )
+            retry_result = self._retry_forbidden_https_with_proxy(
+                scheme,
+                host,
+                port,
+                target_path,
+                body,
+                outbound_headers,
+                connection,
+                response,
+                route_decision,
+            )
+            if retry_result is None:
+                return
+            connection, response, route_decision = retry_result
             self._write_response(
                 connection,
                 response,
@@ -1205,6 +1291,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 target_host=host,
                 target_port=port,
                 request_body_bytes=request_body_bytes,
+                request_headers=request_headers_for_record,
+                request_body_preview=request_body_preview,
                 method=self.command,
                 kind="https" if scheme == "https" else "http",
                 route_decision=route_decision,
@@ -1561,6 +1649,68 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 connection.close()
             raise
 
+    def _retry_forbidden_https_with_proxy(
+        self,
+        scheme,
+        host,
+        port,
+        target_path,
+        body,
+        outbound_headers,
+        connection,
+        response,
+        route_decision,
+    ):
+        if scheme != "https" or response.status != 403:
+            return connection, response, route_decision
+
+        probe_route = self.server.runtime.build_auto_proxy_status_probe_route(
+            host,
+            route_decision,
+            status_code=response.status,
+        )
+        if probe_route is None:
+            return connection, response, route_decision
+
+        self._debug(
+            "retrying HTTPS 403 response through auto-proxy probe "
+            f"target={host}:{port} route={probe_route['route_label']}",
+            level="INFO",
+        )
+        try:
+            retry_connection, retry_response = self._perform_upstream_request(
+                scheme,
+                host,
+                port,
+                target_path,
+                body,
+                outbound_headers,
+                route_decision=probe_route,
+            )
+        except Exception as exc:
+            for upstream_resource in (response, connection):
+                try:
+                    upstream_resource.close()
+                except Exception:
+                    pass
+            self._send_gateway_error(
+                exc,
+                context="upstream http 403 proxy retry",
+                method=self.command,
+                destination=build_request_destination(scheme, host, port, target_path),
+                host=host,
+                port=port,
+                route_decision=probe_route,
+            )
+            return None
+
+        for upstream_resource in (response, connection):
+            try:
+                upstream_resource.close()
+            except Exception:
+                pass
+        return retry_connection, retry_response, probe_route
+
     def _write_response(
         self,
         connection,
@@ -1571,11 +1721,24 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         target_host: str | None,
         target_port: int | None,
         request_body_bytes: int,
+        request_headers,
+        request_body_preview,
         method: str,
         kind: str,
         route_decision,
     ):
         bytes_written = 0
+        response_preview = bytearray()
+        response_headers = headers_for_record(response.getheaders())
+        response_content_encoding = header_value(response.getheaders(), "Content-Encoding")
+        response_content_type = next(
+            (
+                item.get("value", "")
+                for item in response_headers
+                if str(item.get("name") or "").lower() == "content-type"
+            ),
+            "",
+        )
         try:
             if response.status == 403:
                 self.server.runtime.record_failure(
@@ -1607,6 +1770,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 chunk = response.read(BUFFER_SIZE)
                 if not chunk:
                     break
+                if len(response_preview) < HTTPS_TRAFFIC_BODY_PREVIEW_BYTES:
+                    remaining_preview_bytes = HTTPS_TRAFFIC_BODY_PREVIEW_BYTES - len(response_preview)
+                    response_preview.extend(chunk[:remaining_preview_bytes])
                 self.wfile.write(chunk)
                 bytes_written += len(chunk)
             self.wfile.flush()
@@ -1615,6 +1781,38 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 f"response relayed target={truncate_for_log(target_description)} status={response.status} "
                 f"bytes={bytes_written} total_elapsed_ms={total_elapsed_ms}"
             )
+            if kind == "https" and getattr(self.server, "https_interception_capture", False):
+                self.server.runtime.record_https_traffic(
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
+                    method=method,
+                    scheme="https",
+                    host=target_host or "",
+                    port=target_port or 443,
+                    path=urlsplit(target_description).path
+                    + (f"?{urlsplit(target_description).query}" if urlsplit(target_description).query else ""),
+                    destination=target_description,
+                    route_label=route_decision["route_label"],
+                    matched_rule=route_decision["matched_rule"],
+                    profile_id=route_decision.get("profile_id"),
+                    status_code=response.status,
+                    reason=response.reason,
+                    request_headers=request_headers,
+                    request_body_preview=request_body_preview,
+                    request_body_bytes=request_body_bytes,
+                    response_headers=response_headers,
+                    response_body_preview=body_preview_for_record(
+                        bytes(response_preview),
+                        content_type=response_content_type,
+                        content_encoding=response_content_encoding,
+                        total_bytes=bytes_written,
+                    ),
+                    response_body_bytes=bytes_written,
+                    duration_ms=total_elapsed_ms,
+                )
         except (BrokenPipeError, ConnectionResetError):
             log_event(
                 self.server.proxy_label,
@@ -1844,6 +2042,14 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _set_client_identity(self, identity):
+        self._proxy_client_identity = identity
+        previous_client = getattr(self, "_dashboard_client_id", self.client_address[0])
+        next_client = str((identity or {}).get("id") or self.client_address[0])
+        if previous_client != next_client:
+            self.server.client_tracker.reidentified(previous_client, next_client)
+            self._dashboard_client_id = next_client
+
     def _negotiate_authentication(self, methods: bytes) -> bool:
         settings = self.server.router_config.client_auth_settings()
         methods_set = set(methods)
@@ -1852,7 +2058,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
                 return False
             self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
-            self._proxy_client_identity = self._anonymous_client_identity()
+            self._set_client_identity(self._anonymous_client_identity())
             return True
 
         if SOCKS_AUTH_USERNAME_PASSWORD in methods_set:
@@ -1861,7 +2067,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
         if settings.get("allow_anonymous", True) and SOCKS_AUTH_NO_AUTH in methods_set:
             self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
-            self._proxy_client_identity = self._anonymous_client_identity()
+            self._set_client_identity(self._anonymous_client_identity())
             return True
 
         self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
@@ -1884,19 +2090,22 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         if authenticated is None:
             self.request.sendall(bytes([0x01, 0x01]))
             return False
-        self._proxy_client_identity = {
-            "id": authenticated["id"],
-            "ip": self.client_address[0],
-            "auth_type": "socks5",
-            "username": authenticated["username"],
-            "label": authenticated["label"],
-        }
+        self._set_client_identity(
+            {
+                "id": authenticated["id"],
+                "ip": self.client_address[0],
+                "auth_type": "socks5",
+                "username": authenticated["username"],
+                "label": authenticated["label"],
+            }
+        )
         self.request.sendall(bytes([0x01, 0x00]))
         return True
 
     def handle(self):
         client_ip = self.client_address[0]
-        self.server.client_tracker.connected(client_ip)
+        self._dashboard_client_id = client_ip
+        self.server.client_tracker.connected(client_ip, client=self._dashboard_client_id)
         try:
             if not ensure_client_allowed(client_ip, self.server.allowed_networks):
                 self._log("denied")
@@ -2126,7 +2335,10 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             )
             self._send_reply(0x01)
         finally:
-            self.server.client_tracker.disconnected(client_ip)
+            self.server.client_tracker.disconnected(
+                client_ip,
+                client=getattr(self, "_dashboard_client_id", client_ip),
+            )
 
     def _open_routed_stream(self, destination_host: str, destination_port: int, route_decision):
         def open_once(_attempt):
@@ -2257,22 +2469,27 @@ class RunningDashboard:
     thread: threading.Thread
 
 
-def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
+def build_client_portal_snapshot(server, client: str, *, range_key: str, client_ip: str | None = None):
     normalized_range = range_key if range_key in HISTORY_RANGE_OPTIONS else HISTORY_DEFAULT_RANGE
     listener_port = int(getattr(server, "server_address", ("", 0))[1] or 0)
     dashboard_snapshot = server.runtime.dashboard_state.snapshot()
+    client_id = str(client or client_ip or "")
+    if client_id and not client_id.startswith("user:"):
+        mapped_identity = (dashboard_snapshot.get("identity_by_client_ip") or {}).get(client_id)
+        if mapped_identity:
+            client_id = str(mapped_identity)
     client_totals = next(
         (
             item
             for item in dashboard_snapshot.get("totals_by_client", [])
-            if item.get("client") == client_ip
+            if item.get("client") == client_id
         ),
         None,
     )
     if client_totals is None:
         empty_totals = empty_client_usage_summary()
         client_totals = {
-            "client": client_ip,
+            "client": client_id,
             "count": empty_totals["count"],
             "active_connections": 0,
             "uploaded_bytes": empty_totals["uploaded_bytes"],
@@ -2284,20 +2501,21 @@ def build_client_portal_snapshot(server, client_ip: str, *, range_key: str):
 
     history = server.history_cache.build_history_payload(
         range_key=normalized_range,
-        client=client_ip,
+        client=client_id,
     )
-    recent_requests = server.history_cache.recent_records(limit=12, client=client_ip)
+    recent_requests = server.history_cache.recent_records(limit=12, client=client_id)
     recent_failures = [
         item
         for item in dashboard_snapshot.get("recent_failures", [])
-        if item.get("client") == client_ip
+        if item.get("client") == client_id
     ][:12]
-    quota = server.runtime.traffic_quota_manager.evaluate_client(client_ip, server.router_config)
+    quota = server.runtime.traffic_quota_manager.evaluate_client(client_id, server.router_config)
     router_runtime = server.router_config.runtime_snapshot()
     active_profile = router_runtime.get("active_profile") or {}
     return {
         "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "client": client_ip,
+        "client": client_id,
+        "client_ip": client_ip,
         "portal_url": server.runtime.self_endpoints.client_portal_url(),
         "ca_install_url": server.runtime.self_endpoints.client_portal_ca_install_url(),
         "ca_certificate_url": server.runtime.self_endpoints.client_portal_ca_certificate_url(),
