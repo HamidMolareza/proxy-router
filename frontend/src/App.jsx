@@ -32,6 +32,12 @@ const AUTO_PROXY_POLICY_LABEL = '2 failures -> probe -> success enables proxy'
 const RULE_DURATION_OPTIONS = ['1h', '1d', '7d', '30d', '90d', 'always']
 const EXEMPTION_DURATION_OPTIONS = ['2h', '6h', '12h', '1d', '7d', '30d', 'always']
 const DEFAULT_ROUTING_PROFILE_ID = 'default'
+const DEFAULT_UPSTREAM_RETRY = {
+  enabled: true,
+  attempts: 4,
+  initial_delay_seconds: 1,
+  max_delay_seconds: 5,
+}
 const RULE_DURATION_SECONDS = {
   '1h': 3600,
   '1d': 86400,
@@ -302,6 +308,14 @@ function normalizeOptionalLimitMb(value) {
     return null
   }
   return parsed
+}
+
+function normalizeBoundedInteger(value, fallback, min, max) {
+  const parsed = parseInt(value, 10)
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+  return Math.min(max, Math.max(min, parsed))
 }
 
 function parseHostPatternList(value) {
@@ -626,6 +640,10 @@ function normalizeRouterConfig(config) {
     source.auto_proxy_failures && typeof source.auto_proxy_failures === 'object'
       ? source.auto_proxy_failures
       : {}
+  const upstreamRetry =
+    source.upstream_retry && typeof source.upstream_retry === 'object'
+      ? source.upstream_retry
+      : {}
   const httpsInterception =
     source.https_interception && typeof source.https_interception === 'object'
       ? source.https_interception
@@ -679,6 +697,30 @@ function normalizeRouterConfig(config) {
       .filter((exemption) => !isExemptionExpired(exemption)),
     auto_proxy_failures: {
       enabled: Boolean(autoProxyFailures.enabled),
+    },
+    upstream_retry: {
+      enabled: upstreamRetry.enabled !== false,
+      attempts: normalizeBoundedInteger(upstreamRetry.attempts, DEFAULT_UPSTREAM_RETRY.attempts, 1, 20),
+      initial_delay_seconds: normalizeBoundedInteger(
+        upstreamRetry.initial_delay_seconds,
+        DEFAULT_UPSTREAM_RETRY.initial_delay_seconds,
+        0,
+        60,
+      ),
+      max_delay_seconds: Math.max(
+        normalizeBoundedInteger(
+          upstreamRetry.max_delay_seconds,
+          DEFAULT_UPSTREAM_RETRY.max_delay_seconds,
+          0,
+          60,
+        ),
+        normalizeBoundedInteger(
+          upstreamRetry.initial_delay_seconds,
+          DEFAULT_UPSTREAM_RETRY.initial_delay_seconds,
+          0,
+          60,
+        ),
+      ),
     },
     https_interception: {
       enabled: Boolean(httpsInterception.enabled),
@@ -1464,6 +1506,10 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const upstreamLabel = config.upstream.enabled
     ? `${config.upstream.type}://${config.upstream.host || '?'}:${config.upstream.port || '?'}`
     : 'Disabled'
+  const upstreamRetry = config.upstream_retry || DEFAULT_UPSTREAM_RETRY
+  const upstreamRetryLabel = upstreamRetry.enabled
+    ? `${upstreamRetry.attempts} attempts · ${upstreamRetry.initial_delay_seconds}s first delay · ${upstreamRetry.max_delay_seconds}s cap`
+    : 'Disabled'
   const httpsInterceptionLabel = config.https_interception.enabled
     ? `Adaptive · ${config.https_interception.mode === 'all' ? 'all port 443 CONNECT hosts' : `${config.https_interception.host_patterns.length} allowlisted hosts`}${
         httpsStatus.available ? '' : ' · unavailable'
@@ -1487,6 +1533,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Enabled', String(enabledRules)],
     ['Default', currentTarget.default_action],
     ['Upstream', upstreamLabel],
+    ['Proxy retry', upstreamRetryLabel],
     ['Upstream check', buildUpstreamConnectivityLabel(upstreamStatus)],
     ['HTTPS sniffing', httpsInterceptionLabel],
     ['Auto proxy', autoProxyStatus],
@@ -3342,6 +3389,72 @@ function App() {
                     In the Docker Compose deployment, proxy-router uses host networking so a host-side upstream proxy
                     can use
                     <strong> 127.0.0.1</strong>.
+                  </div>
+                  <h3 className="mt-4">Upstream failure retry</h3>
+                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                    <input
+                      className={cx(routerHasLocalChanges && dirtyInputClass)}
+                      type="checkbox"
+                      checked={currentRouterConfig.upstream_retry.enabled}
+                      onChange={(event) => {
+                        const nextConfig = cloneJson(currentRouterConfig)
+                        nextConfig.upstream_retry.enabled = event.target.checked
+                        setLocalRouterConfig(nextConfig)
+                      }}
+                    />
+                    <span>Retry transient proxy and upstream connection failures</span>
+                  </label>
+                  <div className={fieldGridClass}>
+                    <label className={fieldClass}>
+                      <span>Attempts</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="number"
+                        min="1"
+                        max="20"
+                        value={currentRouterConfig.upstream_retry.attempts}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.upstream_retry.attempts = event.target.value.trim()
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      />
+                    </label>
+                    <label className={fieldClass}>
+                      <span>First delay seconds</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="number"
+                        min="0"
+                        max="60"
+                        value={currentRouterConfig.upstream_retry.initial_delay_seconds}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.upstream_retry.initial_delay_seconds = event.target.value.trim()
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      />
+                    </label>
+                    <label className={fieldClass}>
+                      <span>Max delay seconds</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="number"
+                        min="0"
+                        max="60"
+                        value={currentRouterConfig.upstream_retry.max_delay_seconds}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.upstream_retry.max_delay_seconds = event.target.value.trim()
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className={noteClass}>
+                    Applies to upstream proxy setup, CONNECT tunnels, SOCKS5 tunnels, and safe or empty-body HTTP
+                    requests before an error is returned to the client. Delay doubles after each failed attempt until
+                    it reaches the cap.
                   </div>
                   <div className={buttonRowClass}>
                     <button

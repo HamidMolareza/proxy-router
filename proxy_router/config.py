@@ -664,6 +664,18 @@ class RouterConfigManager:
                 "stage_durations_seconds": auto_proxy_stage_durations_seconds(),
             }
 
+    def upstream_retry_settings(self):
+        with self._lock:
+            settings = self._config.get("upstream_retry", default_router_config()["upstream_retry"])
+            return {
+                "enabled": bool(settings.get("enabled", True)),
+                "attempts": int(settings.get("attempts", UPSTREAM_RETRY_ATTEMPTS)),
+                "initial_delay_seconds": int(
+                    settings.get("initial_delay_seconds", UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)
+                ),
+                "max_delay_seconds": int(settings.get("max_delay_seconds", UPSTREAM_RETRY_MAX_DELAY_SECONDS)),
+            }
+
     def client_auth_settings(self):
         with self._lock:
             settings = self._config.get("client_auth", default_router_config()["client_auth"])

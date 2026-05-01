@@ -73,9 +73,39 @@ def can_retry_http_request(method: str, body) -> bool:
     return body in {None, b""}
 
 
-def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_upstream_error):
-    attempts = max(1, int(UPSTREAM_RETRY_ATTEMPTS))
-    delay_seconds = float(UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)
+def default_upstream_retry_policy():
+    return {
+        "enabled": True,
+        "attempts": UPSTREAM_RETRY_ATTEMPTS,
+        "initial_delay_seconds": UPSTREAM_RETRY_INITIAL_DELAY_SECONDS,
+        "max_delay_seconds": UPSTREAM_RETRY_MAX_DELAY_SECONDS,
+    }
+
+
+def normalize_upstream_retry_policy(policy):
+    source = default_upstream_retry_policy()
+    if isinstance(policy, dict):
+        source.update(policy)
+
+    enabled = bool(source.get("enabled", True))
+    attempts = max(1, int(source.get("attempts", UPSTREAM_RETRY_ATTEMPTS)))
+    if not enabled:
+        attempts = 1
+    initial_delay_seconds = max(0.0, float(source.get("initial_delay_seconds", UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)))
+    max_delay_seconds = max(initial_delay_seconds, float(source.get("max_delay_seconds", UPSTREAM_RETRY_MAX_DELAY_SECONDS)))
+    return {
+        "enabled": enabled,
+        "attempts": attempts,
+        "initial_delay_seconds": initial_delay_seconds,
+        "max_delay_seconds": max_delay_seconds,
+    }
+
+
+def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_upstream_error, retry_policy=None):
+    normalized_policy = normalize_upstream_retry_policy(retry_policy)
+    attempts = normalized_policy["attempts"]
+    delay_seconds = normalized_policy["initial_delay_seconds"]
+    max_delay_seconds = normalized_policy["max_delay_seconds"]
     for attempt in range(1, attempts + 1):
         try:
             return operation(attempt)
@@ -84,7 +114,7 @@ def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_u
                 raise
             on_retry(attempt, attempts, delay_seconds, exc)
             time.sleep(delay_seconds)
-            delay_seconds = min(delay_seconds * 2, float(UPSTREAM_RETRY_MAX_DELAY_SECONDS))
+            delay_seconds = min(max(delay_seconds * 2, delay_seconds), max_delay_seconds)
 
     raise RuntimeError("unreachable retry state")
 
@@ -181,6 +211,81 @@ def create_http_proxy_tunnel(proxy_host: str, proxy_port: int, target_host: str,
 def sanitize_http_header_value(value) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ").strip()
     return " ".join(text.split())
+
+
+def sanitize_http_header_name(value) -> str:
+    return str(value or "").replace("\r", "").replace("\n", "").strip()
+
+
+def read_http_response_head(sock, *, max_bytes: int = 128 * 1024):
+    buffer = bytearray()
+    delimiter = b"\r\n\r\n"
+    while delimiter not in buffer:
+        chunk = sock.recv(BUFFER_SIZE)
+        if not chunk:
+            raise OSError("connection closed before upstream response headers")
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            raise OSError("upstream response headers are too large")
+
+    head_end = buffer.index(delimiter) + len(delimiter)
+    head = bytes(buffer[:head_end])
+    leftover = bytes(buffer[head_end:])
+    lines = head.split(b"\r\n")
+    status_line = lines[0].decode("iso-8859-1", errors="replace")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise OSError(f"invalid upstream response status line: {status_line}")
+    status_code = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else ""
+    headers = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, separator, value = line.partition(b":")
+        if not separator:
+            continue
+        headers.append(
+            (
+                name.decode("iso-8859-1", errors="replace"),
+                value.strip().decode("iso-8859-1", errors="replace"),
+            )
+        )
+    return head, leftover, status_code, reason, headers
+
+
+def websocket_upgrade_headers_for_upstream(headers, host: str, port: int) -> list[tuple[str, str]]:
+    if hasattr(headers, "items"):
+        iterable = headers.items()
+    else:
+        iterable = headers or []
+
+    authority = host if port in {80, 443} else f"{host}:{port}"
+    outbound_headers = [
+        ("Host", authority),
+        ("Upgrade", "websocket"),
+        ("Connection", "Upgrade"),
+    ]
+    skipped_names = HOP_BY_HOP_HEADERS | {"host", "content-length"}
+    for key, value in iterable:
+        name = sanitize_http_header_name(key)
+        if not name:
+            continue
+        if name.lower() in skipped_names:
+            continue
+        outbound_headers.append((name, sanitize_http_header_value(value)))
+    return outbound_headers
+
+
+def build_websocket_upgrade_request(method: str, target_path: str, headers, host: str, port: int) -> bytes:
+    outbound_headers = websocket_upgrade_headers_for_upstream(headers, host, port)
+    request_target = target_path or "/"
+    request_lines = [
+        f"{str(method or 'GET').upper()} {request_target} HTTP/1.1",
+    ]
+    request_lines.extend(f"{name}: {value}" for name, value in outbound_headers)
+    request_lines.extend(("", ""))
+    return "\r\n".join(request_lines).encode("iso-8859-1", errors="replace")
 
 
 def tunnel_bidirectional(left_socket, right_socket):
@@ -1231,18 +1336,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             ):
                 return
             route_decision = self._resolve_route(host, port)
-            body, outbound_headers, body_details, request_body_bytes = self._prepare_outbound_body_and_headers(
-                host, port
-            )
-            request_content_type = outbound_headers.get("Content-Type") or outbound_headers.get("content-type")
-            request_content_encoding = header_value(outbound_headers, "Content-Encoding")
-            request_headers_for_record = headers_for_record(outbound_headers)
-            request_body_preview = body_preview_for_record(
-                body,
-                content_type=request_content_type,
-                content_encoding=request_content_encoding,
-                total_bytes=request_body_bytes,
-            )
             self._log_http_event(
                 f"{self.command} {destination} via {route_decision['route_label']}"
             )
@@ -1255,6 +1348,29 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_decision=route_decision,
                 )
                 return
+            if self._is_websocket_upgrade():
+                self._forward_websocket_upgrade(
+                    scheme,
+                    host,
+                    port,
+                    target_path,
+                    destination,
+                    route_decision,
+                    request_started=request_started,
+                )
+                return
+            body, outbound_headers, body_details, request_body_bytes = self._prepare_outbound_body_and_headers(
+                host, port
+            )
+            request_content_type = outbound_headers.get("Content-Type") or outbound_headers.get("content-type")
+            request_content_encoding = header_value(outbound_headers, "Content-Encoding")
+            request_headers_for_record = headers_for_record(outbound_headers)
+            request_body_preview = body_preview_for_record(
+                body,
+                content_type=request_content_type,
+                content_encoding=request_content_encoding,
+                total_bytes=request_body_bytes,
+            )
             self._debug(
                 f"resolved-target scheme={scheme} host={host} port={port} path={truncate_for_log(target_path)}"
             )
@@ -1501,6 +1617,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         return retry_upstream_operation(
             open_once,
+            retry_policy=self.server.router_config.upstream_retry_settings(),
             on_retry=lambda attempt, attempts, delay, exc: self._debug(
                 "retrying upstream stream setup "
                 f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
@@ -1548,6 +1665,223 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         )
         return upstream_socket, None
 
+    def _relay_response_body_after_head(self, upstream_socket, leftover: bytes, response_headers) -> int:
+        relayed_bytes = 0
+        if leftover:
+            self.connection.sendall(leftover)
+            relayed_bytes += len(leftover)
+
+        content_length_text = header_value(response_headers, "Content-Length")
+        if content_length_text:
+            try:
+                remaining = max(0, int(content_length_text) - len(leftover))
+            except ValueError:
+                remaining = 0
+            while remaining > 0:
+                chunk = upstream_socket.recv(min(BUFFER_SIZE, remaining))
+                if not chunk:
+                    break
+                self.connection.sendall(chunk)
+                relayed_bytes += len(chunk)
+                remaining -= len(chunk)
+            return relayed_bytes
+
+        connection_header = header_value(response_headers, "Connection").lower()
+        transfer_encoding = header_value(response_headers, "Transfer-Encoding").lower()
+        if "close" not in connection_header and "chunked" not in transfer_encoding:
+            return relayed_bytes
+
+        while True:
+            chunk = upstream_socket.recv(BUFFER_SIZE)
+            if not chunk:
+                return relayed_bytes
+            self.connection.sendall(chunk)
+            relayed_bytes += len(chunk)
+
+    def _forward_websocket_upgrade(
+        self,
+        scheme,
+        host,
+        port,
+        target_path,
+        destination,
+        route_decision,
+        *,
+        request_started: float,
+    ):
+        if self.command.upper() != "GET":
+            raise ValueError("WebSocket upgrade requests must use GET")
+
+        kind = "https" if scheme == "https" else "http"
+        upstream_owner = None
+        upstream = None
+        response_headers = []
+        status_code = 0
+        reason = ""
+        uploaded_bytes = 0
+        downloaded_bytes = 0
+        request_headers = headers_for_record(websocket_upgrade_headers_for_upstream(self.headers, host, port))
+        request_head = build_websocket_upgrade_request(self.command, target_path, self.headers, host, port)
+
+        def close_upstream_resources():
+            for upstream_resource in (upstream, upstream_owner):
+                if upstream_resource is None:
+                    continue
+                try:
+                    upstream_resource.close()
+                except Exception:
+                    pass
+
+        def open_and_send_upgrade(current_route_decision):
+            current_owner = None
+            current_stream = None
+            try:
+                raw_stream, current_owner = self._open_routed_stream(host, port, current_route_decision)
+                current_stream = raw_stream
+                if scheme == "https":
+                    current_stream = ssl.create_default_context().wrap_socket(raw_stream, server_hostname=host)
+                current_stream.settimeout(self.server.timeout_seconds)
+
+                self._debug(
+                    "forwarding WebSocket upgrade "
+                    f"target={host}:{port} route={current_route_decision['route_label']} bytes={len(request_head)}"
+                )
+                current_stream.sendall(request_head)
+                head, remaining, code, reason_text, headers = read_http_response_head(current_stream)
+                self.server.runtime.record_upstream_route_success(
+                    current_route_decision,
+                    destination=f"{host}:{port}",
+                    proxy_label=self.server.proxy_label,
+                )
+                return current_stream, current_owner, head, remaining, code, reason_text, headers
+            except Exception:
+                for upstream_resource in (current_stream, current_owner):
+                    if upstream_resource is None:
+                        continue
+                    try:
+                        upstream_resource.close()
+                    except Exception:
+                        pass
+                raise
+
+        try:
+            (
+                upstream,
+                upstream_owner,
+                response_head,
+                leftover,
+                status_code,
+                reason,
+                response_headers,
+            ) = open_and_send_upgrade(route_decision)
+            probe_route = self.server.runtime.build_auto_proxy_status_probe_route(
+                host,
+                route_decision,
+                status_code=status_code,
+            )
+            if scheme == "https" and probe_route is not None:
+                self._debug(
+                    "retrying WebSocket HTTPS 403 response through auto-proxy probe "
+                    f"target={host}:{port} route={probe_route['route_label']}",
+                    level="INFO",
+                )
+                close_upstream_resources()
+                upstream = None
+                upstream_owner = None
+                route_decision = probe_route
+                (
+                    upstream,
+                    upstream_owner,
+                    response_head,
+                    leftover,
+                    status_code,
+                    reason,
+                    response_headers,
+                ) = open_and_send_upgrade(route_decision)
+
+            self.connection.sendall(response_head)
+
+            if status_code != 101:
+                downloaded_bytes = self._relay_response_body_after_head(upstream, leftover, response_headers)
+                self.server.runtime.record_failure(
+                    proxy_label=self.server.proxy_label,
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
+                    method=self.command,
+                    destination=destination,
+                    host=host,
+                    port=port,
+                    error=f"WebSocket upgrade failed with HTTP {status_code} {reason}".strip(),
+                    context="upstream websocket upgrade",
+                    route_label=route_decision["route_label"],
+                    matched_rule=route_decision["matched_rule"],
+                    profile_id=route_decision.get("profile_id"),
+                )
+                return
+
+            if leftover:
+                self.connection.sendall(leftover)
+                downloaded_bytes += len(leftover)
+            upstream.settimeout(None)
+            self.connection.settimeout(None)
+            stats = tunnel_bidirectional(self.connection, upstream)
+            uploaded_bytes += stats["left_to_right_bytes"]
+            downloaded_bytes += stats["right_to_left_bytes"]
+        finally:
+            duration_ms = int((time.monotonic() - request_started) * 1000)
+            if status_code:
+                if kind == "https" and getattr(self.server, "https_interception_capture", False):
+                    self.server.runtime.record_https_traffic(
+                        client=self._client_id(),
+                        client_ip=self.client_address[0],
+                        client_auth_type=self._client_identity().get("auth_type"),
+                        client_auth_username=self._client_identity().get("username"),
+                        client_auth_label=self._client_identity().get("label"),
+                        method=self.command,
+                        scheme="https",
+                        host=host,
+                        port=port,
+                        path=urlsplit(destination).path
+                        + (f"?{urlsplit(destination).query}" if urlsplit(destination).query else ""),
+                        destination=destination,
+                        route_label=route_decision["route_label"],
+                        matched_rule=route_decision["matched_rule"],
+                        profile_id=route_decision.get("profile_id"),
+                        status_code=status_code,
+                        reason=reason,
+                        request_headers=request_headers,
+                        request_body_preview=body_preview_for_record(b"", total_bytes=0),
+                        request_body_bytes=0,
+                        response_headers=headers_for_record(response_headers),
+                        response_body_preview=body_preview_for_record(b"", total_bytes=0),
+                        response_body_bytes=0,
+                        duration_ms=duration_ms,
+                    )
+                self.server.runtime.record_usage(
+                    proxy_label=self.server.proxy_label,
+                    kind=kind,
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
+                    destination=destination,
+                    uploaded_bytes=uploaded_bytes,
+                    downloaded_bytes=downloaded_bytes,
+                    method=self.command,
+                    route_label=route_decision["route_label"],
+                    matched_rule=route_decision["matched_rule"],
+                    profile_id=route_decision.get("profile_id"),
+                    status_code=status_code,
+                )
+                if status_code == 101:
+                    self.server.runtime.record_auto_proxy_success(host, route_decision)
+            self.close_connection = True
+            close_upstream_resources()
+
     def _perform_upstream_request(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
         should_retry = lambda exc: can_retry_http_request(self.command, body) and is_retryable_upstream_error(exc)
 
@@ -1562,6 +1896,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 route_decision=route_decision,
             ),
             should_retry=should_retry,
+            retry_policy=self.server.router_config.upstream_retry_settings(),
             on_retry=lambda attempt, attempts, delay, exc: self._debug(
                 "retrying upstream HTTP request "
                 f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
@@ -2346,6 +2681,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
         return retry_upstream_operation(
             open_once,
+            retry_policy=self.server.router_config.upstream_retry_settings(),
             on_retry=lambda attempt, attempts, delay, exc: self._debug(
                 "retrying SOCKS5 upstream stream setup "
                 f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "

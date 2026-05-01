@@ -538,6 +538,20 @@ def traffic_limit_mb_to_bytes(limit_mb):
     return int(limit_mb) * BYTES_IN_MB
 
 
+def normalize_positive_int(value, *, field_name: str, minimum: int = 1, maximum: int | None = None) -> int:
+    text = str(value).strip()
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+
+    if parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{field_name} must be at most {maximum}")
+    return parsed
+
+
 def validate_traffic_limit_definition(
     *,
     enabled: bool,
@@ -672,6 +686,12 @@ def default_router_config():
         "client_traffic_exemptions": [],
         "auto_proxy_failures": {
             "enabled": False,
+        },
+        "upstream_retry": {
+            "enabled": True,
+            "attempts": UPSTREAM_RETRY_ATTEMPTS,
+            "initial_delay_seconds": UPSTREAM_RETRY_INITIAL_DELAY_SECONDS,
+            "max_delay_seconds": UPSTREAM_RETRY_MAX_DELAY_SECONDS,
         },
         "https_interception": {
             "enabled": False,
@@ -821,6 +841,12 @@ def normalize_router_config(payload):
     if not isinstance(auto_proxy_failures_payload, dict):
         raise ValueError("router auto_proxy_failures must be an object")
 
+    upstream_retry_payload = payload.get("upstream_retry") or {}
+    if upstream_retry_payload is None:
+        upstream_retry_payload = {}
+    if not isinstance(upstream_retry_payload, dict):
+        raise ValueError("router upstream_retry must be an object")
+
     https_interception_payload = payload.get("https_interception") or {}
     if https_interception_payload is None:
         https_interception_payload = {}
@@ -893,6 +919,36 @@ def normalize_router_config(payload):
     upstream_enabled = bool(upstream_payload.get("enabled", default_config["upstream"]["enabled"]))
     if upstream_enabled and not upstream_host:
         raise ValueError("router upstream host is required when the upstream proxy is enabled")
+
+    upstream_retry_attempts = normalize_positive_int(
+        upstream_retry_payload.get(
+            "attempts",
+            default_config["upstream_retry"]["attempts"],
+        ),
+        field_name="router upstream_retry attempts",
+        minimum=1,
+        maximum=UPSTREAM_RETRY_ATTEMPTS_LIMIT,
+    )
+    upstream_retry_initial_delay_seconds = normalize_positive_int(
+        upstream_retry_payload.get(
+            "initial_delay_seconds",
+            default_config["upstream_retry"]["initial_delay_seconds"],
+        ),
+        field_name="router upstream_retry initial_delay_seconds",
+        minimum=0,
+        maximum=UPSTREAM_RETRY_DELAY_SECONDS_LIMIT,
+    )
+    upstream_retry_max_delay_seconds = normalize_positive_int(
+        upstream_retry_payload.get(
+            "max_delay_seconds",
+            default_config["upstream_retry"]["max_delay_seconds"],
+        ),
+        field_name="router upstream_retry max_delay_seconds",
+        minimum=0,
+        maximum=UPSTREAM_RETRY_DELAY_SECONDS_LIMIT,
+    )
+    if upstream_retry_max_delay_seconds < upstream_retry_initial_delay_seconds:
+        raise ValueError("router upstream_retry max_delay_seconds must be greater than or equal to initial_delay_seconds")
 
     normalized_default_client_traffic_limit = {
         "enabled": bool(
@@ -1103,6 +1159,17 @@ def normalize_router_config(payload):
                     default_config["auto_proxy_failures"]["enabled"],
                 )
             ),
+        },
+        "upstream_retry": {
+            "enabled": bool(
+                upstream_retry_payload.get(
+                    "enabled",
+                    default_config["upstream_retry"]["enabled"],
+                )
+            ),
+            "attempts": upstream_retry_attempts,
+            "initial_delay_seconds": upstream_retry_initial_delay_seconds,
+            "max_delay_seconds": upstream_retry_max_delay_seconds,
         },
         "https_interception": {
             "enabled": bool(
