@@ -82,6 +82,8 @@ class UsageHistoryCache:
         range_key: str,
         proxy_type: str | None = None,
         client: str | None = None,
+        timezone_name: str | None = None,
+        timezone_offset_minutes=None,
     ):
         with self._lock:
             self._load_if_needed()
@@ -94,6 +96,8 @@ class UsageHistoryCache:
             range_key=range_key,
             proxy_type=proxy_type,
             client=client,
+            timezone_name=timezone_name,
+            timezone_offset_minutes=timezone_offset_minutes,
         )
 
     def recent_records(

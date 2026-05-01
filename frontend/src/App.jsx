@@ -55,6 +55,7 @@ const pageClass = [
   "[&_button]:min-h-10 [&_button]:cursor-pointer [&_button]:rounded-[10px] [&_button]:border [&_button]:border-[#c8c0b2] [&_button]:bg-[#fffdf8] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[#1f2a30]",
   '[&_button:disabled]:cursor-default [&_button:disabled]:opacity-55',
   "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[10px] [&_input[type='number']]:border [&_input[type='number']]:border-[#d8d1c2] [&_input[type='number']]:bg-[#fffdf8] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2",
+  "[&_input[type='password']]:w-full [&_input[type='password']]:rounded-[10px] [&_input[type='password']]:border [&_input[type='password']]:border-[#d8d1c2] [&_input[type='password']]:bg-[#fffdf8] [&_input[type='password']]:px-3 [&_input[type='password']]:py-2",
   "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[#d8d1c2] [&_input[type='search']]:bg-[#fffdf8] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2",
   "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[#d8d1c2] [&_input[type='text']]:bg-[#fffdf8] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2",
   '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[#d8d1c2] [&_select]:bg-[#fffdf8] [&_select]:px-3 [&_select]:py-2',
@@ -560,6 +561,27 @@ function normalizeRoutingProfile(profile, index) {
   }
 }
 
+function normalizeClientAuthCredential(credential) {
+  const source = credential && typeof credential === 'object' ? credential : {}
+  return {
+    enabled: source.enabled !== false,
+    username: String(source.username || '').trim(),
+    password_hash: String(source.password_hash || '').trim(),
+    password: Object.prototype.hasOwnProperty.call(source, 'password') ? String(source.password || '') : '',
+    label: String(source.label || ''),
+  }
+}
+
+function formatClientAuthCredentialStatus(credential) {
+  if (String((credential && credential.password) || '').trim()) {
+    return credential.password_hash ? 'Password change pending' : 'New password pending'
+  }
+  if (String((credential && credential.password_hash) || '').trim()) {
+    return 'Saved password'
+  }
+  return 'Needs password'
+}
+
 function normalizeRouterConfig(config) {
   const source = config && typeof config === 'object' ? config : {}
   const upstream = source.upstream && typeof source.upstream === 'object' ? source.upstream : {}
@@ -571,6 +593,7 @@ function normalizeRouterConfig(config) {
     source.https_interception && typeof source.https_interception === 'object'
       ? source.https_interception
       : {}
+  const clientAuth = source.client_auth && typeof source.client_auth === 'object' ? source.client_auth : {}
   const defaultClientTrafficLimit =
     source.default_client_traffic_limit && typeof source.default_client_traffic_limit === 'object'
       ? source.default_client_traffic_limit
@@ -595,6 +618,14 @@ function normalizeRouterConfig(config) {
         note: String(limit.note || ''),
       }),
     ),
+    client_auth: {
+      enabled: Boolean(clientAuth.enabled),
+      allow_anonymous: clientAuth.allow_anonymous !== false,
+      realm: String(clientAuth.realm || 'proxy-router').trim() || 'proxy-router',
+      credentials: (Array.isArray(clientAuth.credentials) ? clientAuth.credentials : []).map(
+        (credential) => normalizeClientAuthCredential(credential),
+      ),
+    },
     client_traffic_exemptions: (Array.isArray(source.client_traffic_exemptions)
       ? source.client_traffic_exemptions
       : []
@@ -648,14 +679,37 @@ function isPersistableClientTrafficLimit(limit) {
   return limit.enabled === false || limit.max_past_hour_mb != null || limit.max_past_3h_mb != null
 }
 
+function isPersistableClientAuthCredential(credential) {
+  return Boolean(
+    String((credential && credential.username) || '').trim() &&
+      (String((credential && credential.password) || '').trim() ||
+        String((credential && credential.password_hash) || '').trim()),
+  )
+}
+
 function isPersistableClientTrafficExemption(exemption) {
   return Boolean(String((exemption && exemption.client) || '').trim()) && !isExemptionExpired(exemption)
 }
 
 function buildPersistableRouterConfig(config) {
   const normalized = normalizeRouterConfig(config)
+  const credentials = normalized.client_auth.credentials
+    .filter((credential) => isPersistableClientAuthCredential(credential))
+    .map((credential) => {
+      const password = String(credential.password || '').trim()
+      return {
+        enabled: credential.enabled,
+        username: credential.username,
+        label: credential.label,
+        ...(password ? { password } : { password_hash: credential.password_hash }),
+      }
+    })
   return {
     ...normalized,
+    client_auth: {
+      ...normalized.client_auth,
+      credentials,
+    },
     client_traffic_limits: normalized.client_traffic_limits.filter((limit) => isPersistableClientTrafficLimit(limit)),
     client_traffic_exemptions: normalized.client_traffic_exemptions.filter((exemption) =>
       isPersistableClientTrafficExemption(exemption),
@@ -668,9 +722,32 @@ function buildPersistableRouterConfig(config) {
   }
 }
 
+function reconcileSavedClientAuthCredentials(existingConfig, savedConfig) {
+  const existing = normalizeRouterConfig(existingConfig)
+  const saved = normalizeRouterConfig(savedConfig)
+  const savedCredentialsByUsername = new Map(
+    saved.client_auth.credentials.map((credential) => [credential.username, credential]),
+  )
+  return {
+    ...existing,
+    client_auth: {
+      ...saved.client_auth,
+      credentials: existing.client_auth.credentials.map((credential) => {
+        if (!isPersistableClientAuthCredential(credential)) {
+          return credential
+        }
+        return savedCredentialsByUsername.get(credential.username) || credential
+      }),
+    },
+  }
+}
+
 function countRouterDraftItems(config) {
   const normalized = normalizeRouterConfig(config)
   let count = normalized.rules.filter((rule) => !isPersistableRule(rule)).length
+  count += normalized.client_auth.credentials.filter(
+    (credential) => !isPersistableClientAuthCredential(credential),
+  ).length
   count += normalized.client_traffic_limits.filter((limit) => !isPersistableClientTrafficLimit(limit)).length
   count += normalized.client_traffic_exemptions.filter((exemption) => !isPersistableClientTrafficExemption(exemption)).length
   count += normalized.routing_profiles.reduce(
@@ -889,6 +966,14 @@ function currentHttpsInterceptionStatus(snapshot) {
 function formatStatusDateTime(value) {
   const parsed = parseDateText(value)
   return parsed ? parsed.toLocaleString() : 'Unknown time'
+}
+
+function formatClientAuthSummary(event) {
+  if (!event || !event.client_auth_type || event.client_auth_type === 'anonymous') {
+    return 'anonymous'
+  }
+  const label = event.client_auth_label ? ` (${event.client_auth_label})` : ''
+  return `${event.client_auth_type}: ${event.client_auth_username || event.client}${label}`
 }
 
 function buildUpstreamConnectivityLabel(upstreamStatus) {
@@ -1185,6 +1270,8 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const enabledRules = visibleRuleEntries.filter((entry) => entry.rule && entry.rule.enabled).length
   const enabledClientLimits = config.client_traffic_limits.filter((limit) => limit.enabled).length
   const enabledClientExemptions = config.client_traffic_exemptions.filter((exemption) => exemption.enabled).length
+  const clientAuth = config.client_auth || { credentials: [] }
+  const enabledAuthCredentials = (clientAuth.credentials || []).filter((credential) => credential.enabled).length
   const defaultClientLimit = config.default_client_traffic_limit || {}
   const autoProxyStatus = config.auto_proxy_failures.enabled ? AUTO_PROXY_POLICY_LABEL : 'Disabled'
   const runtime = currentRouterRuntime(snapshot)
@@ -1204,6 +1291,9 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const defaultClientLimitLabel = defaultClientLimit.enabled
     ? `1h ${defaultClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${defaultClientLimit.max_past_3h_mb ?? 'none'}MB`
     : 'Disabled'
+  const clientAuthLabel = clientAuth.enabled
+    ? `${clientAuth.allow_anonymous ? 'Optional' : 'Required'} · ${enabledAuthCredentials}/${clientAuth.credentials.length} credentials`
+    : 'Disabled'
   return [
     ['Edit target', editorTargetLabel],
     [
@@ -1219,6 +1309,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Upstream check', buildUpstreamConnectivityLabel(upstreamStatus)],
     ['HTTPS sniffing', httpsInterceptionLabel],
     ['Auto proxy', autoProxyStatus],
+    ['Proxy auth', clientAuthLabel],
     ['Default quota', defaultClientLimitLabel],
     ['Client limits', `${enabledClientLimits}/${config.client_traffic_limits.length}`],
     ['Exemptions', `${enabledClientExemptions}/${config.client_traffic_exemptions.length}`],
@@ -1247,6 +1338,8 @@ function buildRouterStatusText(config, lastSavedConfig, profileId, options = {})
     return `${draftLabel} until required fields are filled · editing ${editorLabel}`
   }
   return `Auto-sync on · ${visibleRuleEntries.length} rules · ${config.client_traffic_limits.length} client limits · ${config.client_traffic_exemptions.length} exemptions · ${
+    config.client_auth.enabled ? 'auth on' : 'auth off'
+  } · ${
     config.upstream.enabled ? 'upstream on' : 'upstream off'
   } · editing ${editorLabel}`
 }
@@ -1622,6 +1715,11 @@ function App() {
   async function refreshHistory(rangeValue = historyRange, proxyTypeValue = historyProxyType) {
     const params = new URLSearchParams()
     params.set('range', rangeValue)
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    if (browserTimezone) {
+      params.set('timezone', browserTimezone)
+    }
+    params.set('timezone_offset_minutes', String(-new Date().getTimezoneOffset()))
     if (proxyTypeValue !== 'all') {
       params.set('proxy_type', proxyTypeValue)
     }
@@ -1898,15 +1996,19 @@ function App() {
           setRouterSaveError('')
           setRouterStatusOverride(null)
           setCurrentRouterConfig((existingConfig) => {
-            const existingPersistableFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(existingConfig))
-            const normalizedFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(normalizedConfig))
             if (routerEditVersionRef.current !== requestVersion) {
               return existingConfig
             }
+            if (!countRouterDraftItems(existingConfig)) {
+              return normalizedConfig
+            }
+            const reconciledConfig = reconcileSavedClientAuthCredentials(existingConfig, normalizedConfig)
+            const existingPersistableFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(reconciledConfig))
+            const normalizedFingerprint = routerConfigFingerprint(buildPersistableRouterConfig(normalizedConfig))
             if (existingPersistableFingerprint !== normalizedFingerprint) {
               return existingConfig
             }
-            return countRouterDraftItems(existingConfig) ? existingConfig : normalizedConfig
+            return reconciledConfig
           })
         })
         .catch((error) => {
@@ -1986,6 +2088,34 @@ function App() {
     } else {
       ensureRuleExpiration(rule, false)
     }
+    setLocalRouterConfig(nextConfig)
+  }
+
+  function addClientAuthCredential(credential = null) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    nextConfig.client_auth.credentials.push(
+      normalizeClientAuthCredential(
+        credential || {
+          enabled: true,
+          username: '',
+          password: '',
+          password_hash: '',
+          label: '',
+        },
+      ),
+    )
+    setLocalRouterConfig(nextConfig, {
+      activateTab: 'quotas',
+      message: 'Proxy auth credential draft added. It syncs automatically after you enter a username and password.',
+    })
+  }
+
+  function updateClientAuthCredentialField(index, field, value) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    if (!nextConfig.client_auth.credentials[index]) {
+      return
+    }
+    nextConfig.client_auth.credentials[index][field] = value
     setLocalRouterConfig(nextConfig)
   }
 
@@ -2328,6 +2458,8 @@ function App() {
                     ['Method', dashboardSnapshot.latest_request.method],
                     ['Status', dashboardSnapshot.latest_request.status_code || 'n/a'],
                     ['Client', dashboardSnapshot.latest_request.client],
+                    ['Client IP', dashboardSnapshot.latest_request.client_ip || dashboardSnapshot.latest_request.client],
+                    ['Auth', formatClientAuthSummary(dashboardSnapshot.latest_request)],
                     ['Destination', dashboardSnapshot.latest_request.destination],
                     ['Route', dashboardSnapshot.latest_request.route_label || 'direct'],
                     ['Upload', formatMb(dashboardSnapshot.latest_request.uploaded_bytes)],
@@ -2429,6 +2561,8 @@ function App() {
                         <th>Method</th>
                         <th>Status</th>
                         <th>Client</th>
+                        <th>Client IP</th>
+                        <th>Auth</th>
                         <th>Destination</th>
                         <th>Route</th>
                         <th>Total</th>
@@ -2442,6 +2576,8 @@ function App() {
                           <td>{request.method}</td>
                           <td>{request.status_code || 'n/a'}</td>
                           <td>{request.client}</td>
+                          <td>{request.client_ip || request.client}</td>
+                          <td>{formatClientAuthSummary(request)}</td>
                           <td className="max-w-md break-words">{request.destination}</td>
                           <td>{request.route_label || 'direct'}</td>
                           <td>{formatMb(request.total_bytes)}</td>
@@ -3110,7 +3246,7 @@ function App() {
                           pagedRules.map((entry) => {
                             const rule = entry.rule
                             return (
-                              <tr key={`${entry.scope}-${entry.index}-${rule.pattern}-${rule.note}`}>
+                              <tr key={`${entry.scope}-${entry.index}`}>
                                 <td className="min-w-32">
                                   <span className={rulePillClass}>{entry.scope_label}</span>
                                 </td>
@@ -3267,6 +3403,149 @@ function App() {
                 </div>
               </div>
 
+              <div className={cx(panelHeaderClass, 'mt-3')}>
+                <div>
+                  <h3>Proxy authentication</h3>
+                  <div className={noteClass}>
+                    HTTP Basic proxy auth and SOCKS5 username/password auth can identify devices as stable
+                    <code className="mx-1">user:&lt;username&gt;</code>
+                    clients.
+                  </div>
+                </div>
+                <button id="add-client-auth-button" type="button" onClick={() => addClientAuthCredential()}>
+                  Add credential
+                </button>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(160px,0.7fr)]">
+                <label className="flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="checkbox"
+                    checked={currentRouterConfig.client_auth.enabled}
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.client_auth.enabled = event.target.checked
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                  <span>Enable proxy authentication</span>
+                </label>
+                <label className="flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="checkbox"
+                    checked={currentRouterConfig.client_auth.allow_anonymous}
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.client_auth.allow_anonymous = event.target.checked
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                  <span>Allow anonymous devices</span>
+                </label>
+                <label className={fieldClass}>
+                  <span>Realm</span>
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="text"
+                    value={currentRouterConfig.client_auth.realm}
+                    placeholder="proxy-router"
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.client_auth.realm = event.target.value
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                </label>
+              </div>
+              <div className={noteClass}>
+                Leave anonymous enabled when some devices or apps cannot send proxy credentials.
+              </div>
+
+              <div className={tableWrapClass}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Enabled</th>
+                      <th>Username</th>
+                      <th>Password</th>
+                      <th>Label</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentRouterConfig.client_auth.credentials.length ? (
+                      currentRouterConfig.client_auth.credentials.map((credential, index) => (
+                        <tr key={`client-auth-${index}`}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={credential.enabled}
+                              onChange={(event) =>
+                                updateClientAuthCredentialField(index, 'enabled', event.target.checked)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              type="text"
+                              value={credential.username}
+                              placeholder="phone"
+                              onChange={(event) =>
+                                updateClientAuthCredentialField(index, 'username', event.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              type="password"
+                              value={credential.password || ''}
+                              placeholder={credential.password_hash ? 'leave blank to keep existing password' : 'new password'}
+                              autoComplete="new-password"
+                              onChange={(event) =>
+                                updateClientAuthCredentialField(index, 'password', event.target.value)
+                              }
+                            />
+                          </td>
+                          <td>
+                            <input
+                              type="text"
+                              value={credential.label}
+                              placeholder="Android phone"
+                              onChange={(event) =>
+                                updateClientAuthCredentialField(index, 'label', event.target.value)
+                              }
+                            />
+                          </td>
+                          <td>{formatClientAuthCredentialStatus(credential)}</td>
+                          <td className={ruleActionsClass}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const nextConfig = cloneJson(currentRouterConfig)
+                                nextConfig.client_auth.credentials.splice(index, 1)
+                                setLocalRouterConfig(nextConfig, {
+                                  message: 'Proxy auth credential removed. Syncing automatically.',
+                                })
+                              }}
+                            >
+                              Delete
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan="6" className="pt-2 text-[#6a6f73]">
+                          No proxy auth credentials yet.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
               <div className={noteClass}>Default traffic quota for all devices</div>
               <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                 <input
@@ -3333,7 +3612,7 @@ function App() {
               </div>
 
               <div className={noteClass}>
-                Custom client IP or CIDR limits override the default. Exemptions override both limits.
+                Custom client identity, IP, or CIDR limits override the default. Exemptions override both limits.
               </div>
 
               <div className={cx(panelHeaderClass, 'mt-4')}>
@@ -3343,7 +3622,7 @@ function App() {
                 </button>
               </div>
               <div className={noteClass}>
-                Match one client IP or CIDR and cap its traffic over the last hour and last 3 hours.
+                Match one authenticated client identity, client IP, or CIDR and cap its traffic over the last hour and last 3 hours.
               </div>
 
               <div className={tableWrapClass}>
@@ -3351,7 +3630,7 @@ function App() {
                   <thead>
                     <tr>
                       <th>Enabled</th>
-                      <th>Client IP / CIDR</th>
+                      <th>Client identity / IP / CIDR</th>
                       <th>Last hour (MB)</th>
                       <th>Last 3h (MB)</th>
                       <th>Note</th>
@@ -3361,7 +3640,7 @@ function App() {
                   <tbody>
                     {currentRouterConfig.client_traffic_limits.length ? (
                       currentRouterConfig.client_traffic_limits.map((limit, index) => (
-                        <tr key={`${limit.client}-${index}`}>
+                        <tr key={`client-limit-${index}`}>
                           <td>
                             <input
                               type="checkbox"
@@ -3375,7 +3654,7 @@ function App() {
                             <input
                               type="text"
                               value={limit.client}
-                              placeholder="192.168.1.50 or 192.168.1.0/24"
+                              placeholder="user:phone, 192.168.1.50, or 192.168.1.0/24"
                               onChange={(event) => updateClientTrafficLimitField(index, 'client', event.target.value)}
                             />
                           </td>
@@ -3451,7 +3730,7 @@ function App() {
                 </button>
               </div>
               <div className={noteClass}>
-                Use exemptions to exclude devices permanently or suspend quota enforcement for a limited time such as 2h.
+                Use exemptions to exclude authenticated clients or devices permanently, or suspend quota enforcement for a limited time such as 2h.
               </div>
 
               <div className={tableWrapClass}>
@@ -3459,7 +3738,7 @@ function App() {
                   <thead>
                     <tr>
                       <th>Enabled</th>
-                      <th>Client IP / CIDR</th>
+                      <th>Client identity / IP / CIDR</th>
                       <th>Duration</th>
                       <th>Active until</th>
                       <th>Note</th>
@@ -3469,7 +3748,7 @@ function App() {
                   <tbody>
                     {currentRouterConfig.client_traffic_exemptions.length ? (
                       currentRouterConfig.client_traffic_exemptions.map((exemption, index) => (
-                        <tr key={`${exemption.client}-${index}`}>
+                        <tr key={`client-exemption-${index}`}>
                           <td>
                             <input
                               type="checkbox"
@@ -3483,7 +3762,7 @@ function App() {
                             <input
                               type="text"
                               value={exemption.client}
-                              placeholder="127.0.0.1 or 192.168.1.0/24"
+                              placeholder="user:phone, 127.0.0.1, or 192.168.1.0/24"
                               onChange={(event) => updateClientTrafficExemptionField(index, 'client', event.target.value)}
                             />
                           </td>
@@ -3550,7 +3829,7 @@ function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Client IP</th>
+                        <th>Client identity</th>
                         <th>
                           <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleQuotaDeviceSort('active')}>
                             Active{quotaSortLabel('active')}

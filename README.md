@@ -11,6 +11,7 @@ It is designed for cases where a phone or another device on the same network sho
 - Shared and per-network routing profiles
 - Automatic direct-failure probing before temporary auto-proxy rules
 - Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA
+- Optional HTTP/SOCKS proxy authentication for stable per-device identities
 - Per-client traffic quotas, default quotas, and temporary or permanent exemptions
 - Docker-first deployment with persistent state under `./data`
 - Small Python backend with a separate React + Vite frontend
@@ -151,7 +152,7 @@ The dashboard includes five main areas:
 - `Overview`: current activity, totals, recent traffic, active clients
 - `History`: time-bucketed usage history and top destinations
 - `Routing`: upstream settings, rules, routing profiles, auto-proxy controls
-- `Quotas`: default client quota, per-client quota rules, exemptions
+- `Quotas`: optional proxy authentication, default client quota, per-client quota rules, exemptions
 - `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
 Client self-service portal:
@@ -171,6 +172,7 @@ Current dashboard behaviors:
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
+- Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
 - Transient upstream connection/setup failures are retried briefly before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
@@ -180,6 +182,9 @@ Current dashboard behaviors:
 
 ## Quotas
 
+- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally.
+- Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
+- Client limit and exemption targets can be `user:<username>`, a single IP address, or a CIDR range.
 - Specific client limits override the default client quota.
 - Exemptions override both custom and default limits.
 - Exemptions support permanent and timed entries such as `2h`.
@@ -237,6 +242,8 @@ docs/                      supporting project documentation
 
 - Binding to `0.0.0.0` exposes the listener to any reachable device unless you restrict clients.
 - On shared networks, use `--allow-client` whenever possible.
+- Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected.
+- Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; do not commit runtime config or data files.
 - HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust are temporarily bypassed after TLS trust failures and can also use manual bypass patterns or SOCKS5.
 - Intercepted HTTPS records keep URL-level metadata and byte totals, not headers or bodies.
 - Do not commit secrets, private upstream credentials, or runtime data files.

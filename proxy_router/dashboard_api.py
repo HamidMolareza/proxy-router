@@ -206,10 +206,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
             proxy_type = normalize_history_filter(first_query_value(query, "proxy_type"))
             client = normalize_history_filter(first_query_value(query, "client"))
+            timezone_name = first_query_value(query, "timezone")
+            timezone_offset_minutes = first_query_value(query, "timezone_offset_minutes")
             payload = self.server.history_cache.build_history_payload(
                 range_key=range_key,
                 proxy_type=proxy_type,
                 client=client,
+                timezone_name=timezone_name,
+                timezone_offset_minutes=timezone_offset_minutes,
             )
             self._send_json(payload)
             return

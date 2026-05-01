@@ -72,6 +72,10 @@ class DashboardState:
         matched_rule: dict | None = None,
         profile_id: str | None = None,
         status_code: int | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         with self._lock:
             summary = self._totals_by_proxy.setdefault(proxy_label, empty_usage_summary())
@@ -110,6 +114,10 @@ class DashboardState:
                     "matched_rule": matched_rule,
                     "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
                     "status_code": status_code,
+                    "client_ip": client_ip,
+                    "client_auth_type": client_auth_type,
+                    "client_auth_username": client_auth_username,
+                    "client_auth_label": client_auth_label,
                 }
             )
 
@@ -129,6 +137,10 @@ class DashboardState:
         matched_rule: dict | None = None,
         profile_id: str | None = None,
         status_code: int | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         with self._lock:
             self._recent_failures.appendleft(
@@ -145,6 +157,10 @@ class DashboardState:
                     "route_label": route_label or "direct",
                     "matched_rule": matched_rule,
                     "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
+                    "client_ip": client_ip,
+                    "client_auth_type": client_auth_type,
+                    "client_auth_username": client_auth_username,
+                    "client_auth_label": client_auth_label,
                 }
             )
 
@@ -547,6 +563,10 @@ class UsageLogger:
         matched_rule: dict | None = None,
         profile_id: str | None = None,
         status_code: int | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         if self._stream is None:
             return
@@ -569,6 +589,14 @@ class UsageLogger:
             event["matched_rule"] = matched_rule
         if status_code is not None:
             event["status_code"] = int(status_code)
+        if client_ip is not None:
+            event["client_ip"] = client_ip
+        if client_auth_type is not None:
+            event["client_auth_type"] = client_auth_type
+        if client_auth_username is not None:
+            event["client_auth_username"] = client_auth_username
+        if client_auth_label is not None:
+            event["client_auth_label"] = client_auth_label
 
         with self._lock:
             self._stream.write(json.dumps(event, sort_keys=True) + "\n")
@@ -621,6 +649,10 @@ class FailureLogger:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         event = {
             "timestamp": timestamp,
@@ -635,6 +667,14 @@ class FailureLogger:
             "route_label": route_label or "direct",
             "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
         }
+        if client_ip is not None:
+            event["client_ip"] = client_ip
+        if client_auth_type is not None:
+            event["client_auth_type"] = client_auth_type
+        if client_auth_username is not None:
+            event["client_auth_username"] = client_auth_username
+        if client_auth_label is not None:
+            event["client_auth_label"] = client_auth_label
         if matched_rule is not None:
             event["matched_rule"] = matched_rule
 
@@ -821,6 +861,10 @@ class AppRuntime:
                 matched_rule=record.get("matched_rule") if isinstance(record.get("matched_rule"), dict) else None,
                 profile_id=str(record.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID),
                 status_code=normalized_status_code,
+                client_ip=str(record.get("client_ip")) if record.get("client_ip") is not None else None,
+                client_auth_type=str(record.get("client_auth_type")) if record.get("client_auth_type") is not None else None,
+                client_auth_username=str(record.get("client_auth_username")) if record.get("client_auth_username") is not None else None,
+                client_auth_label=str(record.get("client_auth_label")) if record.get("client_auth_label") is not None else None,
             )
 
         failure_records, _ = load_failure_records(
@@ -853,6 +897,10 @@ class AppRuntime:
                 route_label=str(record.get("route_label") or "direct"),
                 matched_rule=record.get("matched_rule") if isinstance(record.get("matched_rule"), dict) else None,
                 profile_id=str(record.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID),
+                client_ip=str(record.get("client_ip")) if record.get("client_ip") is not None else None,
+                client_auth_type=str(record.get("client_auth_type")) if record.get("client_auth_type") is not None else None,
+                client_auth_username=str(record.get("client_auth_username")) if record.get("client_auth_username") is not None else None,
+                client_auth_label=str(record.get("client_auth_label")) if record.get("client_auth_label") is not None else None,
             )
 
     def attach_router_config(self, router_config):
@@ -968,6 +1016,10 @@ class AppRuntime:
         matched_rule: dict | None = None,
         profile_id: str | None = None,
         status_code: int | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.usage_logger.record(
@@ -983,6 +1035,10 @@ class AppRuntime:
             matched_rule=matched_rule,
             profile_id=profile_id,
             status_code=status_code,
+            client_ip=client_ip,
+            client_auth_type=client_auth_type,
+            client_auth_username=client_auth_username,
+            client_auth_label=client_auth_label,
         )
         self.dashboard_state.record_request(
             proxy_label=proxy_label,
@@ -997,6 +1053,10 @@ class AppRuntime:
             matched_rule=matched_rule,
             profile_id=profile_id,
             status_code=status_code,
+            client_ip=client_ip,
+            client_auth_type=client_auth_type,
+            client_auth_username=client_auth_username,
+            client_auth_label=client_auth_label,
         )
         self.traffic_quota_manager.record_usage(
             client=client,
@@ -1019,6 +1079,10 @@ class AppRuntime:
         route_label: str | None = None,
         matched_rule: dict | None = None,
         profile_id: str | None = None,
+        client_ip: str | None = None,
+        client_auth_type: str | None = None,
+        client_auth_username: str | None = None,
+        client_auth_label: str | None = None,
     ):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.failure_logger.record(
@@ -1034,6 +1098,10 @@ class AppRuntime:
             route_label=route_label,
             matched_rule=matched_rule,
             profile_id=profile_id,
+            client_ip=client_ip,
+            client_auth_type=client_auth_type,
+            client_auth_username=client_auth_username,
+            client_auth_label=client_auth_label,
         )
         self.dashboard_state.record_failure(
             proxy_label=proxy_label,
@@ -1048,6 +1116,10 @@ class AppRuntime:
             route_label=route_label,
             matched_rule=matched_rule,
             profile_id=profile_id,
+            client_ip=client_ip,
+            client_auth_type=client_auth_type,
+            client_auth_username=client_auth_username,
+            client_auth_label=client_auth_label,
         )
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.record_failure(

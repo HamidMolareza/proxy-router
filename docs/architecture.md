@@ -54,12 +54,13 @@ Purpose:
 ### Proxy traffic
 
 1. A client connects to the mixed or SOCKS5 listener.
-2. The backend validates the client and evaluates quota state.
-3. Routing rules are resolved from the active config and profile context.
-4. HTTP CONNECT requests are either tunneled unchanged or, when HTTPS interception is enabled and matched, terminated with a generated host certificate.
-5. The request is sent direct, proxied upstream, or blocked.
-6. Usage and failure events are written to persisted log files.
-7. Runtime dashboard state is updated in memory.
+2. The backend validates the source network and resolves an anonymous IP identity or an authenticated `user:<username>` identity.
+3. The backend evaluates quota state for that identity.
+4. Routing rules are resolved from the active config and profile context.
+5. HTTP CONNECT requests are either tunneled unchanged or, when HTTPS interception is enabled and matched, terminated with a generated host certificate.
+6. The request is sent direct, proxied upstream, or blocked.
+7. Usage and failure events are written to persisted log files.
+8. Runtime dashboard state is updated in memory.
 
 ### Dashboard traffic
 
@@ -75,7 +76,7 @@ Compose mounts `./data` to `/data`.
 
 Persisted files:
 
-- `router-config.json`: routing, upstream, quota, exemption, and profile configuration
+- `router-config.json`: routing, upstream, optional proxy auth, quota, exemption, and profile configuration
 - `router-config-auto-proxy-state.json`: auto-proxy activation state
 - `router-config-https-interception-state.json`: adaptive HTTPS trust and fallback state
 - `https-interception/`: generated local CA and per-host certificates
@@ -154,5 +155,6 @@ Common defaults:
 - The dashboard frontend is separate from the backend and consumes JSON APIs.
 - The root executable is a thin shim; most backend behavior lives in `proxy_router/`.
 - Runtime state is centralized in `AppRuntime` instead of spreading service globals across the codebase.
+- Optional proxy authentication supports HTTP Basic `Proxy-Authorization` and SOCKS5 username/password. Anonymous access can remain enabled, and authenticated traffic is logged, limited, and exempted as `user:<username>` while retaining the source IP metadata.
 - HTTPS interception uses adaptive fallback: successful TLS handshakes mark a client as CA-trusted, while TLS trust failures temporarily bypass MITM for that client or host and use raw CONNECT.
 - SOCKS5 remains a raw tunnel path for apps that reject user-installed CAs or use certificate pinning.

@@ -664,6 +664,11 @@ class RouterConfigManager:
                 "stage_durations_seconds": auto_proxy_stage_durations_seconds(),
             }
 
+    def client_auth_settings(self):
+        with self._lock:
+            settings = self._config.get("client_auth", default_router_config()["client_auth"])
+            return json.loads(json.dumps(settings))
+
     def https_interception_settings(self):
         with self._lock:
             settings = self._config.get("https_interception", default_router_config()["https_interception"])

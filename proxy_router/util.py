@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import hashlib
+import hmac
+import secrets
 import socket
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - zoneinfo is available on supported Python versions
+    ZoneInfo = None
+    ZoneInfoNotFoundError = ValueError
 
 from .constants import *
 from .output import debug_log
@@ -353,10 +362,118 @@ def should_intercept_https_connect(settings, host: str | None, port: int | None)
     return host_matches_any_suffix_pattern(host, settings.get("host_patterns"))
 
 
+def normalize_client_auth_username(value: str) -> str:
+    username = str(value or "").strip()
+    if username.startswith("user:"):
+        username = username[5:].strip()
+    if not username:
+        return ""
+    if not CLIENT_AUTH_USERNAME_PATTERN.fullmatch(username):
+        raise ValueError(
+            "client auth username must be 1-80 characters and contain only letters, numbers, dot, underscore, at, plus, or hyphen"
+        )
+    return username
+
+
+def client_identity_from_username(username: str) -> str:
+    normalized_username = normalize_client_auth_username(username)
+    return f"user:{normalized_username}" if normalized_username else ""
+
+
+def hash_client_auth_password(password: str) -> str:
+    salt = secrets.token_bytes(CLIENT_AUTH_PBKDF2_SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(password or "").encode("utf-8"),
+        salt,
+        CLIENT_AUTH_PBKDF2_ITERATIONS,
+    )
+    return (
+        "pbkdf2_sha256:"
+        f"{CLIENT_AUTH_PBKDF2_ITERATIONS}:"
+        f"{salt.hex()}:"
+        f"{digest.hex()}"
+    )
+
+
+def normalize_client_auth_password_hash(value: str | None) -> str:
+    password_hash = str(value or "").strip()
+    if not password_hash:
+        return ""
+    if password_hash.startswith("pbkdf2_sha256:"):
+        parts = password_hash.split(":")
+        if len(parts) != 4:
+            raise ValueError("client auth password_hash must be a valid pbkdf2_sha256 hash")
+        _, iterations_text, salt_hex, digest_hex = parts
+        try:
+            iterations = int(iterations_text)
+        except ValueError as exc:
+            raise ValueError("client auth password_hash iterations must be an integer") from exc
+        if iterations <= 0:
+            raise ValueError("client auth password_hash iterations must be positive")
+        salt_hex = salt_hex.lower()
+        digest_hex = digest_hex.lower()
+        if (
+            len(salt_hex) < 16
+            or len(salt_hex) % 2
+            or any(character not in "0123456789abcdef" for character in salt_hex)
+            or len(digest_hex) != 64
+            or any(character not in "0123456789abcdef" for character in digest_hex)
+        ):
+            raise ValueError("client auth password_hash must be a valid pbkdf2_sha256 hash")
+        return f"pbkdf2_sha256:{iterations}:{salt_hex}:{digest_hex}"
+    if password_hash.startswith("sha256:"):
+        digest = password_hash.split(":", 1)[1].lower()
+    else:
+        digest = password_hash.lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("client auth password_hash must be a sha256 hex digest")
+    return f"sha256:{digest}"
+
+
+def verify_client_auth_password(password: str, password_hash: str | None) -> bool:
+    expected_hash = normalize_client_auth_password_hash(password_hash)
+    if not expected_hash:
+        return False
+    if expected_hash.startswith("pbkdf2_sha256:"):
+        _, iterations_text, salt_hex, digest_hex = expected_hash.split(":")
+        computed_digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(password or "").encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            int(iterations_text),
+        ).hex()
+        return hmac.compare_digest(computed_digest, digest_hex)
+    legacy_digest = "sha256:" + hashlib.sha256(str(password or "").encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy_digest, expected_hash)
+
+
+def authenticate_client_auth_credentials(settings, username: str | None, password: str | None):
+    normalized_username = normalize_client_auth_username(username or "")
+    if not normalized_username:
+        return None
+    for credential in (settings or {}).get("credentials") or []:
+        if not credential.get("enabled", True):
+            continue
+        if str(credential.get("username") or "") != normalized_username:
+            continue
+        if verify_client_auth_password(str(password or ""), credential.get("password_hash")):
+            return {
+                "username": normalized_username,
+                "id": client_identity_from_username(normalized_username),
+                "label": str(credential.get("label") or "").strip(),
+            }
+        return None
+    return None
+
+
 def normalize_client_limit_target(value: str) -> str:
-    target = str(value).strip()
+    target = str(value or "").strip()
     if not target:
         return ""
+
+    if target.lower().startswith("user:"):
+        return client_identity_from_username(target)
 
     try:
         return str(ipaddress.ip_address(target))
@@ -365,17 +482,22 @@ def normalize_client_limit_target(value: str) -> str:
 
     try:
         return str(ipaddress.ip_network(target, strict=False))
-    except ValueError as exc:
-        raise ValueError(f"invalid client IP or CIDR '{value}'") from exc
+    except ValueError:
+        return client_identity_from_username(target)
 
 
 def client_limit_target_specificity(target: str) -> int:
+    if str(target).startswith("user:"):
+        return 1000
     if "/" in target:
         return ipaddress.ip_network(target, strict=False).prefixlen
     return ipaddress.ip_address(target).max_prefixlen
 
 
 def client_ip_matches_limit_target(client_ip: str, target: str) -> bool:
+    if str(target).startswith("user:"):
+        return str(client_ip or "") == str(target)
+
     try:
         client_address = ipaddress.ip_address(client_ip)
     except ValueError:
@@ -535,6 +657,12 @@ def default_router_config():
             "max_past_hour_mb": None,
             "max_past_3h_mb": None,
             "note": "",
+        },
+        "client_auth": {
+            "enabled": False,
+            "allow_anonymous": True,
+            "realm": DEFAULT_CLIENT_AUTH_REALM,
+            "credentials": [],
         },
         "client_traffic_limits": [],
         "client_traffic_exemptions": [],
@@ -701,6 +829,12 @@ def normalize_router_config(payload):
     if not isinstance(default_client_traffic_limit_payload, dict):
         raise ValueError("router default_client_traffic_limit must be an object")
 
+    client_auth_payload = payload.get("client_auth") or {}
+    if client_auth_payload is None:
+        client_auth_payload = {}
+    if not isinstance(client_auth_payload, dict):
+        raise ValueError("router client_auth must be an object")
+
     client_traffic_limits_payload = payload.get("client_traffic_limits") or []
     if not isinstance(client_traffic_limits_payload, list):
         raise ValueError("router client_traffic_limits must be an array")
@@ -790,6 +924,39 @@ def normalize_router_config(payload):
         max_past_3h_mb=normalized_default_client_traffic_limit["max_past_3h_mb"],
         field_prefix="router default_client_traffic_limit",
     )
+
+    client_auth_credentials_payload = client_auth_payload.get("credentials") or []
+    if not isinstance(client_auth_credentials_payload, list):
+        raise ValueError("router client_auth credentials must be an array")
+
+    normalized_client_auth_credentials = []
+    seen_auth_usernames = set()
+    for index, credential_payload in enumerate(client_auth_credentials_payload, start=1):
+        if not isinstance(credential_payload, dict):
+            raise ValueError(f"router client_auth credential #{index} must be an object")
+        username = normalize_client_auth_username(str(credential_payload.get("username", "")))
+        if not username:
+            continue
+        if username in seen_auth_usernames:
+            raise ValueError(f"router client_auth credential #{index} uses duplicate username '{username}'")
+        seen_auth_usernames.add(username)
+
+        password_text = credential_payload.get("password")
+        if password_text is not None and str(password_text):
+            password_hash = hash_client_auth_password(str(password_text))
+        else:
+            password_hash = normalize_client_auth_password_hash(credential_payload.get("password_hash"))
+        if not password_hash:
+            continue
+
+        normalized_client_auth_credentials.append(
+            {
+                "username": username,
+                "password_hash": password_hash,
+                "label": str(credential_payload.get("label", "")).strip(),
+                "enabled": bool(credential_payload.get("enabled", True)),
+            }
+        )
 
     normalized_client_traffic_limits = []
     for index, limit_payload in enumerate(client_traffic_limits_payload, start=1):
@@ -914,6 +1081,15 @@ def normalize_router_config(payload):
         "default_action": normalized_routing_defaults["default_action"],
         "ignored_failure_hosts": normalized_routing_defaults["ignored_failure_hosts"],
         "default_client_traffic_limit": normalized_default_client_traffic_limit,
+        "client_auth": {
+            "enabled": bool(client_auth_payload.get("enabled", default_config["client_auth"]["enabled"])),
+            "allow_anonymous": bool(
+                client_auth_payload.get("allow_anonymous", default_config["client_auth"]["allow_anonymous"])
+            ),
+            "realm": str(client_auth_payload.get("realm", default_config["client_auth"]["realm"])).strip()
+            or DEFAULT_CLIENT_AUTH_REALM,
+            "credentials": normalized_client_auth_credentials,
+        },
         "client_traffic_limits": normalized_client_traffic_limits,
         "client_traffic_exemptions": normalized_client_traffic_exemptions,
         "auto_proxy_failures": {
@@ -1611,9 +1787,55 @@ def config_rule_matches_failure(config, failure) -> bool:
     return False
 
 
-def bucket_datetime(value: datetime, bucket_seconds: int) -> datetime:
-    bucket_epoch = int(value.timestamp()) // bucket_seconds * bucket_seconds
-    return datetime.fromtimestamp(bucket_epoch, tz=value.tzinfo)
+def resolve_history_timezone(timezone_name: str | None = None, timezone_offset_minutes=None):
+    normalized_name = str(timezone_name or "").strip()
+    if normalized_name and ZoneInfo is not None:
+        try:
+            return ZoneInfo(normalized_name)
+        except ZoneInfoNotFoundError:
+            pass
+
+    try:
+        offset_minutes = int(timezone_offset_minutes)
+    except (TypeError, ValueError):
+        offset_minutes = None
+    if offset_minutes is not None and -14 * 60 <= offset_minutes <= 14 * 60:
+        return timezone(timedelta(minutes=offset_minutes))
+
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def bucket_datetime(value: datetime, bucket_seconds: int, history_timezone=None) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=history_timezone or datetime.now().astimezone().tzinfo)
+    elif history_timezone is not None:
+        value = value.astimezone(history_timezone)
+
+    normalized_bucket_seconds = max(1, int(bucket_seconds))
+    if normalized_bucket_seconds >= 86400 and normalized_bucket_seconds % 86400 == 0:
+        return value.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if normalized_bucket_seconds >= 3600 and normalized_bucket_seconds % 3600 == 0:
+        bucket_hours = max(1, normalized_bucket_seconds // 3600)
+        return value.replace(
+            hour=(value.hour // bucket_hours) * bucket_hours,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+    if normalized_bucket_seconds >= 60 and normalized_bucket_seconds % 60 == 0:
+        bucket_minutes = max(1, normalized_bucket_seconds // 60)
+        return value.replace(
+            minute=(value.minute // bucket_minutes) * bucket_minutes,
+            second=0,
+            microsecond=0,
+        )
+
+    midnight = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_since_midnight = int((value - midnight).total_seconds())
+    bucket_offset = seconds_since_midnight // normalized_bucket_seconds * normalized_bucket_seconds
+    return midnight + timedelta(seconds=bucket_offset)
 
 
 def summarize_history_records(
@@ -1623,9 +1845,13 @@ def summarize_history_records(
     range_key: str,
     proxy_type: str | None = None,
     client: str | None = None,
+    timezone_name: str | None = None,
+    timezone_offset_minutes=None,
+    now: datetime | None = None,
 ):
     config = HISTORY_RANGE_OPTIONS.get(range_key, HISTORY_RANGE_OPTIONS[HISTORY_DEFAULT_RANGE])
-    now = datetime.now().astimezone()
+    history_timezone = resolve_history_timezone(timezone_name, timezone_offset_minutes)
+    now = (now or datetime.now(history_timezone)).astimezone(history_timezone)
     window = config["window"]
     cutoff = now - window if window is not None else None
 
@@ -1647,6 +1873,9 @@ def summarize_history_records(
         timestamp = parse_usage_timestamp(record.get("timestamp"))
         if timestamp is None:
             continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        timestamp = timestamp.astimezone(history_timezone)
         if cutoff is not None and timestamp < cutoff:
             continue
 
@@ -1660,7 +1889,7 @@ def summarize_history_records(
         summary["total_bytes"] += total_bytes
         selected_timestamps.append(timestamp)
 
-        bucket_start = bucket_datetime(timestamp, config["bucket_seconds"])
+        bucket_start = bucket_datetime(timestamp, config["bucket_seconds"], history_timezone)
         bucket_key = bucket_start.isoformat()
         bucket_summary = buckets.setdefault(
             bucket_key,
@@ -1697,10 +1926,10 @@ def summarize_history_records(
     series = []
     if selected_timestamps:
         if cutoff is not None:
-            start_bucket = bucket_datetime(cutoff, config["bucket_seconds"])
+            start_bucket = bucket_datetime(cutoff, config["bucket_seconds"], history_timezone)
         else:
-            start_bucket = bucket_datetime(min(selected_timestamps), config["bucket_seconds"])
-        end_bucket = bucket_datetime(max(selected_timestamps), config["bucket_seconds"])
+            start_bucket = bucket_datetime(min(selected_timestamps), config["bucket_seconds"], history_timezone)
+        end_bucket = bucket_datetime(max(selected_timestamps), config["bucket_seconds"], history_timezone)
         cursor = start_bucket
         while cursor <= end_bucket:
             bucket_key = cursor.isoformat()
@@ -1729,6 +1958,7 @@ def summarize_history_records(
         "range_title": config["title"],
         "proxy_type": proxy_type or "all",
         "client": client or "all",
+        "timezone": str(timezone_name or getattr(history_timezone, "key", "") or history_timezone.tzname(now) or ""),
         "summary": summary,
         "series": series,
         "top_destinations": top_destinations,

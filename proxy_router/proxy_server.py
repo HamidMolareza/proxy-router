@@ -337,7 +337,7 @@ class ProtocolServerView:
 
 
 class InterceptedHTTPSProtocolView:
-    def __init__(self, server):
+    def __init__(self, server, *, client_identity=None):
         self.allowed_networks = server.allowed_networks
         self.timeout_seconds = server.timeout_seconds
         self.verbose = server.verbose
@@ -348,6 +348,7 @@ class InterceptedHTTPSProtocolView:
         self.runtime = server.runtime
         self.history_cache = server.history_cache
         self.server_address = server.server_address
+        self.client_identity = client_identity
 
 
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -415,6 +416,83 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 f"{self.client_address[0]} - {fmt % args}",
             )
 
+    def _anonymous_client_identity(self):
+        return {
+            "id": self.client_address[0],
+            "ip": self.client_address[0],
+            "auth_type": "anonymous",
+            "username": None,
+            "label": "",
+        }
+
+    def _client_identity(self):
+        return getattr(self, "_proxy_client_identity", None) or getattr(
+            self.server,
+            "client_identity",
+            None,
+        ) or self._anonymous_client_identity()
+
+    def _client_id(self) -> str:
+        return str(self._client_identity().get("id") or self.client_address[0])
+
+    def _send_proxy_auth_required(self, settings, *, error: str | None = None):
+        realm = sanitize_http_header_value(str((settings or {}).get("realm") or DEFAULT_CLIENT_AUTH_REALM))
+        body = b"Proxy authentication required\n"
+        if error:
+            body = f"{error}\n".encode("utf-8")
+        self._send_body_response(
+            407,
+            "Proxy Authentication Required",
+            body,
+            content_type="text/plain; charset=utf-8",
+            extra_headers={"Proxy-Authenticate": f'Basic realm="{realm}"'},
+        )
+
+    def _authenticate_http_client(self) -> bool:
+        settings = self.server.router_config.client_auth_settings()
+        if not settings.get("enabled", False):
+            self._proxy_client_identity = self._anonymous_client_identity()
+            return True
+
+        header = str(self.headers.get("Proxy-Authorization") or "").strip()
+        if not header:
+            if settings.get("allow_anonymous", True):
+                self._proxy_client_identity = self._anonymous_client_identity()
+                return True
+            self._send_proxy_auth_required(settings)
+            return False
+
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "basic" or not token.strip():
+            self._send_proxy_auth_required(settings, error="Unsupported proxy authentication scheme")
+            return False
+        try:
+            decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            self._send_proxy_auth_required(settings, error="Invalid proxy authentication credentials")
+            return False
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            self._send_proxy_auth_required(settings, error="Invalid proxy authentication credentials")
+            return False
+
+        try:
+            authenticated = authenticate_client_auth_credentials(settings, username, password)
+        except ValueError:
+            authenticated = None
+        if authenticated is None:
+            self._send_proxy_auth_required(settings, error="Invalid proxy authentication credentials")
+            return False
+
+        self._proxy_client_identity = {
+            "id": authenticated["id"],
+            "ip": self.client_address[0],
+            "auth_type": "basic",
+            "username": authenticated["username"],
+            "label": authenticated["label"],
+        }
+        return True
+
     def do_CONNECT(self):
         if not self._check_client_allowed():
             return
@@ -427,6 +505,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return
             if self._is_client_portal_connect_target(host, port):
                 self._handle_client_portal_connect_request(host, port)
+                return
+            if not self._authenticate_http_client():
                 return
             if not self._check_client_traffic_limit(
                 method="CONNECT",
@@ -488,7 +568,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.server.runtime.record_usage(
                     proxy_label=self.server.proxy_label,
                     kind="connect",
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     destination=f"{host}:{port}",
                     uploaded_bytes=stats["left_to_right_bytes"],
                     downloaded_bytes=stats["right_to_left_bytes"],
@@ -678,7 +762,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.server.runtime.record_failure(
                     proxy_label="https",
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     method="CONNECT",
                     destination=f"{host}:{port}",
                     host=None,
@@ -743,7 +831,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.server.runtime.record_failure(
                     proxy_label="https",
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     method="CONNECT",
                     destination=f"{host}:{port}",
                     host=host,
@@ -761,7 +853,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 host,
                 source="intercept",
             )
-            intercepted_server = InterceptedHTTPSProtocolView(self.server)
+            intercepted_server = InterceptedHTTPSProtocolView(
+                self.server,
+                client_identity=self._client_identity(),
+            )
             InterceptedHTTPSRequestHandler(tls_connection, self.client_address, intercepted_server)
             duration_ms = int((time.monotonic() - request_started) * 1000)
             self._debug(f"HTTPS interception session closed target={host}:{port} duration_ms={duration_ms}")
@@ -770,7 +865,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._debug(message, level="WARNING")
             self.server.runtime.record_failure(
                 proxy_label="https",
-                client=self.client_address[0],
+                client=self._client_id(),
+                client_ip=self.client_address[0],
+                client_auth_type=self._client_identity().get("auth_type"),
+                client_auth_username=self._client_identity().get("username"),
+                client_auth_label=self._client_identity().get("label"),
                 method="CONNECT",
                 destination=f"{host}:{port}",
                 host=host,
@@ -976,7 +1075,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         return False
 
     def _check_client_traffic_limit(self, *, method: str, destination: str, host: str | None, port: int | None) -> bool:
-        evaluation = self.server.runtime.traffic_quota_manager.evaluate_client(self.client_address[0], self.server.router_config)
+        evaluation = self.server.runtime.traffic_quota_manager.evaluate_client(self._client_id(), self.server.router_config)
         if evaluation["allowed"]:
             return True
 
@@ -1007,7 +1106,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         )
         self.server.runtime.record_failure(
             proxy_label=self.server.proxy_label,
-            client=self.client_address[0],
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
             method=method,
             destination=destination,
             host=host,
@@ -1022,7 +1125,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         if method != "CONNECT" and self._prefers_html_error_response():
             document = render_client_traffic_limit_html(
-                client_ip=self.client_address[0],
+                client_ip=self._client_id(),
                 evaluation=evaluation,
                 destination=destination,
             )
@@ -1054,6 +1157,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             scheme, host, port, target_path = self._extract_target()
             destination = build_request_destination(scheme, host, port, target_path)
             if self._handle_client_portal_request(scheme, host, port, target_path):
+                return
+            if not self._authenticate_http_client():
                 return
             if not self._check_client_traffic_limit(
                 method=self.command,
@@ -1278,7 +1383,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         log_event(self.server.proxy_label, log_message)
         self.server.runtime.record_failure(
             proxy_label=self.server.proxy_label,
-            client=self.client_address[0],
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
             method=method,
             destination=destination,
             host=host,
@@ -1471,7 +1580,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if response.status == 403:
                 self.server.runtime.record_failure(
                     proxy_label=self.server.proxy_label,
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     method=method,
                     destination=target_description,
                     host=target_host,
@@ -1515,7 +1628,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.server.runtime.record_usage(
                 proxy_label=self.server.proxy_label,
                 kind=kind,
-                client=self.client_address[0],
+                client=self._client_id(),
+                client_ip=self.client_address[0],
+                client_auth_type=self._client_identity().get("auth_type"),
+                client_auth_username=self._client_identity().get("username"),
+                client_auth_label=self._client_identity().get("label"),
                 destination=target_description,
                 uploaded_bytes=request_body_bytes,
                 downloaded_bytes=bytes_written,
@@ -1560,7 +1677,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         )
         self.server.runtime.record_failure(
             proxy_label=self.server.proxy_label,
-            client=self.client_address[0],
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
             method=method,
             destination=destination,
             host=host,
@@ -1708,6 +1829,71 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         if self.server.debug:
             debug_log(self.server.proxy_label, f"{self._client_label()} - {message}", level=level)
 
+    def _anonymous_client_identity(self):
+        return {
+            "id": self.client_address[0],
+            "ip": self.client_address[0],
+            "auth_type": "anonymous",
+            "username": None,
+            "label": "",
+        }
+
+    def _client_identity(self):
+        return getattr(self, "_proxy_client_identity", None) or self._anonymous_client_identity()
+
+    def _client_id(self) -> str:
+        return str(self._client_identity().get("id") or self.client_address[0])
+
+    def _negotiate_authentication(self, methods: bytes) -> bool:
+        settings = self.server.router_config.client_auth_settings()
+        methods_set = set(methods)
+        if not settings.get("enabled", False):
+            if SOCKS_AUTH_NO_AUTH not in methods_set:
+                self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
+                return False
+            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
+            self._proxy_client_identity = self._anonymous_client_identity()
+            return True
+
+        if SOCKS_AUTH_USERNAME_PASSWORD in methods_set:
+            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_USERNAME_PASSWORD]))
+            return self._authenticate_username_password()
+
+        if settings.get("allow_anonymous", True) and SOCKS_AUTH_NO_AUTH in methods_set:
+            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
+            self._proxy_client_identity = self._anonymous_client_identity()
+            return True
+
+        self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
+        return False
+
+    def _authenticate_username_password(self) -> bool:
+        settings = self.server.router_config.client_auth_settings()
+        version = self._read_exact(1)[0]
+        if version != 0x01:
+            self.request.sendall(bytes([0x01, 0x01]))
+            return False
+        username_length = self._read_exact(1)[0]
+        try:
+            username = self._read_exact(username_length).decode("utf-8", errors="strict")
+            password_length = self._read_exact(1)[0]
+            password = self._read_exact(password_length).decode("utf-8", errors="strict")
+            authenticated = authenticate_client_auth_credentials(settings, username, password)
+        except (UnicodeDecodeError, ValueError):
+            authenticated = None
+        if authenticated is None:
+            self.request.sendall(bytes([0x01, 0x01]))
+            return False
+        self._proxy_client_identity = {
+            "id": authenticated["id"],
+            "ip": self.client_address[0],
+            "auth_type": "socks5",
+            "username": authenticated["username"],
+            "label": authenticated["label"],
+        }
+        self.request.sendall(bytes([0x01, 0x00]))
+        return True
+
     def handle(self):
         client_ip = self.client_address[0]
         self.server.client_tracker.connected(client_ip)
@@ -1730,11 +1916,8 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             methods_count = self._read_exact(1)[0]
             methods = self._read_exact(methods_count)
             self._debug(f"handshake methods={list(methods)}")
-            if 0 not in methods:
-                self.request.sendall(bytes([SOCKS_VERSION, 0xFF]))
+            if not self._negotiate_authentication(methods):
                 return
-
-            self.request.sendall(bytes([SOCKS_VERSION, 0x00]))
 
             version, command, _, address_type = self._read_exact(4)
             if version != SOCKS_VERSION:
@@ -1746,13 +1929,17 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             destination_host = self._read_destination_host(address_type)
             destination_port = int.from_bytes(self._read_exact(2), "big")
             quota_evaluation = self.server.runtime.traffic_quota_manager.evaluate_client(
-                self.client_address[0], self.server.router_config
+                self._client_id(), self.server.router_config
             )
             if not quota_evaluation["allowed"]:
                 message = build_client_traffic_limit_message(quota_evaluation)
                 self.server.runtime.record_failure(
                     proxy_label=self.server.proxy_label,
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     method="CONNECT",
                     destination=f"{destination_host}:{destination_port}",
                     host=destination_host,
@@ -1838,7 +2025,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     context = "router block rule"
                 self.server.runtime.record_failure(
                     proxy_label=self.server.proxy_label,
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     method="CONNECT",
                     destination=f"{destination_host}:{destination_port}",
                     host=destination_host,
@@ -1877,7 +2068,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 self.server.runtime.record_usage(
                     proxy_label=self.server.proxy_label,
                     kind="connect",
-                    client=self.client_address[0],
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
                     destination=f"{destination_host}:{destination_port}",
                     uploaded_bytes=stats["left_to_right_bytes"],
                     downloaded_bytes=stats["right_to_left_bytes"],
@@ -1910,7 +2105,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             )
             self.server.runtime.record_failure(
                 proxy_label=self.server.proxy_label,
-                client=self.client_address[0],
+                client=self._client_id(),
+                client_ip=self.client_address[0],
+                client_auth_type=self._client_identity().get("auth_type"),
+                client_auth_username=self._client_identity().get("username"),
+                client_auth_label=self._client_identity().get("label"),
                 method="CONNECT",
                 destination=(
                     f"{destination_host}:{destination_port}"
