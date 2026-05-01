@@ -73,6 +73,13 @@ def can_retry_http_request(method: str, body) -> bool:
     return body in {None, b""}
 
 
+def is_loopback_client_ip(value) -> bool:
+    try:
+        return ipaddress.ip_address(str(value)).is_loopback
+    except ValueError:
+        return False
+
+
 def default_upstream_retry_policy():
     return {
         "enabled": True,
@@ -558,6 +565,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.server.client_tracker.reidentified(previous_client, next_client)
             self._dashboard_client_id = next_client
 
+    def _is_local_client(self) -> bool:
+        return is_loopback_client_ip(self.client_address[0])
+
     def _build_http_basic_identity(self, settings):
         header = str(self.headers.get("Proxy-Authorization") or "").strip()
         if not header:
@@ -612,6 +622,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _authenticate_http_client(self) -> bool:
         settings = self.server.router_config.client_auth_settings()
         if not settings.get("enabled", False):
+            self._set_client_identity(self._anonymous_client_identity())
+            return True
+
+        if self._is_local_client():
             self._set_client_identity(self._anonymous_client_identity())
             return True
 
@@ -671,14 +685,28 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return
             if not self._authenticate_http_client():
                 return
-            if not self._check_client_traffic_limit(
-                method="CONNECT",
-                destination=f"{host}:{port}",
-                host=host,
-                port=port,
-            ):
-                return
-            route_decision = self._resolve_route(host, port)
+            https_interception_settings = self.server.router_config.https_interception_settings()
+            intercept_https = should_intercept_https_connect(https_interception_settings, host, port)
+            adaptive_bypass = None
+            if intercept_https:
+                adaptive_bypass = self.server.runtime.https_interception_adaptive_bypass(
+                    self.client_address[0],
+                    host,
+                    https_interception_settings,
+                )
+            if not (intercept_https and adaptive_bypass is None):
+                if not self._check_client_traffic_limit(
+                    method="CONNECT",
+                    destination=f"{host}:{port}",
+                    host=host,
+                    port=port,
+                ):
+                    return
+            route_decision = self._resolve_route(
+                host,
+                port,
+                apply_auto_proxy_probe=not (intercept_https and adaptive_bypass is None),
+            )
             self._debug(f"request-line={truncate_for_log(self.requestline)}")
             self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             self._log_http_event(f"CONNECT {host}:{port} via {route_decision['route_label']}")
@@ -691,13 +719,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_decision=route_decision,
                 )
                 return
-            https_interception_settings = self.server.router_config.https_interception_settings()
-            if should_intercept_https_connect(https_interception_settings, host, port):
-                adaptive_bypass = self.server.runtime.https_interception_adaptive_bypass(
-                    self.client_address[0],
-                    host,
-                    https_interception_settings,
-                )
+            if intercept_https:
                 if adaptive_bypass is None:
                     self._handle_intercepted_connect(host, port, route_decision, request_started=request_started)
                     return
@@ -820,10 +842,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _build_client_traffic_limit_headers(self, evaluation, message: str) -> dict[str, str]:
+        quota_url = self.server.runtime.self_endpoints.client_portal_quota_url()
         headers = {
             "X-Proxy-Error": "client-traffic-limit",
             "X-Proxy-Error-Message": sanitize_http_header_value(message),
             "X-Proxy-Client": self.client_address[0],
+            "X-Proxy-Quota-Url": quota_url,
+            "Link": f"<{quota_url}>; rel=\"help\"",
         }
         retry_after_seconds = evaluation.get("retry_after_seconds")
         if retry_after_seconds is not None:
@@ -1117,6 +1142,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         html_paths = {"/", "/index.html", "/client", "/client/"}
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
         live_paths = {"/api/client/live", "/client.live"}
+        quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
         ca_check_paths = {"/ca-check", "/ca-check/"}
@@ -1199,7 +1225,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
             return True
 
-        if route_path not in html_paths and route_path not in json_paths:
+        if route_path not in html_paths and route_path not in json_paths and route_path not in quota_paths:
             if is_alias_host:
                 self._send_body_response(
                     404,
@@ -1216,6 +1242,25 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             range_key=range_key,
             client_ip=self.client_address[0],
         )
+        if route_path in quota_paths:
+            self._log_http_event(f"served client quota page {route_path} for {self.client_address[0]}")
+            quota = payload.get("quota") or {}
+            if quota.get("limit") and not quota.get("allowed", True):
+                document = render_client_traffic_limit_html(
+                    client_ip=portal_client_id,
+                    evaluation=quota,
+                    destination="Current client",
+                )
+            else:
+                document = render_client_portal_html(payload)
+            self._send_body_response(
+                200,
+                "OK",
+                document.encode("utf-8"),
+                content_type="text/html; charset=utf-8",
+            )
+            return True
+
         self._log_http_event(f"served client portal {route_path} for {self.client_address[0]}")
         if route_path in json_paths or str(first_query_value(query, "format") or "").strip().lower() == "json":
             self._send_json_response(payload)
@@ -1516,7 +1561,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             body_length,
         )
 
-    def _resolve_route(self, host: str, port: int):
+    def _resolve_route(self, host: str, port: int, *, apply_auto_proxy_probe: bool = True):
         self_target_kind = self.server.runtime.self_endpoints.resolve_target_kind(host, port)
         if self_target_kind == "dashboard":
             route_decision = {
@@ -1553,7 +1598,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return route_decision
 
         route_decision = self.server.router_config.decide(host)
-        route_decision = self.server.runtime.apply_auto_proxy_probe_route(host, route_decision)
+        if apply_auto_proxy_probe:
+            route_decision = self.server.runtime.apply_auto_proxy_probe_route(host, route_decision)
         matched_rule = route_decision["matched_rule"]
         route_decision["connect_host"] = host
         route_decision["connect_port"] = port
@@ -2385,6 +2431,9 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             self.server.client_tracker.reidentified(previous_client, next_client)
             self._dashboard_client_id = next_client
 
+    def _is_local_client(self) -> bool:
+        return is_loopback_client_ip(self.client_address[0])
+
     def _negotiate_authentication(self, methods: bytes) -> bool:
         settings = self.server.router_config.client_auth_settings()
         methods_set = set(methods)
@@ -2392,6 +2441,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             if SOCKS_AUTH_NO_AUTH not in methods_set:
                 self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
                 return False
+            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
+            self._set_client_identity(self._anonymous_client_identity())
+            return True
+
+        if self._is_local_client() and SOCKS_AUTH_NO_AUTH in methods_set:
             self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
             self._set_client_identity(self._anonymous_client_identity())
             return True
@@ -2885,7 +2939,12 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
         )
     retry_after_text = format_duration_seconds(evaluation.get("retry_after_seconds"))
     limit_note = html.escape(limit.get("note", "")) if limit.get("note") else ""
-    limit_scope = "Default quota" if limit.get("scope") == "default" else "Custom quota"
+    if limit.get("scope") == "default":
+        limit_scope = "Default quota"
+    elif limit.get("scope") == "default_authenticated":
+        limit_scope = "Authenticated default quota"
+    else:
+        limit_scope = "Custom quota"
     portal_url = html.escape(f"http://{CLIENT_PORTAL_PRIMARY_HOST}/")
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -3379,6 +3438,8 @@ def render_client_portal_html(snapshot) -> str:
         limit_scope = "Exempt device"
     elif limit.get("scope") == "default":
         limit_scope = "Default quota"
+    elif limit.get("scope") == "default_authenticated":
+        limit_scope = "Authenticated default quota"
     elif limit.get("scope") == "custom":
         limit_scope = "Custom quota"
     limit_scope = html.escape(limit_scope)
@@ -3537,6 +3598,7 @@ def render_client_portal_html(snapshot) -> str:
         const limit = quota && quota.limit ? quota.limit : {};
         if (quota && quota.exempt) return "Exempt device";
         if (limit.scope === "default") return "Default quota";
+        if (limit.scope === "default_authenticated") return "Authenticated default quota";
         if (limit.scope === "custom") return "Custom quota";
         return "No quota";
       }

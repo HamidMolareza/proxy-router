@@ -819,6 +819,9 @@ class SelfEndpoints:
     def client_portal_url(self) -> str:
         return f"http://{self.client_portal_primary_host}/"
 
+    def client_portal_quota_url(self) -> str:
+        return f"http://{self.client_portal_primary_host}/quota"
+
     def client_portal_ca_install_url(self) -> str:
         return f"http://{self.client_portal_primary_host}/ca"
 

@@ -653,6 +653,11 @@ function normalizeRouterConfig(config) {
     source.default_client_traffic_limit && typeof source.default_client_traffic_limit === 'object'
       ? source.default_client_traffic_limit
       : {}
+  const defaultAuthenticatedClientTrafficLimit =
+    source.default_authenticated_client_traffic_limit &&
+    typeof source.default_authenticated_client_traffic_limit === 'object'
+      ? source.default_authenticated_client_traffic_limit
+      : {}
   const defaultRoutingTarget = normalizeRoutingTarget(source)
 
   return {
@@ -663,6 +668,12 @@ function normalizeRouterConfig(config) {
       max_past_hour_mb: normalizeOptionalLimitMb(defaultClientTrafficLimit.max_past_hour_mb),
       max_past_3h_mb: normalizeOptionalLimitMb(defaultClientTrafficLimit.max_past_3h_mb),
       note: String(defaultClientTrafficLimit.note || ''),
+    },
+    default_authenticated_client_traffic_limit: {
+      enabled: Boolean(defaultAuthenticatedClientTrafficLimit.enabled),
+      max_past_hour_mb: normalizeOptionalLimitMb(defaultAuthenticatedClientTrafficLimit.max_past_hour_mb),
+      max_past_3h_mb: normalizeOptionalLimitMb(defaultAuthenticatedClientTrafficLimit.max_past_3h_mb),
+      note: String(defaultAuthenticatedClientTrafficLimit.note || ''),
     },
     client_traffic_limits: (Array.isArray(source.client_traffic_limits) ? source.client_traffic_limits : []).map(
       (limit) => ({
@@ -1496,6 +1507,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const clientAuth = config.client_auth || { credentials: [] }
   const enabledAuthCredentials = (clientAuth.credentials || []).filter((credential) => credential.enabled).length
   const defaultClientLimit = config.default_client_traffic_limit || {}
+  const defaultAuthenticatedClientLimit = config.default_authenticated_client_traffic_limit || {}
   const autoProxyStatus = config.auto_proxy_failures.enabled ? AUTO_PROXY_POLICY_LABEL : 'Disabled'
   const runtime = currentRouterRuntime(snapshot)
   const activeProfile = runtime.active_profile || {}
@@ -1518,6 +1530,11 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const defaultClientLimitLabel = defaultClientLimit.enabled
     ? `1h ${defaultClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${defaultClientLimit.max_past_3h_mb ?? 'none'}MB`
     : 'Disabled'
+  const defaultAuthenticatedClientLimitLabel = defaultAuthenticatedClientLimit.enabled
+    ? `1h ${defaultAuthenticatedClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${
+        defaultAuthenticatedClientLimit.max_past_3h_mb ?? 'none'
+      }MB`
+    : 'Uses default quota'
   const clientAuthLabel = clientAuth.enabled
     ? `${clientAuth.allow_anonymous ? 'Optional' : 'Required'} · ${enabledAuthCredentials}/${clientAuth.credentials.length} credentials`
     : 'Disabled'
@@ -1539,6 +1556,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Auto proxy', autoProxyStatus],
     ['Proxy auth', clientAuthLabel],
     ['Default quota', defaultClientLimitLabel],
+    ['Auth quota', defaultAuthenticatedClientLimitLabel],
     ['Client limits', `${enabledClientLimits}/${config.client_traffic_limits.length}`],
     ['Exemptions', `${enabledClientExemptions}/${config.client_traffic_exemptions.length}`],
     ['Ignored domains', String(getEffectiveEditorIgnoredDomains(config, profileId).length)],
@@ -4275,7 +4293,8 @@ function App() {
                 </label>
               </div>
               <div className={noteClass}>
-                Leave anonymous enabled when some devices or apps cannot send proxy credentials.
+                Loopback clients from this machine can still connect without credentials when anonymous devices are
+                disabled. Other devices must authenticate unless anonymous access is enabled.
               </div>
 
               <div className={tableWrapClass}>
@@ -4362,7 +4381,7 @@ function App() {
                 </table>
               </div>
 
-              <div className={noteClass}>Default traffic quota for all devices</div>
+              <div className={noteClass}>General default traffic quota</div>
               <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                 <input
                   className={cx(routerHasLocalChanges && dirtyInputClass)}
@@ -4374,7 +4393,7 @@ function App() {
                     setLocalRouterConfig(nextConfig)
                   }}
                 />
-                <span>Enable default quota for every device</span>
+                <span>Enable general default quota</span>
               </label>
               <div className={fieldGridClass}>
                 <label className={fieldClass}>
@@ -4428,7 +4447,76 @@ function App() {
               </div>
 
               <div className={noteClass}>
-                Custom client identity, IP, or CIDR limits override the default. Exemptions override both limits.
+                Authenticated users can have a separate default. When it is disabled, they use the general default
+                quota.
+              </div>
+
+              <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
+                <input
+                  className={cx(routerHasLocalChanges && dirtyInputClass)}
+                  type="checkbox"
+                  checked={currentRouterConfig.default_authenticated_client_traffic_limit.enabled}
+                  onChange={(event) => {
+                    const nextConfig = cloneJson(currentRouterConfig)
+                    nextConfig.default_authenticated_client_traffic_limit.enabled = event.target.checked
+                    setLocalRouterConfig(nextConfig)
+                  }}
+                />
+                <span>Enable separate default quota for authenticated users</span>
+              </label>
+              <div className={fieldGridClass}>
+                <label className={fieldClass}>
+                  <span>Auth last hour (MB)</span>
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="number"
+                    min="1"
+                    value={currentRouterConfig.default_authenticated_client_traffic_limit.max_past_hour_mb ?? ''}
+                    placeholder="3000"
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.default_authenticated_client_traffic_limit.max_past_hour_mb = normalizeOptionalLimitMb(
+                        event.target.value,
+                      )
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                </label>
+                <label className={fieldClass}>
+                  <span>Auth last 3h (MB)</span>
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="number"
+                    min="1"
+                    value={currentRouterConfig.default_authenticated_client_traffic_limit.max_past_3h_mb ?? ''}
+                    placeholder="7500"
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.default_authenticated_client_traffic_limit.max_past_3h_mb = normalizeOptionalLimitMb(
+                        event.target.value,
+                      )
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                </label>
+                <label className={fieldClass}>
+                  <span>Auth note</span>
+                  <input
+                    className={cx(routerHasLocalChanges && dirtyInputClass)}
+                    type="text"
+                    value={currentRouterConfig.default_authenticated_client_traffic_limit.note || ''}
+                    placeholder="optional note"
+                    onChange={(event) => {
+                      const nextConfig = cloneJson(currentRouterConfig)
+                      nextConfig.default_authenticated_client_traffic_limit.note = event.target.value
+                      setLocalRouterConfig(nextConfig)
+                    }}
+                  />
+                </label>
+              </div>
+
+              <div className={noteClass}>
+                Custom client identity, IP, or CIDR limits override defaults. Exemptions override all limits.
               </div>
 
               <div className={cx(panelHeaderClass, 'mt-4')}>

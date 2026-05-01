@@ -188,11 +188,12 @@ Current dashboard behaviors:
 
 ## Quotas
 
-- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally.
+- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
 - The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
 - Client limit and exemption targets can be `user:<username>`, a single IP address, or a CIDR range.
-- Specific client limits override the default client quota.
+- The general default quota applies to anonymous clients and to authenticated clients unless a separate authenticated default quota is enabled.
+- Specific client limits override both default quotas.
 - Exemptions override both custom and default limits.
 - Exemptions support permanent and timed entries such as `2h`.
 
@@ -203,9 +204,10 @@ When a client exceeds quota:
 
 Response behavior:
 
-- Browser-style HTTP requests receive an HTML response page
-- CONNECT/HTTPS quota rejections return `429 Client Traffic Limit Reached` with `Retry-After` and `X-Proxy-Error*` headers plus a plain-text body
-- Some browsers and apps still show a generic tunnel failure for rejected CONNECT requests because HTTPS proxy CONNECT does not have a normal user-visible HTML error page
+- Browser-style HTTP requests receive an HTML response page. The same quota page is available through the proxy at `http://proxy.router/quota`.
+- HTTPS page requests can show the same message when HTTPS interception is active and the client trusts the proxy-router CA.
+- Raw CONNECT/HTTPS quota rejections return `429 Client Traffic Limit Reached` with `Retry-After`, `X-Proxy-Error*`, and `X-Proxy-Quota-Url` headers plus a plain-text body.
+- Some browsers and apps still show a generic tunnel failure for raw CONNECT requests because HTTPS proxy CONNECT does not have a normal user-visible HTML error page.
 - SOCKS5 traffic still uses standard SOCKS5 rejection codes without a text body
 - Devices can still open the self-service portal at `http://proxy.router/` even while quota-blocked, because that page is served locally by the proxy
 
@@ -250,7 +252,7 @@ docs/                      supporting project documentation
 
 - Binding to `0.0.0.0` exposes the listener to any reachable device unless you restrict clients.
 - On shared networks, use `--allow-client` whenever possible.
-- Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected.
+- Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected; loopback clients on the proxy host are always exempt for local workflows.
 - Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; do not commit runtime config or data files.
 - HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust are temporarily bypassed after TLS trust failures and can also use manual bypass patterns or SOCKS5.
 - Intercepted HTTPS analyzer records include redacted headers and bounded text body previews. Sensitive headers and token-like text fields are redacted, common compressed bodies are decoded for preview when possible, binary bodies are omitted, and previews are truncated, but the log can still contain private application data.

@@ -601,6 +601,12 @@ class RouterConfigManager:
                     default_router_config()["default_client_traffic_limit"],
                 )
             )
+            default_authenticated_limit = dict(
+                self._config.get(
+                    "default_authenticated_client_traffic_limit",
+                    default_router_config()["default_authenticated_client_traffic_limit"],
+                )
+            )
 
         matched_exemption = None
         matched_specificity = -1
@@ -637,11 +643,16 @@ class RouterConfigManager:
                 matched_specificity = specificity
 
         if matched_limit is None:
-            if not default_limit.get("enabled", False):
+            if str(client_ip or "").startswith("user:") and default_authenticated_limit.get("enabled", False):
+                matched_limit = default_authenticated_limit
+                matched_limit["scope"] = "default_authenticated"
+                matched_limit["target"] = "authenticated users"
+            elif default_limit.get("enabled", False):
+                matched_limit = default_limit
+                matched_limit["scope"] = "default"
+                matched_limit["target"] = "all devices"
+            else:
                 return None
-            matched_limit = default_limit
-            matched_limit["scope"] = "default"
-            matched_limit["target"] = "all devices"
         else:
             matched_limit["scope"] = "custom"
             matched_limit["target"] = matched_limit.get("client")

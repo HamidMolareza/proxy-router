@@ -565,6 +565,33 @@ def validate_traffic_limit_definition(
         )
 
 
+def normalize_default_traffic_limit(payload, *, default_payload, config_key: str):
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"router {config_key} must be an object")
+
+    normalized = {
+        "enabled": bool(payload.get("enabled", default_payload["enabled"])),
+        "max_past_hour_mb": normalize_traffic_limit_mb(
+            payload.get("max_past_hour_mb", default_payload["max_past_hour_mb"]),
+            field_name=f"router {config_key} max_past_hour_mb",
+        ),
+        "max_past_3h_mb": normalize_traffic_limit_mb(
+            payload.get("max_past_3h_mb", default_payload["max_past_3h_mb"]),
+            field_name=f"router {config_key} max_past_3h_mb",
+        ),
+        "note": str(payload.get("note", default_payload["note"])).strip(),
+    }
+    validate_traffic_limit_definition(
+        enabled=normalized["enabled"],
+        max_past_hour_mb=normalized["max_past_hour_mb"],
+        max_past_3h_mb=normalized["max_past_3h_mb"],
+        field_prefix=f"router {config_key}",
+    )
+    return normalized
+
+
 def parse_client_traffic_exemption_duration(value: str | None, *, field_name: str) -> timedelta | None:
     normalized = str(value or "").strip().lower()
     if normalized == "always":
@@ -671,6 +698,12 @@ def default_router_config():
         "default_action": routing_defaults["default_action"],
         "ignored_failure_hosts": list(routing_defaults["ignored_failure_hosts"]),
         "default_client_traffic_limit": {
+            "enabled": False,
+            "max_past_hour_mb": None,
+            "max_past_3h_mb": None,
+            "note": "",
+        },
+        "default_authenticated_client_traffic_limit": {
             "enabled": False,
             "max_past_hour_mb": None,
             "max_past_3h_mb": None,
@@ -854,10 +887,9 @@ def normalize_router_config(payload):
         raise ValueError("router https_interception must be an object")
 
     default_client_traffic_limit_payload = payload.get("default_client_traffic_limit") or {}
-    if default_client_traffic_limit_payload is None:
-        default_client_traffic_limit_payload = {}
-    if not isinstance(default_client_traffic_limit_payload, dict):
-        raise ValueError("router default_client_traffic_limit must be an object")
+    default_authenticated_client_traffic_limit_payload = (
+        payload.get("default_authenticated_client_traffic_limit") or {}
+    )
 
     client_auth_payload = payload.get("client_auth") or {}
     if client_auth_payload is None:
@@ -950,39 +982,15 @@ def normalize_router_config(payload):
     if upstream_retry_max_delay_seconds < upstream_retry_initial_delay_seconds:
         raise ValueError("router upstream_retry max_delay_seconds must be greater than or equal to initial_delay_seconds")
 
-    normalized_default_client_traffic_limit = {
-        "enabled": bool(
-            default_client_traffic_limit_payload.get(
-                "enabled",
-                default_config["default_client_traffic_limit"]["enabled"],
-            )
-        ),
-        "max_past_hour_mb": normalize_traffic_limit_mb(
-            default_client_traffic_limit_payload.get(
-                "max_past_hour_mb",
-                default_config["default_client_traffic_limit"]["max_past_hour_mb"],
-            ),
-            field_name="router default_client_traffic_limit max_past_hour_mb",
-        ),
-        "max_past_3h_mb": normalize_traffic_limit_mb(
-            default_client_traffic_limit_payload.get(
-                "max_past_3h_mb",
-                default_config["default_client_traffic_limit"]["max_past_3h_mb"],
-            ),
-            field_name="router default_client_traffic_limit max_past_3h_mb",
-        ),
-        "note": str(
-            default_client_traffic_limit_payload.get(
-                "note",
-                default_config["default_client_traffic_limit"]["note"],
-            )
-        ).strip(),
-    }
-    validate_traffic_limit_definition(
-        enabled=normalized_default_client_traffic_limit["enabled"],
-        max_past_hour_mb=normalized_default_client_traffic_limit["max_past_hour_mb"],
-        max_past_3h_mb=normalized_default_client_traffic_limit["max_past_3h_mb"],
-        field_prefix="router default_client_traffic_limit",
+    normalized_default_client_traffic_limit = normalize_default_traffic_limit(
+        default_client_traffic_limit_payload,
+        default_payload=default_config["default_client_traffic_limit"],
+        config_key="default_client_traffic_limit",
+    )
+    normalized_default_authenticated_client_traffic_limit = normalize_default_traffic_limit(
+        default_authenticated_client_traffic_limit_payload,
+        default_payload=default_config["default_authenticated_client_traffic_limit"],
+        config_key="default_authenticated_client_traffic_limit",
     )
 
     client_auth_credentials_payload = client_auth_payload.get("credentials") or []
@@ -1141,6 +1149,7 @@ def normalize_router_config(payload):
         "default_action": normalized_routing_defaults["default_action"],
         "ignored_failure_hosts": normalized_routing_defaults["ignored_failure_hosts"],
         "default_client_traffic_limit": normalized_default_client_traffic_limit,
+        "default_authenticated_client_traffic_limit": normalized_default_authenticated_client_traffic_limit,
         "client_auth": {
             "enabled": bool(client_auth_payload.get("enabled", default_config["client_auth"]["enabled"])),
             "allow_anonymous": bool(
