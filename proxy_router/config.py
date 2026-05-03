@@ -403,6 +403,14 @@ class RouterConfigManager:
         if len(config["client_traffic_exemptions"]) != len(self._config.get("client_traffic_exemptions", [])):
             expired_found = True
 
+        config["client_blocks"] = [
+            block
+            for block in config.get("client_blocks", [])
+            if not is_client_block_expired(block, now=now)
+        ]
+        if len(config["client_blocks"]) != len(self._config.get("client_blocks", [])):
+            expired_found = True
+
         if not expired_found:
             return False
 
@@ -664,6 +672,34 @@ class RouterConfigManager:
             matched_limit.get("max_past_3h_mb")
         )
         return matched_limit
+
+    def find_client_block(self, client_id: str):
+        with self._lock:
+            self._prune_expired_rules_locked()
+            configured_blocks = list(self._config.get("client_blocks", []))
+
+        matched_block = None
+        matched_specificity = -1
+        for block in configured_blocks:
+            if not block.get("enabled", True):
+                continue
+            target = block.get("client")
+            if not target or not client_ip_matches_limit_target(client_id, target):
+                continue
+
+            specificity = client_limit_target_specificity(target)
+            if specificity > matched_specificity:
+                matched_block = dict(block)
+                matched_specificity = specificity
+
+        if matched_block is None:
+            return None
+
+        matched_block["scope"] = "blocked"
+        matched_block["target"] = matched_block.get("client")
+        matched_block["blocked"] = True
+        matched_block["remaining_seconds"] = client_block_remaining_seconds(matched_block)
+        return matched_block
 
     def auto_proxy_failure_settings(self):
         with self._lock:

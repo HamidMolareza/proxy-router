@@ -677,6 +677,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         request_started = time.monotonic()
         try:
             host, port = split_host_port(self.path, 443)
+            if self._drop_blocked_client(
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                client_id=self.client_address[0],
+            ):
+                return
             if self._is_client_portal_https_trust_check_target(host, port):
                 self._handle_client_portal_https_request(host, port, request_started=request_started)
                 return
@@ -684,6 +692,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self._handle_client_portal_connect_request(host, port)
                 return
             if not self._authenticate_http_client():
+                return
+            if self._drop_blocked_client(
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+            ):
                 return
             https_interception_settings = self.server.router_config.https_interception_settings()
             intercept_https = should_intercept_https_connect(https_interception_settings, host, port)
@@ -1154,6 +1169,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
         self._apply_optional_http_client_identity()
         portal_client_id = self._client_id()
+        portal_destination = build_request_destination(scheme, host, port, target_path)
+        if self._drop_blocked_client(
+            method=self.command,
+            destination=portal_destination,
+            host=host,
+            port=port,
+        ):
+            return True
         if route_path in live_paths:
             if not self._is_websocket_upgrade():
                 self._send_body_response(
@@ -1359,6 +1382,56 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             extra_headers=extra_headers,
         )
 
+    def _silently_close_connection(self):
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+    def _drop_blocked_client(
+        self,
+        *,
+        method: str,
+        destination: str,
+        host: str | None,
+        port: int | None,
+        client_id: str | None = None,
+    ) -> bool:
+        resolved_client_id = str(client_id or self._client_id())
+        block = self.server.router_config.find_client_block(resolved_client_id)
+        if block is None:
+            return False
+
+        target_label = block.get("target", resolved_client_id)
+        log_event(
+            self.server.proxy_label,
+            f"{self._client_label()} - silently blocked client {target_label} for {destination}",
+        )
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=resolved_client_id,
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method=method,
+            destination=destination,
+            host=host,
+            port=port,
+            error=f"Client access blocked for target {target_label}.",
+            context="client access block",
+            route_label=CLIENT_BLOCK_ROUTE_LABEL,
+            matched_rule=None,
+            profile_id=DEFAULT_ROUTING_PROFILE_ID,
+        )
+        self._silently_close_connection()
+        return True
+
     def _forward_http_request(self):
         if not self._check_client_allowed():
             return
@@ -1369,9 +1442,24 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._debug(f"request-headers={format_headers_for_log(self.headers)}")
             scheme, host, port, target_path = self._extract_target()
             destination = build_request_destination(scheme, host, port, target_path)
+            if self._drop_blocked_client(
+                method=self.command,
+                destination=destination,
+                host=host,
+                port=port,
+                client_id=self.client_address[0],
+            ):
+                return
             if self._handle_client_portal_request(scheme, host, port, target_path):
                 return
             if not self._authenticate_http_client():
+                return
+            if self._drop_blocked_client(
+                method=self.command,
+                destination=destination,
+                host=host,
+                port=port,
+            ):
                 return
             if not self._check_client_traffic_limit(
                 method=self.command,
@@ -2491,6 +2579,47 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         self.request.sendall(bytes([0x01, 0x00]))
         return True
 
+    def _silently_close_connection(self):
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.request.close()
+        except OSError:
+            pass
+
+    def _drop_blocked_client(self, *, method: str, destination: str, host: str | None, port: int | None) -> bool:
+        resolved_client_id = self._client_id()
+        block = self.server.router_config.find_client_block(resolved_client_id)
+        if block is None:
+            return False
+
+        target_label = block.get("target", resolved_client_id)
+        log_event(
+            self.server.proxy_label,
+            f"{self._client_label()} - silently blocked client {target_label} for {destination}",
+        )
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=resolved_client_id,
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method=method,
+            destination=destination,
+            host=host,
+            port=port,
+            error=f"Client access blocked for target {target_label}.",
+            context="client access block",
+            route_label=CLIENT_BLOCK_ROUTE_LABEL,
+            matched_rule=None,
+            profile_id=DEFAULT_ROUTING_PROFILE_ID,
+        )
+        self._silently_close_connection()
+        return True
+
     def handle(self):
         client_ip = self.client_address[0]
         self._dashboard_client_id = client_ip
@@ -2526,6 +2655,13 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
             destination_host = self._read_destination_host(address_type)
             destination_port = int.from_bytes(self._read_exact(2), "big")
+            if self._drop_blocked_client(
+                method="CONNECT",
+                destination=f"{destination_host}:{destination_port}",
+                host=destination_host,
+                port=destination_port,
+            ):
+                return
             quota_evaluation = self.server.runtime.traffic_quota_manager.evaluate_client(
                 self._client_id(), self.server.router_config
             )
@@ -3422,6 +3558,7 @@ def render_client_portal_html(snapshot) -> str:
     recent_requests = list(snapshot.get("recent_requests") or [])
     recent_failures = list(snapshot.get("recent_failures") or [])
     top_destinations = list(history.get("top_destinations") or [])
+    period_totals = list(history.get("period_totals") or [])
 
     if quota.get("exempt"):
         quota_status_text = "Exempt from quota"
@@ -3482,6 +3619,19 @@ def render_client_portal_html(snapshot) -> str:
             f"<td>{html.escape(state_text)}</td>"
             "</tr>"
         )
+
+    period_rows = []
+    for item in period_totals:
+        period_summary = item.get("summary") or {}
+        period_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(item.get('title') or item.get('key') or 'Period'))}</td>"
+            f"<td>{html.escape(format_mb(int(period_summary.get('total_bytes', 0))))}</td>"
+            f"<td>{html.escape(str(period_summary.get('count') or 0))}</td>"
+            "</tr>"
+        )
+    if not period_rows:
+        period_rows.append('<tr><td colspan="3" class="empty">No usage recorded for this device yet.</td></tr>')
 
     destination_rows = []
     for item in top_destinations:
@@ -3560,7 +3710,11 @@ def render_client_portal_html(snapshot) -> str:
       }
 
       function formatMb(bytes) {
-        return `${(Number(bytes || 0) / 1000000).toFixed(2)} MB`;
+        const valueInMb = Number(bytes || 0) / 1000000;
+        if (valueInMb > 1024) {
+          return `${(valueInMb / 1024).toFixed(2)} GB`;
+        }
+        return `${valueInMb.toFixed(2)} MB`;
       }
 
       function formatDuration(seconds) {
@@ -3666,6 +3820,15 @@ def render_client_portal_html(snapshot) -> str:
 
         const quotaRows = document.getElementById("quota-rows");
         if (quotaRows) quotaRows.innerHTML = renderQuotaRows(quota);
+
+        setRows(
+          "period-rows",
+          (history.period_totals || []).map((item) => {
+            const summary = item.summary || {};
+            return `<tr><td>${escapeHtml(item.title || item.key || "Period")}</td><td>${formatMb(summary.total_bytes)}</td><td>${escapeHtml(summary.count || 0)}</td></tr>`;
+          }),
+          '<tr><td colspan="3" class="empty">No usage recorded for this device yet.</td></tr>',
+        );
 
         setRows(
           "destination-rows",
@@ -4185,6 +4348,27 @@ def render_client_portal_html(snapshot) -> str:
           <div class="label">Last seen</div>
           <div class="value" id="last-seen" style="font-size:1.1rem">{last_seen}</div>
           <div class="sub">Most recent recorded usage</div>
+          </div>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article>
+          <div class="portal-card">
+          <div class="panel-head">
+            <h2>Period usage</h2>
+            <span class="muted">Calendar totals for this device</span>
+          </div>
+          <div class="table-responsive">
+          <table class="table portal-table align-middle">
+            <thead>
+              <tr><th>Period</th><th>Data</th><th>Requests</th></tr>
+            </thead>
+            <tbody id="period-rows">
+              {''.join(period_rows)}
+            </tbody>
+          </table>
+          </div>
           </div>
         </article>
       </section>

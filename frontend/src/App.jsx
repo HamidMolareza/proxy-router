@@ -13,6 +13,7 @@ const TAB_DEFINITIONS = [
   { id: 'history', label: 'History' },
   { id: 'routing', label: 'Routing' },
   { id: 'https', label: 'HTTPS' },
+  { id: 'users', label: 'Users' },
   { id: 'quotas', label: 'Quotas' },
   { id: 'failures', label: 'Failures' },
 ]
@@ -30,6 +31,7 @@ const COMMON_SECOND_LEVEL_DOMAIN_LABELS = new Set([
 ])
 const AUTO_PROXY_POLICY_LABEL = '2 failures -> probe -> success enables proxy'
 const RULE_DURATION_OPTIONS = ['1h', '1d', '7d', '30d', '90d', 'always']
+const BLOCK_DURATION_OPTIONS = ['1h', '6h', '12h', '1d', '7d', '30d', 'always']
 const EXEMPTION_DURATION_OPTIONS = ['2h', '6h', '12h', '1d', '7d', '30d', 'always']
 const DEFAULT_ROUTING_PROFILE_ID = 'default'
 const DEFAULT_UPSTREAM_RETRY = {
@@ -49,6 +51,7 @@ const RULE_DURATION_SECONDS = {
 const RULES_PAGE_SIZE = 10
 const DEFAULT_FAILURE_PAGE_SIZE = 10
 const BYTES_IN_MB = 1_000_000
+const MB_IN_GB = 1024
 
 function cx(...classes) {
   return classes.filter(Boolean).join(' ')
@@ -114,6 +117,34 @@ function compareNumbers(left, right, direction) {
   return direction === 'asc' ? leftValue - rightValue : rightValue - leftValue
 }
 
+function formatRelativeElapsed(seconds) {
+  const remaining = Math.max(0, Math.floor(Number(seconds) || 0))
+  if (remaining < 60) {
+    return 'moments ago'
+  }
+  const units = [
+    ['month', 30 * 86400],
+    ['week', 7 * 86400],
+    ['day', 86400],
+    ['hour', 3600],
+    ['minute', 60],
+  ]
+  const parts = []
+  let leftover = remaining
+  for (const [label, unitSeconds] of units) {
+    const amount = Math.floor(leftover / unitSeconds)
+    if (!amount) {
+      continue
+    }
+    parts.push(`${amount} ${label}${amount === 1 ? '' : 's'}`)
+    leftover -= amount * unitSeconds
+    if (parts.length >= 2) {
+      break
+    }
+  }
+  return `${parts.join(' and ')} ago`
+}
+
 function getQuotaClientSortValue(row, key) {
   if (key === 'active') {
     return row.activeConnections
@@ -163,6 +194,8 @@ function emptyDashboardSnapshot() {
     recent_failures: [],
     latest_request: null,
     totals_by_client: [],
+    known_clients: [],
+    client_block_status: {},
     client_quota_status: {},
     failure_summary: {
       grouped_visible: [],
@@ -247,6 +280,8 @@ function emptyHistoryData() {
     client: 'all',
     summary: emptyUsageSummary(),
     series: [],
+    period_totals: [],
+    client_period_totals: [],
     top_destinations: [],
     invalid_lines: 0,
     available_proxy_types: [],
@@ -281,7 +316,15 @@ function emptyHttpsTrafficData() {
 }
 
 function formatMb(byteCount) {
-  return `${(Number(byteCount || 0) / BYTES_IN_MB).toFixed(2)} MB`
+  const valueInMb = Number(byteCount || 0) / BYTES_IN_MB
+  if (valueInMb > MB_IN_GB) {
+    return `${(valueInMb / MB_IN_GB).toFixed(2)} GB`
+  }
+  return `${valueInMb.toFixed(2)} MB`
+}
+
+function formatPanelTraffic(byteCount) {
+  return formatMb(byteCount)
 }
 
 function formatBytes(byteCount) {
@@ -396,6 +439,48 @@ function normalizeExemptionDuration(value) {
   return normalized === 'always' || durationSecondsForCompactDuration(normalized) != null
     ? normalized
     : '2h'
+}
+
+function normalizeClientBlockDuration(value) {
+  const normalized = String(value || '').trim().toLowerCase() || 'always'
+  return normalized === 'always' || durationSecondsForCompactDuration(normalized) != null
+    ? normalized
+    : '6h'
+}
+
+function ensureClientBlockExpiration(block, resetExpiration = false) {
+  if (!block) {
+    return block
+  }
+  const duration = normalizeClientBlockDuration(block.duration)
+  block.duration = duration
+  if (duration === 'always') {
+    block.expires_at = null
+    return block
+  }
+  const seconds = durationSecondsForCompactDuration(duration)
+  if (seconds == null) {
+    block.expires_at = null
+    return block
+  }
+  if (!block.expires_at || resetExpiration) {
+    block.expires_at = new Date(Date.now() + seconds * 1000).toISOString()
+  }
+  return block
+}
+
+function isClientBlockExpired(block) {
+  const expiresAt = parseDateText(block && block.expires_at)
+  return expiresAt ? expiresAt.getTime() <= Date.now() : false
+}
+
+function formatClientBlockExpiry(block, nowMs) {
+  const expiresAt = parseDateText(block && block.expires_at)
+  if (!expiresAt) {
+    return 'Blocked until removed'
+  }
+  const remainingSeconds = Math.max(0, Math.floor((expiresAt.getTime() - nowMs) / 1000))
+  return `blocked for ${formatDuration(remainingSeconds)} more · until ${expiresAt.toLocaleString()}`
 }
 
 function ensureExemptionExpiration(exemption, resetExpiration = false) {
@@ -675,6 +760,17 @@ function normalizeRouterConfig(config) {
       max_past_3h_mb: normalizeOptionalLimitMb(defaultAuthenticatedClientTrafficLimit.max_past_3h_mb),
       note: String(defaultAuthenticatedClientTrafficLimit.note || ''),
     },
+    client_blocks: (Array.isArray(source.client_blocks) ? source.client_blocks : [])
+      .map((block) =>
+        ensureClientBlockExpiration({
+          enabled: block.enabled !== false,
+          client: String(block.client || '').trim(),
+          duration: normalizeClientBlockDuration(block.duration),
+          expires_at: block.expires_at ? String(block.expires_at) : null,
+          note: String(block.note || ''),
+        }),
+      )
+      .filter((block) => !isClientBlockExpired(block)),
     client_traffic_limits: (Array.isArray(source.client_traffic_limits) ? source.client_traffic_limits : []).map(
       (limit) => ({
         enabled: limit.enabled !== false,
@@ -769,6 +865,21 @@ function isPersistableClientTrafficLimit(limit) {
   return limit.enabled === false || limit.max_past_hour_mb != null || limit.max_past_3h_mb != null
 }
 
+function isPersistableClientBlock(block) {
+  return Boolean(String((block && block.client) || '').trim()) && !isClientBlockExpired(block)
+}
+
+function findExactClientBlock(blocks, client) {
+  const normalizedClient = String(client || '').trim()
+  return (Array.isArray(blocks) ? blocks : []).find(
+    (block) =>
+      block &&
+      block.enabled !== false &&
+      !isClientBlockExpired(block) &&
+      String(block.client || '').trim() === normalizedClient,
+  ) || null
+}
+
 function isPersistableClientAuthCredential(credential) {
   return Boolean(
     String((credential && credential.username) || '').trim() &&
@@ -800,6 +911,7 @@ function buildPersistableRouterConfig(config) {
       ...normalized.client_auth,
       credentials,
     },
+    client_blocks: normalized.client_blocks.filter((block) => isPersistableClientBlock(block)),
     client_traffic_limits: normalized.client_traffic_limits.filter((limit) => isPersistableClientTrafficLimit(limit)),
     client_traffic_exemptions: normalized.client_traffic_exemptions.filter((exemption) =>
       isPersistableClientTrafficExemption(exemption),
@@ -838,6 +950,7 @@ function countRouterDraftItems(config) {
   count += normalized.client_auth.credentials.filter(
     (credential) => !isPersistableClientAuthCredential(credential),
   ).length
+  count += normalized.client_blocks.filter((block) => !isPersistableClientBlock(block)).length
   count += normalized.client_traffic_limits.filter((limit) => !isPersistableClientTrafficLimit(limit)).length
   count += normalized.client_traffic_exemptions.filter((exemption) => !isPersistableClientTrafficExemption(exemption)).length
   count += normalized.routing_profiles.reduce(
@@ -1056,6 +1169,21 @@ function currentHttpsInterceptionStatus(snapshot) {
 function formatStatusDateTime(value) {
   const parsed = parseDateText(value)
   return parsed ? parsed.toLocaleString() : 'Unknown time'
+}
+
+function formatUserLastSeen(value, nowMs, activeConnections) {
+  const parsed = parseDateText(value)
+  if (!parsed) {
+    return {
+      primary: Number(activeConnections || 0) > 0 ? 'Online now' : 'Waiting for first activity',
+      secondary: '',
+    }
+  }
+  const elapsedSeconds = Math.max(0, Math.floor((nowMs - parsed.getTime()) / 1000))
+  return {
+    primary: Number(activeConnections || 0) > 0 ? 'Online now' : formatRelativeElapsed(elapsedSeconds),
+    secondary: parsed.toLocaleString(),
+  }
 }
 
 function formatDurationMs(value) {
@@ -1442,9 +1570,9 @@ function buildOverviewCards(snapshot) {
     ['Requests handled', String(overall.count)],
     ['Direct handled', `${String(directSummary.count)} (${formatPercent(directSummary.count, overall.count)})`],
     ['Proxied handled', `${String(proxySummary.count)} (${formatPercent(proxySummary.count, overall.count)})`],
-    ['Direct traffic', formatMb(directSummary.total_bytes)],
-    ['Proxied traffic', formatMb(proxySummary.total_bytes)],
-    ['Total traffic', formatMb(overall.total_bytes)],
+    ['Direct traffic', formatPanelTraffic(directSummary.total_bytes)],
+    ['Proxied traffic', formatPanelTraffic(proxySummary.total_bytes)],
+    ['Total traffic', formatPanelTraffic(overall.total_bytes)],
   ]
 }
 
@@ -1455,9 +1583,9 @@ function buildHistoryCards(history) {
     ['Range', history.range_title || 'History'],
     ['Client', client],
     ['Matched requests', String(summary.count || 0)],
-    ['Total traffic', formatMb(summary.total_bytes || 0)],
-    ['Upload', formatMb(summary.uploaded_bytes || 0)],
-    ['Download', formatMb(summary.downloaded_bytes || 0)],
+    ['Total traffic', formatPanelTraffic(summary.total_bytes || 0)],
+    ['Upload', formatPanelTraffic(summary.uploaded_bytes || 0)],
+    ['Download', formatPanelTraffic(summary.downloaded_bytes || 0)],
   ]
 }
 
@@ -1502,6 +1630,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const currentTarget = getRoutingTargetById(config, profileId) || config
   const visibleRuleEntries = getEditorVisibleRuleEntries(config, profileId)
   const enabledRules = visibleRuleEntries.filter((entry) => entry.rule && entry.rule.enabled).length
+  const enabledClientBlocks = config.client_blocks.filter((block) => block.enabled).length
   const enabledClientLimits = config.client_traffic_limits.filter((limit) => limit.enabled).length
   const enabledClientExemptions = config.client_traffic_exemptions.filter((exemption) => exemption.enabled).length
   const clientAuth = config.client_auth || { credentials: [] }
@@ -1528,12 +1657,12 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
       }`
     : 'Disabled'
   const defaultClientLimitLabel = defaultClientLimit.enabled
-    ? `1h ${defaultClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${defaultClientLimit.max_past_3h_mb ?? 'none'}MB`
+    ? `1h ${formatLimitMb(defaultClientLimit.max_past_hour_mb)} · 3h ${formatLimitMb(defaultClientLimit.max_past_3h_mb)}`
     : 'Disabled'
   const defaultAuthenticatedClientLimitLabel = defaultAuthenticatedClientLimit.enabled
-    ? `1h ${defaultAuthenticatedClientLimit.max_past_hour_mb ?? 'none'}MB · 3h ${
-        defaultAuthenticatedClientLimit.max_past_3h_mb ?? 'none'
-      }MB`
+    ? `1h ${formatLimitMb(defaultAuthenticatedClientLimit.max_past_hour_mb)} · 3h ${formatLimitMb(
+        defaultAuthenticatedClientLimit.max_past_3h_mb,
+      )}`
     : 'Uses default quota'
   const clientAuthLabel = clientAuth.enabled
     ? `${clientAuth.allow_anonymous ? 'Optional' : 'Required'} · ${enabledAuthCredentials}/${clientAuth.credentials.length} credentials`
@@ -1555,6 +1684,7 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['HTTPS sniffing', httpsInterceptionLabel],
     ['Auto proxy', autoProxyStatus],
     ['Proxy auth', clientAuthLabel],
+    ['Blocks', `${enabledClientBlocks}/${config.client_blocks.length}`],
     ['Default quota', defaultClientLimitLabel],
     ['Auth quota', defaultAuthenticatedClientLimitLabel],
     ['Client limits', `${enabledClientLimits}/${config.client_traffic_limits.length}`],
@@ -1583,7 +1713,7 @@ function buildRouterStatusText(config, lastSavedConfig, profileId, options = {})
   if (draftCount) {
     return `${draftLabel} until required fields are filled · editing ${editorLabel}`
   }
-  return `Auto-sync on · ${visibleRuleEntries.length} rules · ${config.client_traffic_limits.length} client limits · ${config.client_traffic_exemptions.length} exemptions · ${
+  return `Auto-sync on · ${visibleRuleEntries.length} rules · ${config.client_blocks.length} blocks · ${config.client_traffic_limits.length} client limits · ${config.client_traffic_exemptions.length} exemptions · ${
     config.client_auth.enabled ? 'auth on' : 'auth off'
   } · ${
     config.upstream.enabled ? 'upstream on' : 'upstream off'
@@ -1803,11 +1933,14 @@ function App() {
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [currentRouterConfig, setCurrentRouterConfig] = useState(normalizeRouterConfig({}))
   const [lastSavedRouterConfig, setLastSavedRouterConfig] = useState(normalizeRouterConfig({}))
+  const [clientBlockDraftDurations, setClientBlockDraftDurations] = useState({})
   const [currentFailurePage, setCurrentFailurePage] = useState(1)
   const [currentRulesPage, setCurrentRulesPage] = useState(1)
   const [currentRulesSearchTerm, setCurrentRulesSearchTerm] = useState('')
   const [currentEditorProfileId, setCurrentEditorProfileId] = useState(DEFAULT_ROUTING_PROFILE_ID)
   const [quotaDeviceSort, setQuotaDeviceSort] = useState({ key: 'active', direction: 'desc' })
+  const [usersSearchTerm, setUsersSearchTerm] = useState('')
+  const [usersSort, setUsersSort] = useState({ key: 'active', direction: 'desc' })
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
   const [isClearingTraffic, setIsClearingTraffic] = useState(false)
   const [isSavingRouter, setIsSavingRouter] = useState(false)
@@ -1908,9 +2041,82 @@ function App() {
     safeEditorProfileId,
     dashboardSnapshot,
   )
+  const knownClients = Array.isArray(dashboardSnapshot.known_clients) ? dashboardSnapshot.known_clients : []
+  const snapshotClientBlockStatus = dashboardSnapshot.client_block_status || {}
   const historyNote = historyError || buildHistoryNote(historyData)
+  const historyPeriodTotals = Array.isArray(historyData.period_totals) ? historyData.period_totals : []
+  const historyClientPeriodTotals = Array.isArray(historyData.client_period_totals)
+    ? historyData.client_period_totals
+    : []
   const httpsTrafficRows = Array.isArray(httpsTrafficData.items) ? httpsTrafficData.items : []
   const httpsTrafficSelectedId = httpsTrafficDetail && httpsTrafficDetail.id ? httpsTrafficDetail.id : ''
+  const normalizedUsersSearchTerm = String(usersSearchTerm || '').trim().toLowerCase()
+  const usersTableRows = knownClients
+    .map((row) => {
+      const blockStatus =
+        findExactClientBlock(currentRouterConfig.client_blocks, row.client) ||
+        snapshotClientBlockStatus[row.client] ||
+        null
+      const blockDuration =
+        clientBlockDraftDurations[row.client] || (blockStatus && blockStatus.duration) || '6h'
+      const kindLabel =
+        row.kind === 'user' ? 'User' : row.kind === 'network' ? 'Network' : 'IP'
+      const activeConnections = Number(row.active_connections || 0)
+      const totalBytes = Number(row.total_bytes || 0)
+      const lastSeenAt = row.last_seen_at ? String(row.last_seen_at) : ''
+      const lastSeenDate = parseDateText(lastSeenAt)
+      const blockRank = !blockStatus ? 0 : blockStatus.expires_at ? 1 : 2
+      const blockStatusText = !blockStatus
+        ? 'Allowed'
+        : blockStatus.expires_at
+          ? 'Blocked temporarily'
+          : 'Blocked always'
+      const searchText = [
+        row.client,
+        row.label,
+        row.username,
+        kindLabel,
+        Array.isArray(row.source_ips) ? row.source_ips.join(' ') : '',
+        Array.isArray(row.proxy_types) ? row.proxy_types.join(' ') : '',
+        row.configured ? 'configured' : '',
+        row.credential_enabled === true ? 'auth enabled' : row.credential_enabled === false ? 'auth disabled' : '',
+        blockStatusText,
+        blockStatus && blockStatus.target ? blockStatus.target : '',
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return {
+        activeConnections,
+        blockDuration,
+        blockRank,
+        blockStatus,
+        blockStatusText,
+        kindLabel,
+        lastSeenDate,
+        lastSeenMs: lastSeenDate ? lastSeenDate.getTime() : 0,
+        row,
+        searchText,
+        totalBytes,
+      }
+    })
+    .filter((item) => !normalizedUsersSearchTerm || item.searchText.includes(normalizedUsersSearchTerm))
+    .sort((left, right) => {
+      let compared = 0
+      if (usersSort.key === 'active') {
+        compared = compareNumbers(left.activeConnections, right.activeConnections, usersSort.direction)
+      } else if (usersSort.key === 'total') {
+        compared = compareNumbers(left.totalBytes, right.totalBytes, usersSort.direction)
+      } else if (usersSort.key === 'last_seen') {
+        compared = compareNumbers(left.lastSeenMs, right.lastSeenMs, usersSort.direction)
+      } else if (usersSort.key === 'block_status') {
+        compared = compareNumbers(left.blockRank, right.blockRank, usersSort.direction)
+      }
+      if (compared !== 0) {
+        return compared
+      }
+      return String(left.row.client || '').localeCompare(String(right.row.client || ''))
+    })
   const quotaDeviceRows = dashboardSnapshot.totals_by_client.map((client) => {
     const quota = dashboardSnapshot.client_quota_status[client.client] || {}
     const usage = quota.usage || {}
@@ -1972,6 +2178,18 @@ function App() {
     }
     return quotaDeviceSort.direction === 'asc' ? ' ↑' : ' ↓'
   }
+  function toggleUsersSort(key) {
+    setUsersSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'desc' ? 'asc' : 'desc',
+    }))
+  }
+  function usersSortLabel(key) {
+    if (usersSort.key !== key) {
+      return ''
+    }
+    return usersSort.direction === 'asc' ? ' ↑' : ' ↓'
+  }
   function updateHttpsInterceptionPatterns(field, text) {
     const nextConfig = cloneJson(currentRouterConfig)
     nextConfig.https_interception[field] = parseHostPatternList(text)
@@ -2021,6 +2239,15 @@ function App() {
       window.history.replaceState(null, '', nextHash)
     }
   }, [activeTab])
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 60000)
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [])
 
   async function loadRouterConfig({ showStatus = false } = {}) {
     const response = await fetch('/api/router-config', {
@@ -2685,6 +2912,51 @@ function App() {
     setLocalRouterConfig(nextConfig)
   }
 
+  function blockClient(client, duration) {
+    const target = String(client || '').trim()
+    if (!target) {
+      return
+    }
+    const nextConfig = cloneJson(currentRouterConfig)
+    const existing = findExactClientBlock(nextConfig.client_blocks, target)
+    nextConfig.client_blocks = nextConfig.client_blocks.filter((block) => String(block.client || '').trim() !== target)
+    nextConfig.client_blocks.push(
+      ensureClientBlockExpiration(
+        {
+          enabled: true,
+          client: target,
+          duration: normalizeClientBlockDuration(duration),
+          expires_at: existing ? existing.expires_at : null,
+          note: existing ? existing.note : '',
+        },
+        true,
+      ),
+    )
+    setLocalRouterConfig(nextConfig, {
+      activateTab: 'users',
+      message: `Client block added for ${target}. Syncing automatically.`,
+    })
+  }
+
+  function unblockClient(target) {
+    const normalizedTarget = String(target || '').trim()
+    if (!normalizedTarget) {
+      return
+    }
+    const nextConfig = cloneJson(currentRouterConfig)
+    const before = nextConfig.client_blocks.length
+    nextConfig.client_blocks = nextConfig.client_blocks.filter(
+      (block) => String(block.client || '').trim() !== normalizedTarget,
+    )
+    if (nextConfig.client_blocks.length === before) {
+      return
+    }
+    setLocalRouterConfig(nextConfig, {
+      activateTab: 'users',
+      message: `Client block removed for ${normalizedTarget}. Syncing automatically.`,
+    })
+  }
+
   function clearCurrentScopeRules() {
     const editorLabel = getEditorTargetLabel(currentRouterConfig, safeEditorProfileId)
     const confirmed = window.confirm(
@@ -2897,7 +3169,7 @@ function App() {
         <div className={panelHeaderClass}>
           <div>
             <h2>Configuration</h2>
-            <div className={noteClass}>Routing profiles, rules, quotas, and exemptions sync automatically.</div>
+            <div className={noteClass}>Routing profiles, rules, users, quotas, and exemptions sync automatically.</div>
           </div>
           <div className="flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:items-center sm:flex-wrap">
             <div className={cx(pillClass, routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
@@ -2973,9 +3245,9 @@ function App() {
                     ['Auth', formatClientAuthSummary(dashboardSnapshot.latest_request)],
                     ['Destination', dashboardSnapshot.latest_request.destination],
                     ['Route', dashboardSnapshot.latest_request.route_label || 'direct'],
-                    ['Upload', formatMb(dashboardSnapshot.latest_request.uploaded_bytes)],
-                    ['Download', formatMb(dashboardSnapshot.latest_request.downloaded_bytes)],
-                    ['Total', formatMb(dashboardSnapshot.latest_request.total_bytes)],
+                    ['Upload', formatPanelTraffic(dashboardSnapshot.latest_request.uploaded_bytes)],
+                    ['Download', formatPanelTraffic(dashboardSnapshot.latest_request.downloaded_bytes)],
+                    ['Total', formatPanelTraffic(dashboardSnapshot.latest_request.total_bytes)],
                   ].map(([label, value]) => (
                     <div className="grid grid-cols-[minmax(4.5rem,0.75fr)_minmax(0,1fr)] gap-3 border-b border-[#ece5d8] py-2 last:border-b-0 sm:flex sm:justify-between sm:gap-4" key={label}>
                       <span className="min-w-0 text-[#6a6f73] sm:min-w-24">{label}</span>
@@ -3169,6 +3441,89 @@ function App() {
               <div className={noteClass}>{historyNote}</div>
 
               <div className="mt-3 grid grid-cols-1 gap-4">
+                <section className={subpanelClass}>
+                  <div className={panelHeaderClass}>
+                    <div>
+                      <h3>Period totals</h3>
+                      <div className={noteClass}>
+                        Calendar periods for the current proxy/client filter in {historyData.timezone || 'the active timezone'}.
+                        The selected range above only affects the chart and top destinations.
+                      </div>
+                    </div>
+                  </div>
+                  {historyError ? (
+                    <div className="pt-2 text-[#6a6f73]">History data is unavailable right now.</div>
+                  ) : historyPeriodTotals.length ? (
+                    <div className={cx(cardGridClass, 'mt-3')}>
+                      {historyPeriodTotals.map((period) => {
+                        const periodSummary = period.summary || emptyUsageSummary()
+                        return (
+                          <div className={cardClass} key={period.key || period.title}>
+                            <div className={cardLabelClass}>{period.title || period.key || 'Period'}</div>
+                            <div className={cardValueClass}>{formatPanelTraffic(periodSummary.total_bytes || 0)}</div>
+                            <div className={noteClass}>{`${periodSummary.count || 0} requests`}</div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <div className="pt-2 text-[#6a6f73]">No usage matched the current filter yet.</div>
+                  )}
+                </section>
+
+                <section className={subpanelClass}>
+                  <div className={panelHeaderClass}>
+                    <div>
+                      <h3>Per-client period totals</h3>
+                      <div className={noteClass}>
+                        Usage broken out per client for the current proxy filter. Select a client above to focus on one row.
+                      </div>
+                    </div>
+                  </div>
+                  {historyError ? (
+                    <div className="pt-2 text-[#6a6f73]">History data is unavailable right now.</div>
+                  ) : historyClientPeriodTotals.length ? (
+                    <div className={cx(tableWrapClass, 'mt-3')}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Client</th>
+                            <th>All time</th>
+                            {historyPeriodTotals.map((period) => (
+                              <th key={period.key || period.title}>{period.title || period.key || 'Period'}</th>
+                            ))}
+                            <th>Last seen</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {historyClientPeriodTotals.map((row) => (
+                            <tr key={row.client}>
+                              <td>
+                                <div className={ruleMetaClass}>
+                                  <strong>{row.client}</strong>
+                                  <small>{`${(row.summary || emptyUsageSummary()).count || 0} requests`}</small>
+                                  {Array.isArray(row.proxy_types) && row.proxy_types.length ? (
+                                    <small>{row.proxy_types.join(', ')}</small>
+                                  ) : null}
+                                </div>
+                              </td>
+                              <td>{formatMb((row.summary || emptyUsageSummary()).total_bytes || 0)}</td>
+                              {historyPeriodTotals.map((period) => {
+                                const periodSummary =
+                                  ((row.period_totals || {})[period.key]) || emptyUsageSummary()
+                                return <td key={`${row.client}-${period.key}`}>{formatMb(periodSummary.total_bytes || 0)}</td>
+                              })}
+                              <td>{row.last_seen_at ? formatStatusDateTime(row.last_seen_at) : 'waiting for first request'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="pt-2 text-[#6a6f73]">No client usage matched the current filter.</div>
+                  )}
+                </section>
+
                 <section className={subpanelClass}>
                   <h3>Traffic over time</h3>
                   {historyError ? (
@@ -4219,6 +4574,173 @@ function App() {
                   ) : null}
                 </section>
               </div>
+            </section>
+          </section>
+        </section>
+      ) : null}
+
+      {activeTab === 'users' ? (
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
+                <div>
+                  <h2>Users</h2>
+                  <div className={noteClass}>
+                    Configured proxy-auth users and client identities seen in traffic or failures. Blocking here
+                    silently closes future connections instead of showing a quota page or explanatory proxy error.
+                  </div>
+                </div>
+              </div>
+
+              {knownClients.length ? (
+                <>
+                  <div className={controlsClass}>
+                    <label className={controlClass}>
+                      <span>Search</span>
+                      <input
+                        type="search"
+                        value={usersSearchTerm}
+                        onChange={(event) => setUsersSearchTerm(event.target.value)}
+                        placeholder="Client, username, IP, proxy type, block status"
+                      />
+                    </label>
+                    <div className={controlClass}>
+                      <span>Visible</span>
+                      <div className="rounded-[10px] border border-[#d8d1c2] bg-[#fffdf8] px-3 py-2 text-[#1f2a30]">
+                        {`${usersTableRows.length} of ${knownClients.length}`}
+                      </div>
+                    </div>
+                  </div>
+
+                  {usersTableRows.length ? (
+                    <div className={cx(tableWrapClass, 'mt-3')}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Client</th>
+                            <th>Type</th>
+                            <th>Details</th>
+                            <th>
+                              <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleUsersSort('active')}>
+                                Active{usersSortLabel('active')}
+                              </button>
+                            </th>
+                            <th>Requests</th>
+                            <th>
+                              <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleUsersSort('total')}>
+                                Total{usersSortLabel('total')}
+                              </button>
+                            </th>
+                            <th>
+                              <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleUsersSort('last_seen')}>
+                                Last seen{usersSortLabel('last_seen')}
+                              </button>
+                            </th>
+                            <th>
+                              <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleUsersSort('block_status')}>
+                                Block status{usersSortLabel('block_status')}
+                              </button>
+                            </th>
+                            <th>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {usersTableRows.map((item) => {
+                            const { activeConnections, blockDuration, blockStatus, kindLabel, row } = item
+                            const activeClient = activeConnections > 0
+                            const lastSeen = formatUserLastSeen(row.last_seen_at, nowMs, activeConnections)
+                            return (
+                              <tr className={cx(activeClient && 'bg-[#eef8f3] text-[#115e59]')} key={row.client}>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    <strong>{row.client}</strong>
+                                    {row.label ? <small>{row.label}</small> : null}
+                                  </div>
+                                </td>
+                                <td>{kindLabel}</td>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    {row.username ? <small>{`username: ${row.username}`}</small> : null}
+                                    {Array.isArray(row.source_ips) && row.source_ips.length ? (
+                                      <small>{`source IPs: ${row.source_ips.join(', ')}`}</small>
+                                    ) : null}
+                                    {Array.isArray(row.proxy_types) && row.proxy_types.length ? (
+                                      <small>{`proxy types: ${row.proxy_types.join(', ')}`}</small>
+                                    ) : null}
+                                    {row.configured ? (
+                                      <small>
+                                        {row.credential_enabled == null
+                                          ? 'configured'
+                                          : row.credential_enabled
+                                            ? 'configured auth enabled'
+                                            : 'configured auth disabled'}
+                                      </small>
+                                    ) : null}
+                                  </div>
+                                </td>
+                                <td>{activeConnections}</td>
+                                <td>{row.request_count || 0}</td>
+                                <td>{formatMb(row.total_bytes || 0)}</td>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    <strong>{lastSeen.primary}</strong>
+                                    {lastSeen.secondary ? <small>{lastSeen.secondary}</small> : null}
+                                  </div>
+                                </td>
+                                <td>
+                                  {blockStatus ? (
+                                    <div className={ruleMetaClass}>
+                                      <strong>{blockStatus.expires_at ? 'Blocked temporarily' : 'Blocked always'}</strong>
+                                      <small>{formatClientBlockExpiry(blockStatus, nowMs)}</small>
+                                      {blockStatus.target && blockStatus.target !== row.client ? (
+                                        <small>{`matched by ${blockStatus.target}`}</small>
+                                      ) : null}
+                                    </div>
+                                  ) : (
+                                    'Allowed'
+                                  )}
+                                </td>
+                                <td className={ruleActionsClass}>
+                                  <select
+                                    value={blockDuration}
+                                    onChange={(event) =>
+                                      setClientBlockDraftDurations((current) => ({
+                                        ...current,
+                                        [row.client]: event.target.value,
+                                      }))
+                                    }
+                                  >
+                                    {BLOCK_DURATION_OPTIONS.map((duration) => (
+                                      <option key={duration} value={duration}>
+                                        {duration}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button type="button" onClick={() => blockClient(row.client, blockDuration)}>
+                                    {blockStatus ? 'Replace block' : 'Block'}
+                                  </button>
+                                  {blockStatus ? (
+                                    <button type="button" onClick={() => unblockClient(blockStatus.target || row.client)}>
+                                      Unblock
+                                    </button>
+                                  ) : null}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="pt-3 text-[#6a6f73]">No users matched the current search.</div>
+                  )}
+                </>
+              ) : (
+                <div className="pt-3 text-[#6a6f73]">
+                  No configured users or client identities have been observed yet.
+                </div>
+              )}
             </section>
           </section>
         </section>

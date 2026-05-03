@@ -1,17 +1,18 @@
 # proxy-router
 
-`proxy-router` is a LAN-friendly proxy listener with a React dashboard for routing, quotas, usage history, and failure review.
+`proxy-router` is a LAN-friendly proxy listener with a React dashboard for routing, users, quotas, usage history, and failure review.
 
 It is designed for cases where a phone or another device on the same network should send traffic through a computer, while you keep control over which hosts go direct, which go through an upstream proxy, and how much traffic each client can use.
 
 ## Highlights
 
 - Mixed HTTP + SOCKS5 listener on one port for simple device setup
-- React dashboard for overview, history, HTTPS analysis, routing, quotas, and failures
+- React dashboard for overview, history, HTTPS analysis, routing, users, quotas, and failures
 - Shared and per-network routing profiles
 - Automatic direct-failure probing before temporary auto-proxy rules
 - Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA and JSONL analyzer logs
 - Optional HTTP/SOCKS proxy authentication for stable per-device identities
+- Per-user or per-IP temporary/permanent silent blocks from the admin dashboard
 - Per-client traffic quotas, default quotas, and temporary or permanent exemptions
 - Docker-first deployment with persistent state under `./data`
 - Small Python backend with a separate React + Vite frontend
@@ -149,18 +150,20 @@ Typical setup:
 
 ## Dashboard
 
-The dashboard includes six main areas:
+The dashboard includes seven main areas:
 
 - `Overview`: current activity, totals, recent traffic, active clients
-- `History`: time-bucketed usage history and top destinations filtered by range, proxy type, and client
+- `History`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, and top destinations filtered by range, proxy type, and client
 - `Routing`: upstream settings, rules, routing profiles, auto-proxy controls
 - `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
+- `Users`: configured proxy-auth users plus observed client identities/IPs, with silent block/unblock controls
 - `Quotas`: optional proxy authentication, default client quota, per-client quota rules, exemptions
 - `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
 Client self-service portal:
 
 - Devices using the HTTP proxy can open `http://proxy.router/` to view only their own usage and quota data
+- The client portal includes the same daily/weekly/monthly/yearly usage totals for the current device alongside range-based history
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
 - Devices can open `https://proxy.router/ca-check` after installation to confirm CA trust and clear temporary adaptive bypasses
@@ -179,6 +182,7 @@ Current dashboard behaviors:
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
 - Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried once through the upstream proxy when auto-proxy is available; a temporary proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
+- The `Users` tab can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
 - Transient upstream connection/setup failures use the Routing tab's configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
@@ -190,6 +194,7 @@ Current dashboard behaviors:
 
 - Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
+- The `Users` tab merges configured auth users with client identities/IPs seen in recorded traffic or failures, so you can block the exact client from the same list.
 - The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
 - Client limit and exemption targets can be `user:<username>`, a single IP address, or a CIDR range.
 - The general default quota applies to anonymous clients and to authenticated clients unless a separate authenticated default quota is enabled.
@@ -210,6 +215,12 @@ Response behavior:
 - Some browsers and apps still show a generic tunnel failure for raw CONNECT requests because HTTPS proxy CONNECT does not have a normal user-visible HTML error page.
 - SOCKS5 traffic still uses standard SOCKS5 rejection codes without a text body
 - Devices can still open the self-service portal at `http://proxy.router/` even while quota-blocked, because that page is served locally by the proxy
+
+When a client is blocked from the `Users` tab:
+
+- future HTTP, CONNECT, and SOCKS5 sessions are dropped silently instead of receiving the quota page
+- timed blocks expire automatically
+- the client typically only sees a generic connection failure similar to a firewall or closed port
 
 ## Useful CLI Options
 

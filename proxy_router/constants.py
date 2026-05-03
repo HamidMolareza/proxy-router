@@ -177,6 +177,7 @@ CLIENT_TRAFFIC_MAX_WINDOW = max(
     item["window"] for item in CLIENT_TRAFFIC_WINDOW_CONFIG.values()
 )
 CLIENT_TRAFFIC_ROUTE_LABEL = "reject:client-traffic-limit"
+CLIENT_BLOCK_ROUTE_LABEL = "reject:client-access-block"
 CLIENT_TRAFFIC_EXEMPTION_DURATION_PATTERN = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 COMMON_SECOND_LEVEL_DOMAIN_LABELS = {
     "ac",

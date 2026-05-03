@@ -663,6 +663,14 @@ def client_traffic_exemption_remaining_seconds(exemption, *, now: datetime | Non
     return max(0, int((expires_at - check_time).total_seconds()))
 
 
+def is_client_block_expired(block, *, now: datetime | None = None) -> bool:
+    return is_client_traffic_exemption_expired(block, now=now)
+
+
+def client_block_remaining_seconds(block, *, now: datetime | None = None) -> int | None:
+    return client_traffic_exemption_remaining_seconds(block, now=now)
+
+
 def summarize_domain(value: str | None) -> str:
     normalized = normalize_host(value or "")
     if not normalized:
@@ -715,6 +723,7 @@ def default_router_config():
             "realm": DEFAULT_CLIENT_AUTH_REALM,
             "credentials": [],
         },
+        "client_blocks": [],
         "client_traffic_limits": [],
         "client_traffic_exemptions": [],
         "auto_proxy_failures": {
@@ -901,6 +910,10 @@ def normalize_router_config(payload):
     if not isinstance(client_traffic_limits_payload, list):
         raise ValueError("router client_traffic_limits must be an array")
 
+    client_blocks_payload = payload.get("client_blocks") or []
+    if not isinstance(client_blocks_payload, list):
+        raise ValueError("router client_blocks must be an array")
+
     client_traffic_exemptions_payload = payload.get("client_traffic_exemptions") or []
     if not isinstance(client_traffic_exemptions_payload, list):
         raise ValueError("router client_traffic_exemptions must be an array")
@@ -1061,6 +1074,38 @@ def normalize_router_config(payload):
             }
         )
 
+    normalized_client_blocks = []
+    for index, block_payload in enumerate(client_blocks_payload, start=1):
+        if not isinstance(block_payload, dict):
+            raise ValueError(f"router client_blocks entry #{index} must be an object")
+
+        client_target = normalize_client_limit_target(str(block_payload.get("client", "")))
+        if not client_target:
+            continue
+
+        duration = normalize_client_traffic_exemption_duration(
+            block_payload.get("duration"),
+            field_name=f"router client_blocks entry #{index} duration",
+        )
+        expires_at = normalize_client_traffic_exemption_expiration(
+            block_payload.get("expires_at"),
+            duration=duration,
+            now=now,
+            field_name=f"router client_blocks entry #{index} duration",
+        )
+        if expires_at is not None and expires_at <= now:
+            continue
+
+        normalized_client_blocks.append(
+            {
+                "client": client_target,
+                "enabled": bool(block_payload.get("enabled", True)),
+                "duration": duration,
+                "expires_at": expires_at.isoformat() if expires_at is not None else None,
+                "note": str(block_payload.get("note", "")).strip(),
+            }
+        )
+
     normalized_client_traffic_exemptions = []
     for index, exemption_payload in enumerate(client_traffic_exemptions_payload, start=1):
         if not isinstance(exemption_payload, dict):
@@ -1159,6 +1204,7 @@ def normalize_router_config(payload):
             or DEFAULT_CLIENT_AUTH_REALM,
             "credentials": normalized_client_auth_credentials,
         },
+        "client_blocks": normalized_client_blocks,
         "client_traffic_limits": normalized_client_traffic_limits,
         "client_traffic_exemptions": normalized_client_traffic_exemptions,
         "auto_proxy_failures": {
@@ -1628,7 +1674,10 @@ def resolve_https_intercept_cert_cache_dir(path_text: str | None) -> Path:
 
 
 def format_mb(byte_count: int) -> str:
-    return f"{byte_count / BYTES_IN_MB:.2f} MB"
+    value_in_mb = byte_count / BYTES_IN_MB
+    if value_in_mb > 1024:
+        return f"{value_in_mb / 1024:.2f} GB"
+    return f"{value_in_mb:.2f} MB"
 
 
 def format_duration_seconds(total_seconds: int | None) -> str:
@@ -2184,6 +2233,51 @@ def bucket_datetime(value: datetime, bucket_seconds: int, history_timezone=None)
     return midnight + timedelta(seconds=bucket_offset)
 
 
+def add_usage_to_summary(summary, *, uploaded_bytes: int, downloaded_bytes: int, total_bytes: int):
+    summary["count"] += 1
+    summary["uploaded_bytes"] += uploaded_bytes
+    summary["downloaded_bytes"] += downloaded_bytes
+    summary["total_bytes"] += total_bytes
+
+
+def build_history_period_totals(now: datetime):
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = (start_of_day - timedelta(days=start_of_day.weekday())).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    start_of_month = start_of_day.replace(day=1)
+    start_of_year = start_of_day.replace(month=1, day=1)
+    return [
+        {
+            "key": "day",
+            "title": "Today",
+            "start_at": start_of_day.isoformat(),
+            "summary": empty_usage_summary(),
+        },
+        {
+            "key": "week",
+            "title": "This week",
+            "start_at": start_of_week.isoformat(),
+            "summary": empty_usage_summary(),
+        },
+        {
+            "key": "month",
+            "title": "This month",
+            "start_at": start_of_month.isoformat(),
+            "summary": empty_usage_summary(),
+        },
+        {
+            "key": "year",
+            "title": "This year",
+            "start_at": start_of_year.isoformat(),
+            "summary": empty_usage_summary(),
+        },
+    ]
+
+
 def summarize_history_records(
     records,
     *,
@@ -2204,6 +2298,12 @@ def summarize_history_records(
     summary = empty_usage_summary()
     buckets = {}
     destinations = {}
+    period_totals = build_history_period_totals(now)
+    period_starts = {
+        item["key"]: parse_usage_timestamp(item["start_at"]) for item in period_totals
+    }
+    period_totals_by_key = {item["key"]: item for item in period_totals}
+    client_period_totals = {}
     available_proxy_types = set()
     available_clients = set()
     selected_timestamps = []
@@ -2225,17 +2325,61 @@ def summarize_history_records(
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=datetime.now().astimezone().tzinfo)
         timestamp = timestamp.astimezone(history_timezone)
-        if cutoff is not None and timestamp < cutoff:
-            continue
 
         uploaded_bytes = int(record.get("uploaded_bytes", 0))
         downloaded_bytes = int(record.get("downloaded_bytes", 0))
         total_bytes = int(record.get("total_bytes", uploaded_bytes + downloaded_bytes))
 
-        summary["count"] += 1
-        summary["uploaded_bytes"] += uploaded_bytes
-        summary["downloaded_bytes"] += downloaded_bytes
-        summary["total_bytes"] += total_bytes
+        client_period_summary = client_period_totals.setdefault(
+            record_client,
+            {
+                "client": record_client,
+                "summary": empty_usage_summary(),
+                "period_totals": {
+                    item["key"]: empty_usage_summary()
+                    for item in period_totals
+                },
+                "proxy_types": set(),
+                "last_seen_at": None,
+                "_last_seen_dt": None,
+            },
+        )
+        client_period_summary["proxy_types"].add(record_proxy_type)
+        last_seen_dt = client_period_summary.get("_last_seen_dt")
+        if last_seen_dt is None or timestamp > last_seen_dt:
+            client_period_summary["_last_seen_dt"] = timestamp
+            client_period_summary["last_seen_at"] = timestamp.isoformat()
+        add_usage_to_summary(
+            client_period_summary["summary"],
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+        )
+
+        for period_key, period_start in period_starts.items():
+            if period_start is not None and timestamp >= period_start:
+                add_usage_to_summary(
+                    period_totals_by_key[period_key]["summary"],
+                    uploaded_bytes=uploaded_bytes,
+                    downloaded_bytes=downloaded_bytes,
+                    total_bytes=total_bytes,
+                )
+                add_usage_to_summary(
+                    client_period_summary["period_totals"][period_key],
+                    uploaded_bytes=uploaded_bytes,
+                    downloaded_bytes=downloaded_bytes,
+                    total_bytes=total_bytes,
+                )
+
+        if cutoff is not None and timestamp < cutoff:
+            continue
+
+        add_usage_to_summary(
+            summary,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+        )
         selected_timestamps.append(timestamp)
 
         bucket_start = bucket_datetime(timestamp, config["bucket_seconds"], history_timezone)
@@ -2251,10 +2395,12 @@ def summarize_history_records(
                 "total_bytes": 0,
             },
         )
-        bucket_summary["count"] += 1
-        bucket_summary["uploaded_bytes"] += uploaded_bytes
-        bucket_summary["downloaded_bytes"] += downloaded_bytes
-        bucket_summary["total_bytes"] += total_bytes
+        add_usage_to_summary(
+            bucket_summary,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+        )
 
         destination = record.get("destination", "unknown")
         destination_summary = destinations.setdefault(
@@ -2267,10 +2413,12 @@ def summarize_history_records(
                 "total_bytes": 0,
             },
         )
-        destination_summary["count"] += 1
-        destination_summary["uploaded_bytes"] += uploaded_bytes
-        destination_summary["downloaded_bytes"] += downloaded_bytes
-        destination_summary["total_bytes"] += total_bytes
+        add_usage_to_summary(
+            destination_summary,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+        )
 
     series = []
     if selected_timestamps:
@@ -2301,6 +2449,21 @@ def summarize_history_records(
         destinations.values(),
         key=lambda item: (-item["total_bytes"], -item["count"], item["destination"]),
     )[:HISTORY_TOP_DESTINATIONS_LIMIT]
+    client_period_totals_rows = []
+    for item in client_period_totals.values():
+        item["proxy_types"] = sorted(item["proxy_types"])
+        item.pop("_last_seen_dt", None)
+        client_period_totals_rows.append(item)
+    client_period_totals_rows.sort(
+        key=lambda item: (
+            -int((item.get("period_totals") or {}).get("year", {}).get("total_bytes", 0)),
+            -int((item.get("period_totals") or {}).get("month", {}).get("total_bytes", 0)),
+            -int((item.get("period_totals") or {}).get("week", {}).get("total_bytes", 0)),
+            -int((item.get("period_totals") or {}).get("day", {}).get("total_bytes", 0)),
+            -int((item.get("summary") or {}).get("total_bytes", 0)),
+            str(item.get("client") or ""),
+        )
+    )
 
     return {
         "range": range_key if range_key in HISTORY_RANGE_OPTIONS else HISTORY_DEFAULT_RANGE,
@@ -2310,6 +2473,8 @@ def summarize_history_records(
         "timezone": str(timezone_name or getattr(history_timezone, "key", "") or history_timezone.tzname(now) or ""),
         "summary": summary,
         "series": series,
+        "period_totals": period_totals,
+        "client_period_totals": client_period_totals_rows,
         "top_destinations": top_destinations,
         "invalid_lines": invalid_lines,
         "available_proxy_types": sorted(available_proxy_types),
