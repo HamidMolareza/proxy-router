@@ -3534,7 +3534,7 @@ function App() {
 
   async function clearTrafficData() {
     const confirmed = window.confirm(
-      'Clear all recorded traffic history and live counters? Router rules and config will not be changed.',
+      'Clear all recorded history, failures, HTTPS captures, and live counters? Router rules and config will not be changed.',
     )
     if (!confirmed) {
       return
@@ -3567,7 +3567,7 @@ function App() {
       setHttpsTrafficError('')
       setHttpsTrafficDetailError('')
       setStatus({
-        text: `Traffic data cleared · ${new Date().toLocaleTimeString()}`,
+        text: `History cleared · ${new Date().toLocaleTimeString()}`,
         warning: false,
       })
     } finally {
@@ -3804,15 +3804,15 @@ function App() {
             <section className={cx(panelClass, 'col-span-full')}>
               <div className={panelHeaderClass}>
                 <h2>History</h2>
-                <button className={warnButtonClass} id="clear-traffic-button" type="button" disabled={isClearingTraffic} onClick={() => {
+                <button className={warnButtonClass} id="clear-history-button" type="button" disabled={isClearingTraffic} onClick={() => {
                   clearTrafficData().catch((error) => {
                     setStatus({
-                      text: `Traffic clear failed: ${error.message}`,
+                      text: `History clear failed: ${error.message}`,
                       warning: true,
                     })
                   })
                 }}>
-                  {isClearingTraffic ? 'Clearing…' : 'Clear traffic data'}
+                  {isClearingTraffic ? 'Clearing...' : 'Clear history'}
                 </button>
               </div>
 
