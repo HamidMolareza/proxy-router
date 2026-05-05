@@ -329,6 +329,75 @@ def _describe_upstream_probe_error(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def _normalize_history_filter_values(values) -> set[str]:
+    return {str(value).strip() for value in (values or []) if str(value or "").strip()}
+
+
+def _record_matches_client_history_filter(record, *, client_ids: set[str], client_ips: set[str]) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if client_ids and str(record.get("client") or "").strip() in client_ids:
+        return True
+    if client_ips and str(record.get("client_ip") or "").strip() in client_ips:
+        return True
+    return False
+
+
+def _rewrite_jsonl_without_client_history(log_file: Path | None, *, client_ids: set[str], client_ips: set[str]) -> int:
+    if log_file is None or (not client_ids and not client_ips):
+        return 0
+
+    try:
+        lines = log_file.read_text(encoding="utf-8").splitlines(keepends=True)
+    except FileNotFoundError:
+        return 0
+
+    kept_lines = []
+    removed = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            kept_lines.append(line if line.endswith("\n") else f"{line}\n")
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            kept_lines.append(line if line.endswith("\n") else f"{line}\n")
+            continue
+        if _record_matches_client_history_filter(record, client_ids=client_ids, client_ips=client_ips):
+            removed += 1
+            continue
+        kept_lines.append(line if line.endswith("\n") else f"{line}\n")
+
+    if removed:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text("".join(kept_lines), encoding="utf-8")
+    return removed
+
+
+def _clear_client_history_from_logger(logger, *, client_ids: set[str], client_ips: set[str]) -> int:
+    log_file = getattr(logger, "log_file", None)
+    if log_file is None:
+        return 0
+
+    with logger._lock:
+        had_stream = logger._stream is not None
+        if had_stream:
+            logger._stream.flush()
+            logger._stream.close()
+            logger._stream = None
+        try:
+            return _rewrite_jsonl_without_client_history(
+                log_file,
+                client_ids=client_ids,
+                client_ips=client_ips,
+            )
+        finally:
+            if had_stream:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                logger._stream = log_file.open("a", encoding="utf-8", buffering=1)
+
+
 def _probe_upstream_connectivity(upstream_config: dict, *, timeout_seconds: int):
     upstream_type = str(upstream_config.get("type") or "http")
     host = str(upstream_config.get("host") or "").strip()
@@ -644,6 +713,13 @@ class UsageLogger:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self.log_file.write_text("", encoding="utf-8")
 
+    def clear_client_data(self, *, client_ids: set[str], client_ips: set[str]) -> int:
+        return _clear_client_history_from_logger(
+            self,
+            client_ids=client_ids,
+            client_ips=client_ips,
+        )
+
 
 class HttpsTrafficLogger:
     def __init__(self, log_file: Path | None):
@@ -683,6 +759,13 @@ class HttpsTrafficLogger:
                 return
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self.log_file.write_text("", encoding="utf-8")
+
+    def clear_client_data(self, *, client_ids: set[str], client_ips: set[str]) -> int:
+        return _clear_client_history_from_logger(
+            self,
+            client_ids=client_ids,
+            client_ips=client_ips,
+        )
 
 
 class FailureLogger:
@@ -764,6 +847,13 @@ class FailureLogger:
                 return
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self.log_file.write_text("", encoding="utf-8")
+
+    def clear_client_data(self, *, client_ids: set[str], client_ips: set[str]) -> int:
+        return _clear_client_history_from_logger(
+            self,
+            client_ids=client_ids,
+            client_ips=client_ips,
+        )
 
 
 class SelfEndpoints:
@@ -1334,6 +1424,37 @@ class AppRuntime:
             self.https_discovery_manager.clear_observations()
         self.https_interception_trust.clear_observations()
         self.notify_dashboard_update("clear")
+
+    def clear_client_history(self, *, client_ids=None, client_ips=None):
+        normalized_client_ids = _normalize_history_filter_values(client_ids)
+        normalized_client_ips = _normalize_history_filter_values(client_ips)
+        if not normalized_client_ids and not normalized_client_ips:
+            return {
+                "usage": 0,
+                "failures": 0,
+                "https_traffic": 0,
+                "total": 0,
+            }
+
+        counts = {
+            "usage": self.usage_logger.clear_client_data(
+                client_ids=normalized_client_ids,
+                client_ips=normalized_client_ips,
+            ),
+            "failures": self.failure_logger.clear_client_data(
+                client_ids=normalized_client_ids,
+                client_ips=normalized_client_ips,
+            ),
+            "https_traffic": self.https_traffic_logger.clear_client_data(
+                client_ids=normalized_client_ids,
+                client_ips=normalized_client_ips,
+            ),
+        }
+        counts["total"] = sum(counts.values())
+        self.configure_traffic_quota_manager(self.usage_log_path)
+        self.rehydrate_dashboard_state()
+        self.notify_dashboard_update("clear")
+        return counts
 
     def close(self):
         if self.https_discovery_manager is not None:
