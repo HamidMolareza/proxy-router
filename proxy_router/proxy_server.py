@@ -734,6 +734,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_decision=route_decision,
                 )
                 return
+            observe_https_connect = getattr(self.server.runtime, "observe_https_connect", None)
+            if observe_https_connect is not None:
+                observe_https_connect(host, port, route_decision)
             if intercept_https:
                 if adaptive_bypass is None:
                     self._handle_intercepted_connect(host, port, route_decision, request_started=request_started)
@@ -781,7 +784,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
                 )
-                self.server.runtime.record_auto_proxy_success(host, route_decision)
+                if route_decision.get("auto_proxy_probe"):
+                    self.server.runtime.record_auto_proxy_success(host, route_decision)
             finally:
                 if upstream_owner is not None:
                     upstream_owner.close()
@@ -2784,6 +2788,9 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     destination_port,
                     route_decision,
                 )
+                observe_https_connect = getattr(self.server.runtime, "observe_https_connect", None)
+                if observe_https_connect is not None:
+                    observe_https_connect(destination_host, destination_port, route_decision)
 
                 bind_host, bind_port = upstream.getsockname()[:2]
                 self._send_success_reply(bind_host, bind_port)
@@ -2815,7 +2822,8 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
                 )
-                self.server.runtime.record_auto_proxy_success(destination_host, route_decision)
+                if route_decision.get("auto_proxy_probe"):
+                    self.server.runtime.record_auto_proxy_success(destination_host, route_decision)
             finally:
                 if upstream_owner is not None:
                     upstream_owner.close()

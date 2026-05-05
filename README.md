@@ -93,6 +93,7 @@ Persisted backend files:
 - `./data/router-config.json`
 - `./data/router-config-auto-proxy-state.json`
 - `./data/router-config-https-interception-state.json`
+- `./data/router-config-https-discovery-state.json`
 - `./data/https-interception/proxy-router-ca.crt`
 - `./data/https-interception/proxy-router-ca.key`
 - `./data/https-interception/certs/`
@@ -133,6 +134,7 @@ HTTPS interception note:
 
 - The backend stores the HTTPS interception CA and generated per-host certificates under `./data/https-interception`.
 - Adaptive HTTPS trust and fallback observations are stored in `./data/router-config-https-interception-state.json`.
+- HTTPS discovery observations and TLS probe cooldowns are stored in `./data/router-config-https-discovery-state.json`.
 - Intercepted HTTPS request/response metadata and bounded body previews are written to `./data/https-traffic.log` as JSONL for dashboard review or external analyzers.
 - Only the public CA certificate is exposed through the dashboard/API; the CA private key stays on disk.
 
@@ -179,12 +181,13 @@ Current dashboard behaviors:
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
+- Unmanaged direct HTTPS domains are learned in the background. The router probes direct TLS and upstream TLS without requiring a device CA; if direct fails and upstream succeeds, the existing temporary auto-proxy rule flow is activated.
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
 - Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried once through the upstream proxy when auto-proxy is available; a temporary proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The `Users` tab can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
-- The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
+- The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures use the Routing tab's configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
 - `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.
@@ -267,7 +270,8 @@ docs/                      supporting project documentation
 - On shared networks, use `--allow-client` whenever possible.
 - Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected; loopback clients on the proxy host are always exempt for local workflows.
 - Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; do not commit runtime config or data files.
-- HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust are temporarily bypassed after TLS trust failures and can also use manual bypass patterns or SOCKS5.
+- HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust get host-scoped temporary bypasses after TLS trust failures, while failed CA trust checks or repeated domain failures can temporarily bypass MITM for the whole client.
+- HTTPS discovery uses TLS handshakes only, not decrypted request bodies, to compare direct connectivity with upstream connectivity for unmanaged HTTPS domains.
 - Intercepted HTTPS analyzer records include redacted headers and bounded text body previews. Sensitive headers and token-like text fields are redacted, common compressed bodies are decoded for preview when possible, binary bodies are omitted, and previews are truncated, but the log can still contain private application data.
 - Do not commit secrets, private upstream credentials, or runtime data files.
 

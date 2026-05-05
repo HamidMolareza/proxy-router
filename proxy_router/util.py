@@ -80,6 +80,10 @@ def https_interception_state_file_path(config_file: Path) -> Path:
     return config_file.with_name(f"{config_file.stem}{HTTPS_INTERCEPTION_STATE_FILE_SUFFIX}")
 
 
+def https_discovery_state_file_path(config_file: Path) -> Path:
+    return config_file.with_name(f"{config_file.stem}{HTTPS_DISCOVERY_STATE_FILE_SUFFIX}")
+
+
 def parse_datetime_text(value: str | None) -> datetime | None:
     if not value:
         return None

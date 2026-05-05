@@ -12,7 +12,7 @@ from pathlib import Path
 from .constants import *
 from .certificates import HttpsCertificateManager
 from .records import build_failure_snapshot_from_records
-from .traffic import AutoProxyFailureManager, HttpsInterceptionTrustManager, TrafficQuotaManager
+from .traffic import AutoProxyFailureManager, HttpsDiscoveryManager, HttpsInterceptionTrustManager, TrafficQuotaManager
 from .util import *
 
 class DashboardState:
@@ -857,6 +857,7 @@ class AppRuntime:
         self.https_traffic_logger = HttpsTrafficLogger(None)
         self.traffic_quota_manager = TrafficQuotaManager()
         self.auto_proxy_failure_manager = None
+        self.https_discovery_manager = None
         self.self_endpoints = SelfEndpoints()
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
         self.https_interception = HttpsCertificateManager(
@@ -978,8 +979,16 @@ class AppRuntime:
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.shutdown()
             self.auto_proxy_failure_manager = None
+        if self.https_discovery_manager is not None:
+            self.https_discovery_manager.shutdown()
+            self.https_discovery_manager = None
         if router_config is not None:
             self.auto_proxy_failure_manager = AutoProxyFailureManager(router_config)
+            self.https_discovery_manager = HttpsDiscoveryManager(
+                router_config,
+                self.auto_proxy_failure_manager,
+                notify_callback=self.notify_dashboard_update,
+            )
             self.https_interception_trust = HttpsInterceptionTrustManager(
                 https_interception_state_file_path(router_config.config_file)
             )
@@ -1005,8 +1014,27 @@ class AppRuntime:
     def https_interception_status(self, settings=None):
         status = self.https_interception.status(settings)
         status.update(self.https_interception_trust.snapshot())
+        status["https_discovery"] = (
+            self.https_discovery_manager.snapshot()
+            if self.https_discovery_manager is not None
+            else {
+                "state_file": None,
+                "probe_cooldown_seconds": int(HTTPS_DISCOVERY_PROBE_COOLDOWN.total_seconds()),
+                "probe_timeout_seconds": HTTPS_DISCOVERY_PROBE_TIMEOUT_SECONDS,
+                "total_domains": 0,
+                "in_flight": 0,
+                "proxy_recommended": 0,
+                "manual_review": 0,
+                "recent": [],
+            }
+        )
         status["trust_policy"] = str((settings or {}).get("trust_policy") or "adaptive")
         return status
+
+    def observe_https_connect(self, host: str | None, port: int | None, route_decision):
+        if self.https_discovery_manager is None:
+            return None
+        return self.https_discovery_manager.observe_connect(host, port, route_decision)
 
     def https_interception_adaptive_bypass(self, client: str | None, host: str | None, settings=None):
         trust_policy = str((settings or {}).get("trust_policy") or "adaptive").strip().lower()
@@ -1293,10 +1321,15 @@ class AppRuntime:
         self.traffic_quota_manager.clear()
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.clear_observations()
+        if self.https_discovery_manager is not None:
+            self.https_discovery_manager.clear_observations()
         self.https_interception_trust.clear_observations()
         self.notify_dashboard_update("clear")
 
     def close(self):
+        if self.https_discovery_manager is not None:
+            self.https_discovery_manager.shutdown()
+            self.https_discovery_manager = None
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.shutdown()
             self.auto_proxy_failure_manager = None

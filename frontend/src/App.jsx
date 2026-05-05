@@ -267,6 +267,13 @@ function emptyHttpsInterceptionStatus() {
     adaptive_bypass_count: 0,
     active_bypasses: [],
     adaptive_bypass_ttl_seconds: 3600,
+    https_discovery: {
+      total_domains: 0,
+      in_flight: 0,
+      proxy_recommended: 0,
+      manual_review: 0,
+      recent: [],
+    },
     last_success: null,
     last_failure: null,
   }
@@ -1348,6 +1355,16 @@ function currentHttpsInterceptionStatus(snapshot) {
         }))
       : [],
     adaptive_bypass_ttl_seconds: Number(source.adaptive_bypass_ttl_seconds) || 3600,
+    https_discovery:
+      source.https_discovery && typeof source.https_discovery === 'object'
+        ? {
+            total_domains: Number(source.https_discovery.total_domains) || 0,
+            in_flight: Number(source.https_discovery.in_flight) || 0,
+            proxy_recommended: Number(source.https_discovery.proxy_recommended) || 0,
+            manual_review: Number(source.https_discovery.manual_review) || 0,
+            recent: Array.isArray(source.https_discovery.recent) ? source.https_discovery.recent : [],
+          }
+        : emptyHttpsInterceptionStatus().https_discovery,
     last_success: normalizeHttpsInterceptionActivity(source.last_success),
     last_failure: normalizeHttpsInterceptionActivity(source.last_failure),
   }
@@ -4509,17 +4526,7 @@ function App() {
                                   ) : (
                                     <button
                                       type="button"
-                                      onClick={() => {
-                                        const nextConfig = cloneJson(currentRouterConfig)
-                                        const targetScope = getRoutingTargetById(nextConfig, entry.scope)
-                                        if (!targetScope || !targetScope.rules[entry.index]) {
-                                          return
-                                        }
-                                        targetScope.rules.splice(entry.index, 1)
-                                        setLocalRouterConfig(nextConfig, {
-                                          message: 'Rule removed. Syncing automatically.',
-                                        })
-                                      }}
+                                      onClick={() => removeRule(entry.scope, entry.index)}
                                     >
                                       Delete
                                     </button>
@@ -4591,6 +4598,17 @@ function App() {
                       : 'No temporary bypasses'}
                   </div>
                   <div className={noteClass}>Apps that reject the CA temporarily fall back to raw CONNECT.</div>
+                </div>
+                <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
+                  <div className="text-xs text-[#6a6f73]">HTTPS discovery</div>
+                  <div className="mt-1 [overflow-wrap:anywhere] font-bold">
+                    {httpsInterceptionStatus.https_discovery.total_domains} domain(s)
+                  </div>
+                  <div className={noteClass}>
+                    {httpsInterceptionStatus.https_discovery.in_flight
+                      ? `${httpsInterceptionStatus.https_discovery.in_flight} probe(s) running`
+                      : `${httpsInterceptionStatus.https_discovery.proxy_recommended} proxy match(es), ${httpsInterceptionStatus.https_discovery.manual_review} review item(s)`}
+                  </div>
                 </div>
                 <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
                   <div className="text-xs text-[#6a6f73]">Certificate authority</div>

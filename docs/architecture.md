@@ -79,6 +79,7 @@ Persisted files:
 - `router-config.json`: routing, upstream, optional proxy auth, quota, exemption, and profile configuration
 - `router-config-auto-proxy-state.json`: auto-proxy activation state
 - `router-config-https-interception-state.json`: adaptive HTTPS trust and fallback state
+- `router-config-https-discovery-state.json`: unmanaged HTTPS domain discovery and probe state
 - `https-interception/`: generated local CA and per-host certificates
 - `usage.log`: JSONL transfer summaries
 - `failures.log`: JSONL failed-request events
@@ -92,6 +93,7 @@ On backend startup:
 - the HTTPS traffic cache reads `https-traffic.log` incrementally for dashboard and analyzer API queries
 - the auto-proxy manager reloads its persisted state file
 - adaptive HTTPS interception reloads trusted-client observations and temporary bypasses
+- HTTPS discovery reloads recently probed unmanaged domains to avoid repeated direct/proxy probes
 
 This means the dashboard and routing-related state survive container restarts as long as `./data` is preserved.
 
@@ -162,4 +164,5 @@ Common defaults:
 - Optional proxy authentication supports HTTP Basic `Proxy-Authorization` and SOCKS5 username/password. Anonymous access can remain enabled, and authenticated traffic is logged, limited, and exempted as `user:<username>` while retaining the source IP metadata.
 - HTTPS interception uses adaptive fallback: successful TLS handshakes mark a client as CA-trusted, while TLS trust failures temporarily bypass MITM for that client or host and use raw CONNECT.
 - Intercepted HTTPS analyzer records are append-only JSONL with a stable request id, route metadata, redacted headers, byte totals, and bounded decoded text body previews so a UI or external AI agent can inspect captured traffic without scraping the dashboard.
+- HTTPS discovery watches unmanaged direct HTTPS `CONNECT` traffic and probes direct TLS versus upstream TLS in the background. If direct TLS fails and upstream TLS succeeds, it activates the existing temporary auto-proxy rule flow. Raw tunnel completion alone is not treated as proof that the website worked.
 - SOCKS5 remains a raw tunnel path for apps that reject user-installed CAs or use certificate pinning.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import threading
 from collections import deque
 from datetime import datetime, timedelta
@@ -655,6 +657,416 @@ class AutoProxyFailureManager:
                 self._save_state_locked()
 
 
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise OSError("connection closed while reading from socket")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _create_http_proxy_tunnel(proxy_host: str, proxy_port: int, target_host: str, target_port: int, timeout: int):
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        authority = f"{target_host}:{int(target_port)}"
+        request = (
+            f"CONNECT {authority} HTTP/1.1\r\n"
+            f"Host: {authority}\r\n"
+            "Proxy-Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii", errors="replace")
+        sock.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response and len(response) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        head = bytes(response).split(b"\r\n\r\n", 1)[0]
+        status_line = head.splitlines()[0].decode("iso-8859-1", errors="replace") if head else ""
+        parts = status_line.split(" ", 2)
+        status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        if status_code != 200:
+            raise OSError(f"HTTP upstream CONNECT failed with status {status_code or 'unknown'}")
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+def _create_socks5_proxy_tunnel(proxy_host: str, proxy_port: int, target_host: str, target_port: int, timeout: int):
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(bytes([SOCKS_VERSION, 0x01, 0x00]))
+        method_reply = _recv_exact(sock, 2)
+        if method_reply[0] != SOCKS_VERSION or method_reply[1] != 0x00:
+            raise OSError("SOCKS5 upstream rejected no-auth handshake")
+
+        address_bytes = target_host.encode("idna")
+        if len(address_bytes) > 255:
+            raise ValueError("destination host is too long for SOCKS5")
+        request = bytearray([SOCKS_VERSION, SOCKS_CMD_CONNECT, 0x00, SOCKS_ATYP_DOMAIN, len(address_bytes)])
+        request.extend(address_bytes)
+        request.extend(int(target_port).to_bytes(2, "big"))
+        sock.sendall(request)
+
+        header = _recv_exact(sock, 4)
+        if header[0] != SOCKS_VERSION:
+            raise OSError("invalid SOCKS5 upstream reply")
+        if header[1] != 0x00:
+            raise OSError(f"SOCKS5 upstream connect failed with reply code 0x{header[1]:02x}")
+        atyp = header[3]
+        if atyp == SOCKS_ATYP_IPV4:
+            _recv_exact(sock, 4)
+        elif atyp == SOCKS_ATYP_IPV6:
+            _recv_exact(sock, 16)
+        elif atyp == SOCKS_ATYP_DOMAIN:
+            length = _recv_exact(sock, 1)[0]
+            _recv_exact(sock, length)
+        else:
+            raise OSError("invalid SOCKS5 upstream address type")
+        _recv_exact(sock, 2)
+        return sock
+    except Exception:
+        sock.close()
+        raise
+
+
+class HttpsDiscoveryManager:
+    def __init__(
+        self,
+        router_config: RouterConfigManager,
+        auto_proxy_failure_manager: AutoProxyFailureManager | None,
+        *,
+        timeout_seconds: int = HTTPS_DISCOVERY_PROBE_TIMEOUT_SECONDS,
+        notify_callback=None,
+    ):
+        self.router_config = router_config
+        self.auto_proxy_failure_manager = auto_proxy_failure_manager
+        self.state_file = https_discovery_state_file_path(router_config.config_file)
+        self.timeout_seconds = int(timeout_seconds)
+        self._notify_callback = notify_callback
+        self._lock = threading.Lock()
+        self._state = self._load_state()
+        self._stop_event = threading.Event()
+
+    def observe_connect(self, host: str | None, port: int | None, route_decision):
+        plan = self._prepare_probe(host, port, route_decision)
+        if plan is None:
+            return None
+        thread = threading.Thread(
+            target=self._run_probe,
+            args=(plan,),
+            name=f"https-discovery-{plan['pattern']}",
+            daemon=True,
+        )
+        thread.start()
+        self._notify()
+        return {"status": "scheduled", "pattern": plan["pattern"], "profile_id": plan["profile_id"]}
+
+    def probe_now(self, host: str | None, port: int | None, route_decision):
+        plan = self._prepare_probe(host, port, route_decision)
+        if plan is None:
+            return None
+        return self._run_probe(plan)
+
+    def snapshot(self):
+        now = datetime.now().astimezone()
+        with self._lock:
+            dirty = self._prune_in_flight_locked()
+            total_domains = 0
+            in_flight = 0
+            proxy_recommended = 0
+            manual_review = 0
+            recent = []
+            for profile_id, profile in sorted(self._state.get("profiles", {}).items()):
+                for pattern, state in sorted((profile.get("domains") or {}).items()):
+                    total_domains += 1
+                    if state.get("probe_in_flight"):
+                        in_flight += 1
+                    if state.get("status") == "proxy-recommended":
+                        proxy_recommended += 1
+                    if state.get("status") == "manual-review":
+                        manual_review += 1
+                    recent.append(
+                        {
+                            "profile_id": profile_id,
+                            "pattern": pattern,
+                            "host": str(state.get("host") or ""),
+                            "status": str(state.get("status") or "seen"),
+                            "last_seen_at": state.get("last_seen_at"),
+                            "last_probe_at": state.get("last_probe_at"),
+                            "direct_tls": state.get("direct_tls") if isinstance(state.get("direct_tls"), dict) else None,
+                            "proxy_tls": state.get("proxy_tls") if isinstance(state.get("proxy_tls"), dict) else None,
+                        }
+                    )
+            recent.sort(key=lambda item: str(item.get("last_probe_at") or item.get("last_seen_at") or ""), reverse=True)
+            if dirty:
+                self._save_state_locked()
+            return {
+                "state_file": str(self.state_file),
+                "probe_cooldown_seconds": int(HTTPS_DISCOVERY_PROBE_COOLDOWN.total_seconds()),
+                "probe_timeout_seconds": self.timeout_seconds,
+                "total_domains": total_domains,
+                "in_flight": in_flight,
+                "proxy_recommended": proxy_recommended,
+                "manual_review": manual_review,
+                "recent": recent[:20],
+                "generated_at": now.isoformat(timespec="milliseconds"),
+            }
+
+    def clear_observations(self):
+        with self._lock:
+            self._state = {"version": 1, "profiles": {}}
+            self._save_state_locked()
+
+    def shutdown(self):
+        self._stop_event.set()
+
+    def _prepare_probe(self, host: str | None, port: int | None, route_decision):
+        if self._stop_event.is_set() or route_decision is None:
+            return None
+        try:
+            normalized_port = int(port)
+        except (TypeError, ValueError):
+            return None
+        if normalized_port != 443:
+            return None
+        normalized_host = normalize_host(host or "")
+        pattern = summarize_domain(normalized_host) or normalized_host
+        if not normalized_host or not pattern or is_ip_address_text(pattern):
+            return None
+        if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        if route_decision.get("auto_proxy_probe"):
+            return None
+        upstream = route_decision.get("upstream")
+        if not isinstance(upstream, dict):
+            return None
+
+        profile_id = str(route_decision.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID)
+        evaluation = self.router_config.auto_proxy_evaluation(normalized_host, profile_id=profile_id)
+        if not evaluation.get("eligible"):
+            return None
+        resolved_profile_id = str(evaluation.get("profile_id") or profile_id)
+
+        now = datetime.now().astimezone()
+        with self._lock:
+            self._prune_in_flight_locked()
+            domains = self._profile_domains_locked(resolved_profile_id, create=True)
+            state = domains.setdefault(pattern, self._default_state(normalized_host))
+            state["host"] = normalized_host
+            state["last_seen_at"] = now.isoformat(timespec="milliseconds")
+            last_probe_at = parse_datetime_text(state.get("last_probe_at"))
+            if state.get("probe_in_flight"):
+                self._save_state_locked()
+                return None
+            if last_probe_at is not None and now - last_probe_at < HTTPS_DISCOVERY_PROBE_COOLDOWN:
+                self._save_state_locked()
+                return None
+            state["probe_in_flight"] = True
+            state["probe_started_at"] = now.isoformat(timespec="milliseconds")
+            state["status"] = "probing"
+            self._save_state_locked()
+
+        return {
+            "host": normalized_host,
+            "port": normalized_port,
+            "pattern": pattern,
+            "profile_id": resolved_profile_id,
+            "upstream": json.loads(json.dumps(upstream)),
+        }
+
+    def _run_probe(self, plan):
+        if self._stop_event.is_set():
+            return None
+        direct_result = self._probe_tls_direct(plan["host"], plan["port"])
+        proxy_result = None
+        status = "direct-ok" if direct_result["ok"] else "direct-failed"
+        if not direct_result["ok"] and not self._stop_event.is_set():
+            proxy_result = self._probe_tls_via_upstream(plan["host"], plan["port"], plan["upstream"])
+            status = "proxy-recommended" if proxy_result["ok"] else "manual-review"
+
+        now = datetime.now().astimezone()
+        with self._lock:
+            state = self._profile_domains_locked(plan["profile_id"], create=True).setdefault(
+                plan["pattern"],
+                self._default_state(plan["host"]),
+            )
+            state["host"] = plan["host"]
+            state["status"] = status
+            state["probe_in_flight"] = False
+            state["probe_started_at"] = None
+            state["last_probe_at"] = now.isoformat(timespec="milliseconds")
+            state["direct_tls"] = direct_result
+            state["proxy_tls"] = proxy_result
+            self._save_state_locked()
+
+        if status == "proxy-recommended":
+            self._activate_auto_proxy(plan)
+        elif status == "manual-review":
+            self._record_manual_review(plan, direct_result, proxy_result)
+        self._notify()
+        return {"status": status, "direct_tls": direct_result, "proxy_tls": proxy_result}
+
+    def _activate_auto_proxy(self, plan):
+        if self.auto_proxy_failure_manager is None:
+            return
+        self.auto_proxy_failure_manager.record_success(
+            plan["host"],
+            route_label=build_auto_proxy_probe_route_label(plan["upstream"]),
+            profile_id=plan["profile_id"],
+        )
+
+    def _record_manual_review(self, plan, direct_result, proxy_result):
+        if self.auto_proxy_failure_manager is None:
+            return
+        direct_error = direct_result.get("error") or "direct TLS failed"
+        proxy_error = (proxy_result or {}).get("error") or "upstream TLS failed"
+        self.auto_proxy_failure_manager.record_failure(
+            plan["host"],
+            route_label=build_auto_proxy_probe_route_label(plan["upstream"]),
+            destination=f"https://{plan['host']}/",
+            error=f"HTTPS discovery probe failed direct and through upstream. Direct: {direct_error}; upstream: {proxy_error}",
+            context="https discovery tls probe",
+            method="CONNECT",
+            profile_id=plan["profile_id"],
+        )
+
+    def _probe_tls_direct(self, host: str, port: int):
+        try:
+            raw = socket.create_connection((host, int(port)), timeout=self.timeout_seconds)
+            return self._wrap_tls_probe(raw, host)
+        except Exception as exc:
+            return {"ok": False, "error": self._describe_probe_error(exc)}
+
+    def _probe_tls_via_upstream(self, host: str, port: int, upstream: dict):
+        try:
+            upstream_type = str(upstream.get("type") or "http").strip().lower()
+            upstream_host = str(upstream.get("host") or "").strip()
+            upstream_port = int(upstream.get("port") or 0)
+            if upstream_type == "socks5":
+                raw = _create_socks5_proxy_tunnel(upstream_host, upstream_port, host, int(port), self.timeout_seconds)
+            else:
+                raw = _create_http_proxy_tunnel(upstream_host, upstream_port, host, int(port), self.timeout_seconds)
+            return self._wrap_tls_probe(raw, host)
+        except Exception as exc:
+            return {"ok": False, "error": self._describe_probe_error(exc)}
+
+    def _wrap_tls_probe(self, raw_socket: socket.socket, host: str):
+        try:
+            with raw_socket:
+                with ssl.create_default_context().wrap_socket(raw_socket, server_hostname=host):
+                    return {"ok": True, "error": ""}
+        except Exception as exc:
+            return {"ok": False, "error": self._describe_probe_error(exc)}
+
+    def _describe_probe_error(self, exc: Exception) -> str:
+        if isinstance(exc, TimeoutError):
+            return "TLS probe timed out."
+        if isinstance(exc, socket.gaierror):
+            return "TLS probe could not resolve host."
+        if isinstance(exc, ssl.SSLError):
+            return f"TLS handshake failed: {exc}"
+        if isinstance(exc, OSError):
+            return str(exc) or exc.__class__.__name__
+        return str(exc) or exc.__class__.__name__
+
+    def _notify(self):
+        if self._notify_callback is None:
+            return
+        try:
+            self._notify_callback("https-discovery")
+        except Exception as exc:
+            debug_exception("system", "failed to notify HTTPS discovery update", exc)
+
+    def _default_state(self, host: str | None = None):
+        return {
+            "host": normalize_host(host or "") or None,
+            "status": "seen",
+            "last_seen_at": None,
+            "last_probe_at": None,
+            "probe_in_flight": False,
+            "probe_started_at": None,
+            "direct_tls": None,
+            "proxy_tls": None,
+        }
+
+    def _load_state(self):
+        try:
+            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {"version": 1, "profiles": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "profiles": {}}
+        loaded_profiles = {}
+        raw_profiles = payload.get("profiles")
+        if isinstance(raw_profiles, dict):
+            for raw_profile_id, raw_profile in raw_profiles.items():
+                profile_id = str(raw_profile_id or "").strip() or DEFAULT_ROUTING_PROFILE_ID
+                raw_domains = raw_profile.get("domains", {}) if isinstance(raw_profile, dict) else {}
+                loaded_domains = {}
+                if isinstance(raw_domains, dict):
+                    for raw_pattern, raw_state in raw_domains.items():
+                        pattern = normalize_rule_pattern(str(raw_pattern or ""))
+                        if not pattern or not isinstance(raw_state, dict):
+                            continue
+                        loaded_domains[pattern] = {
+                            "host": normalize_host(str(raw_state.get("host") or "")) or None,
+                            "status": str(raw_state.get("status") or "seen"),
+                            "last_seen_at": str(raw_state.get("last_seen_at") or "").strip() or None,
+                            "last_probe_at": str(raw_state.get("last_probe_at") or "").strip() or None,
+                            "probe_in_flight": False,
+                            "probe_started_at": None,
+                            "direct_tls": raw_state.get("direct_tls") if isinstance(raw_state.get("direct_tls"), dict) else None,
+                            "proxy_tls": raw_state.get("proxy_tls") if isinstance(raw_state.get("proxy_tls"), dict) else None,
+                        }
+                if loaded_domains:
+                    loaded_profiles[profile_id] = {"domains": loaded_domains}
+        return {"version": 1, "profiles": loaded_profiles}
+
+    def _save_state_locked(self):
+        serialized = {"version": 1, "profiles": self._state.get("profiles", {})}
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.state_file.with_name(f"{self.state_file.name}.tmp")
+        temporary_file.write_text(json.dumps(serialized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary_file.replace(self.state_file)
+
+    def _profile_domains_locked(self, profile_id: str | None = None, *, create: bool = False):
+        normalized_profile_id = str(profile_id or DEFAULT_ROUTING_PROFILE_ID).strip() or DEFAULT_ROUTING_PROFILE_ID
+        profiles = self._state.setdefault("profiles", {})
+        profile_entry = profiles.get(normalized_profile_id)
+        if profile_entry is None:
+            if not create:
+                return {}
+            profile_entry = {"domains": {}}
+            profiles[normalized_profile_id] = profile_entry
+        return profile_entry.setdefault("domains", {})
+
+    def _prune_in_flight_locked(self) -> bool:
+        now = datetime.now().astimezone()
+        dirty = False
+        for profile in self._state.get("profiles", {}).values():
+            for state in (profile.get("domains") or {}).values():
+                if not state.get("probe_in_flight"):
+                    continue
+                started_at = parse_datetime_text(state.get("probe_started_at"))
+                if started_at is not None and now - started_at <= timedelta(seconds=max(30, self.timeout_seconds * 4)):
+                    continue
+                state["probe_in_flight"] = False
+                state["probe_started_at"] = None
+                if state.get("status") == "probing":
+                    state["status"] = "seen"
+                dirty = True
+        return dirty
+
+
 class HttpsInterceptionTrustManager:
     def __init__(self, state_file: Path | None):
         self.state_file = Path(state_file) if state_file is not None else None
@@ -749,7 +1161,11 @@ class HttpsInterceptionTrustManager:
                 "context": str(context or "HTTPS interception TLS handshake"),
                 "source": str(source or "intercept"),
             }
-            if source == "trust-check" or not client_state.get("trusted_at"):
+            active_bypass_count = self._active_bypass_count_locked(client_state, now)
+            if source == "trust-check" or (
+                not client_state.get("trusted_at")
+                and active_bypass_count >= HTTPS_INTERCEPTION_CLIENT_BYPASS_FAILURE_THRESHOLD
+            ):
                 client_state["untrusted_until"] = expires_at.isoformat()
                 client_state["untrusted_reason"] = reason
             client_state["last_failure"] = {
@@ -915,6 +1331,14 @@ class HttpsInterceptionTrustManager:
                     bypasses.pop(pattern, None)
                     dirty = True
         return dirty
+
+    def _active_bypass_count_locked(self, client_state, now: datetime) -> int:
+        count = 0
+        for bypass in (client_state.get("bypasses") or {}).values():
+            expires_at = parse_datetime_text(bypass.get("expires_at")) if isinstance(bypass, dict) else None
+            if expires_at is not None and expires_at > now:
+                count += 1
+        return count
 
     def _latest_activity(self, current, candidate):
         if not isinstance(candidate, dict):

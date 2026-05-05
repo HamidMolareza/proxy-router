@@ -14,7 +14,7 @@ class HttpsInterceptionAdaptiveTests(unittest.TestCase):
         normalized = normalize_router_config({"https_interception": {"enabled": True}})
         self.assertEqual(normalized["https_interception"]["trust_policy"], "adaptive")
 
-    def test_first_trust_failure_adds_client_wide_temporary_bypass(self):
+    def test_first_intercept_failure_adds_host_temporary_bypass(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = HttpsInterceptionTrustManager(Path(temp_dir) / "https-state.json")
 
@@ -26,7 +26,42 @@ class HttpsInterceptionAdaptiveTests(unittest.TestCase):
                 source="intercept",
             )
 
+            host_bypass = manager.current_bypass("10.0.0.2", "api.example.com")
+            unrelated_bypass = manager.current_bypass("10.0.0.2", "other.example.org")
+            self.assertIsNotNone(host_bypass)
+            self.assertEqual(host_bypass["scope"], "host")
+            self.assertIsNone(unrelated_bypass)
+
+    def test_trust_check_failure_adds_client_wide_temporary_bypass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = HttpsInterceptionTrustManager(Path(temp_dir) / "https-state.json")
+
+            manager.record_failure(
+                "10.0.0.2",
+                "proxy.router",
+                error="tlsv1 alert unknown ca",
+                context="HTTPS CA trust check",
+                source="trust-check",
+            )
+
             bypass = manager.current_bypass("10.0.0.2", "other.example.org")
+            self.assertIsNotNone(bypass)
+            self.assertEqual(bypass["scope"], "client")
+
+    def test_repeated_intercept_failures_add_client_wide_temporary_bypass(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = HttpsInterceptionTrustManager(Path(temp_dir) / "https-state.json")
+
+            for host in ("one.example.com", "two.example.net", "three.example.org"):
+                manager.record_failure(
+                    "10.0.0.2",
+                    host,
+                    error="tlsv1 alert unknown ca",
+                    context="HTTPS interception TLS handshake",
+                    source="intercept",
+                )
+
+            bypass = manager.current_bypass("10.0.0.2", "unrelated.example.test")
             self.assertIsNotNone(bypass)
             self.assertEqual(bypass["scope"], "client")
 
