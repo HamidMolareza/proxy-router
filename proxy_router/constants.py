@@ -78,6 +78,7 @@ AUTO_PROXY_STAGE_DURATIONS = (
 AUTO_PROXY_RULE_NOTE_PREFIX = "auto-proxy:"
 AUTO_PROXY_PROBE_ROUTE_LABEL_PREFIX = "proxy:auto-probe:"
 AUTO_PROXY_STATE_FILE_SUFFIX = "-auto-proxy-state.json"
+RULE_SUGGESTIONS_STATE_FILE_SUFFIX = "-rule-suggestions.json"
 HTTPS_INTERCEPTION_STATE_FILE_SUFFIX = "-https-interception-state.json"
 HTTPS_DISCOVERY_STATE_FILE_SUFFIX = "-https-discovery-state.json"
 HTTPS_INTERCEPTION_TRUST_POLICIES = {"adaptive"}

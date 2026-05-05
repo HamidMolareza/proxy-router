@@ -197,6 +197,7 @@ function emptyDashboardSnapshot() {
     known_clients: [],
     client_block_status: {},
     client_quota_status: {},
+    rule_suggestions: [],
     failure_summary: {
       grouped_visible: [],
       grouped_ignored: [],
@@ -2148,6 +2149,8 @@ function App() {
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
   const [showAllRuleIssues, setShowAllRuleIssues] = useState(false)
   const [ruleConflictCheckStatus, setRuleConflictCheckStatus] = useState(null)
+  const [ruleSuggestionActionStatus, setRuleSuggestionActionStatus] = useState(null)
+  const [ruleSuggestionRejectMessages, setRuleSuggestionRejectMessages] = useState({})
   const [isClearingTraffic, setIsClearingTraffic] = useState(false)
   const [isSavingRouter, setIsSavingRouter] = useState(false)
   const [routerSaveError, setRouterSaveError] = useState('')
@@ -2261,6 +2264,8 @@ function App() {
     dashboardSnapshot,
   )
   const knownClients = Array.isArray(dashboardSnapshot.known_clients) ? dashboardSnapshot.known_clients : []
+  const ruleSuggestions = Array.isArray(dashboardSnapshot.rule_suggestions) ? dashboardSnapshot.rule_suggestions : []
+  const pendingRuleSuggestions = ruleSuggestions.filter((item) => item && item.status === 'pending')
   const snapshotClientBlockStatus = dashboardSnapshot.client_block_status || {}
   const historyNote = historyError || buildHistoryNote(historyData)
   const historyPeriodTotals = Array.isArray(historyData.period_totals) ? historyData.period_totals : []
@@ -3383,6 +3388,59 @@ function App() {
     }
   }
 
+  async function applyRuleSuggestionAction(suggestionId, action) {
+    const normalizedId = String(suggestionId || '').trim()
+    if (!normalizedId || !['approve', 'reject'].includes(action)) {
+      return
+    }
+    try {
+      const body =
+        action === 'reject'
+          ? { message: String(ruleSuggestionRejectMessages[normalizedId] || '').trim() }
+          : {}
+      const response = await fetch(`/api/rule-suggestions/${encodeURIComponent(normalizedId)}/${action}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `rule suggestion HTTP ${response.status}`)
+      }
+      if (payload.router_config) {
+        const normalizedConfig = normalizeRouterConfig(payload.router_config)
+        setCurrentRouterConfig(normalizedConfig)
+        setLastSavedRouterConfig(cloneJson(normalizedConfig))
+        setRouterSaveError('')
+      }
+      if (Array.isArray(payload.suggestions)) {
+        setDashboardSnapshot((existingSnapshot) => ({
+          ...existingSnapshot,
+          rule_suggestions: payload.suggestions,
+        }))
+      }
+      if (action === 'reject') {
+        setRuleSuggestionRejectMessages((current) => {
+          const next = { ...current }
+          delete next[normalizedId]
+          return next
+        })
+      }
+      setRuleSuggestionActionStatus({
+        text: `Rule suggestion ${action === 'approve' ? 'approved' : 'rejected'}.`,
+        warning: false,
+      })
+    } catch (error) {
+      setRuleSuggestionActionStatus({
+        text: `Rule suggestion ${action} failed: ${error.message}`,
+        warning: true,
+      })
+    }
+  }
+
   function renderRuleIssueActions(ref) {
     if (!ref || ref.source === 'auto') {
       return ref ? (
@@ -4216,6 +4274,149 @@ function App() {
                     ) : (
                       <div className={mutedClass}>No ignored domains yet.</div>
                     )}
+                  </div>
+                </section>
+
+                <section className={cx(subpanelClass, 'order-2 col-span-full')}>
+                  <div className={panelHeaderClass}>
+                    <div>
+                      <h3>Rule suggestions</h3>
+                      <div className={noteClass}>
+                        Pending suggestions from authenticated users can be approved after conflicts are resolved.
+                      </div>
+                    </div>
+                    <span className={cx(pillClass, pendingRuleSuggestions.length && warningPillClass)}>
+                      {`${pendingRuleSuggestions.length} pending`}
+                    </span>
+                  </div>
+
+                  {ruleSuggestionActionStatus ? (
+                    <div className={cx('mt-3', pillClass, ruleSuggestionActionStatus.warning && warningPillClass)}>
+                      {ruleSuggestionActionStatus.text}
+                    </div>
+                  ) : null}
+
+                  <div className={cx(tableWrapClass, 'mt-3')}>
+                    <table className="min-w-[88rem]">
+                      <thead>
+                        <tr>
+                          <th>Status</th>
+                          <th>Requester</th>
+                          <th>Rule</th>
+                          <th>Profile</th>
+                          <th>Conflicts</th>
+                          <th>Request note</th>
+                          <th>Admin message</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {ruleSuggestions.length ? (
+                          ruleSuggestions.map((suggestion) => {
+                            const rule = suggestion.rule || {}
+                            const currentConflicts = Array.isArray(suggestion.current_conflicts)
+                              ? suggestion.current_conflicts
+                              : []
+                            const storedConflicts = Array.isArray(suggestion.conflicts) ? suggestion.conflicts : []
+                            const conflicts = currentConflicts.length ? currentConflicts : storedConflicts
+                            const requesterParts = [
+                              suggestion.requester || '',
+                              suggestion.requester_label || '',
+                              suggestion.requester_ip ? `IP ${suggestion.requester_ip}` : '',
+                            ].filter(Boolean)
+                            const status = String(suggestion.status || 'pending')
+                            const rejectMessage = ruleSuggestionRejectMessages[suggestion.id] || ''
+                            return (
+                              <tr key={suggestion.id}>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    <strong>{status}</strong>
+                                    <small>{formatStatusDateTime(suggestion.requested_at)}</small>
+                                    {suggestion.resolved_at ? <small>{`Resolved ${formatStatusDateTime(suggestion.resolved_at)}`}</small> : null}
+                                  </div>
+                                </td>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    <strong>{requesterParts[0] || 'user'}</strong>
+                                    {requesterParts.slice(1).map((part) => <small key={part}>{part}</small>)}
+                                  </div>
+                                </td>
+                                <td>
+                                  <div className={ruleMetaClass}>
+                                    <strong>{rule.pattern || 'unknown'}</strong>
+                                    <small>{`${rule.match || 'suffix'} · ${rule.action || 'proxy'} · ${rule.duration || 'always'}`}</small>
+                                  </div>
+                                </td>
+                                <td>{suggestion.profile_name || suggestion.profile_id || 'Shared'}</td>
+                                <td>
+                                  {suggestion.current_error ? (
+                                    <div className={cx(pillClass, warningPillClass)}>{suggestion.current_error}</div>
+                                  ) : conflicts.length ? (
+                                    <div className={ruleMetaClass}>
+                                      <strong>{`${conflicts.length} ${
+                                        currentConflicts.length ? 'current' : 'submitted'
+                                      } conflict${conflicts.length === 1 ? '' : 's'}`}</strong>
+                                      {conflicts.slice(0, 2).map((issue) => (
+                                        <small key={ruleIssueKey(issue)}>{issue.message}</small>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <span className={mutedClass}>None</span>
+                                  )}
+                                </td>
+                                <td>{suggestion.request_note || ''}</td>
+                                <td>
+                                  {status === 'pending' ? (
+                                    <input
+                                      type="text"
+                                      value={rejectMessage}
+                                      placeholder="optional rejection message"
+                                      onChange={(event) => {
+                                        const value = event.target.value
+                                        setRuleSuggestionRejectMessages((current) => ({
+                                          ...current,
+                                          [suggestion.id]: value,
+                                        }))
+                                      }}
+                                    />
+                                  ) : (
+                                    suggestion.admin_message || ''
+                                  )}
+                                </td>
+                                <td className={ruleActionsClass}>
+                                  {status === 'pending' ? (
+                                    <>
+                                      <button
+                                        type="button"
+                                        disabled={Boolean(currentConflicts.length || suggestion.current_error)}
+                                        onClick={() => applyRuleSuggestionAction(suggestion.id, 'approve')}
+                                      >
+                                        Approve
+                                      </button>
+                                      <button
+                                        className={warnButtonClass}
+                                        type="button"
+                                        onClick={() => applyRuleSuggestionAction(suggestion.id, 'reject')}
+                                      >
+                                        Reject
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <span className={mutedClass}>Resolved</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })
+                        ) : (
+                          <tr>
+                            <td colSpan="8" className="pt-2 text-[#6a6f73]">
+                              No rule suggestions submitted yet.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
                   </div>
                 </section>
 

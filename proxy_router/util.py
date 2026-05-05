@@ -76,6 +76,10 @@ def auto_proxy_state_file_path(config_file: Path) -> Path:
     return config_file.with_name(f"{config_file.stem}{AUTO_PROXY_STATE_FILE_SUFFIX}")
 
 
+def rule_suggestions_state_file_path(config_file: Path) -> Path:
+    return config_file.with_name(f"{config_file.stem}{RULE_SUGGESTIONS_STATE_FILE_SUFFIX}")
+
+
 def https_interception_state_file_path(config_file: Path) -> Path:
     return config_file.with_name(f"{config_file.stem}{HTTPS_INTERCEPTION_STATE_FILE_SUFFIX}")
 

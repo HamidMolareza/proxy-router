@@ -18,6 +18,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from .config import RuleSuggestionConflictError
 from .constants import *
 from .output import debug_exception, debug_log, log_event
 from .records import UsageHistoryCache
@@ -1147,7 +1148,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _handle_client_portal_request(self, scheme: str, host: str, port: int, target_path: str) -> bool:
-        if self.command not in {"GET", "HEAD"} or scheme not in {"http", "https"}:
+        if self.command not in {"GET", "HEAD", "POST"} or scheme not in {"http", "https"}:
             return False
 
         self_target_kind = self.server.runtime.self_endpoints.resolve_target_kind(host, port)
@@ -1161,6 +1162,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         html_paths = {"/", "/index.html", "/client", "/client/"}
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
         live_paths = {"/api/client/live", "/client.live"}
+        suggestion_paths = {"/api/client/rule-suggestions", "/api/client/rule-suggestions.json"}
         quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
@@ -1181,6 +1183,75 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             port=port,
         ):
             return True
+
+        if self.command == "POST":
+            if route_path not in suggestion_paths:
+                if is_alias_host:
+                    self._send_body_response(
+                        404,
+                        "Not Found",
+                        b"Not Found\n",
+                        content_type="text/plain; charset=utf-8",
+                    )
+                    return True
+                return False
+            manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+            if manager is None:
+                self._send_json_response({"error": "rule suggestions are unavailable"}, status=503)
+                return True
+            try:
+                raw_body = self._read_request_body() or b"{}"
+                payload = json.loads(raw_body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("rule suggestion payload must be an object")
+                runtime_snapshot = self.server.router_config.runtime_snapshot()
+                active_profile = runtime_snapshot.get("active_profile") or {}
+                suggestion = manager.submit(
+                    requester_identity=self._client_identity(),
+                    requester_ip=self.client_address[0],
+                    profile=active_profile,
+                    rule_payload=payload.get("rule") or {},
+                    request_note=str(payload.get("request_note") or ""),
+                    confirm_conflicts=bool(payload.get("confirm_conflicts", False)),
+                )
+                response_snapshot = build_client_portal_snapshot(
+                    self.server,
+                    portal_client_id,
+                    range_key=range_key,
+                    client_ip=self.client_address[0],
+                )
+                self._send_json_response(
+                    {
+                        "ok": True,
+                        "suggestion": suggestion,
+                        "snapshot": response_snapshot,
+                    },
+                    status=200,
+                )
+                return True
+            except PermissionError as exc:
+                self._send_json_response({"error": str(exc)}, status=403)
+                return True
+            except RuleSuggestionConflictError as exc:
+                self._send_json_response(
+                    {
+                        "error": str(exc),
+                        "rule": exc.rule,
+                        "conflicts": exc.conflicts,
+                    },
+                    status=409,
+                )
+                return True
+            except json.JSONDecodeError as exc:
+                self._send_json_response({"error": f"invalid JSON body: {exc.msg}"}, status=400)
+                return True
+            except ValueError as exc:
+                self._send_json_response({"error": str(exc)}, status=400)
+                return True
+            except OSError as exc:
+                self._send_json_response({"error": f"failed to save rule suggestion: {exc}"}, status=500)
+                return True
+
         if route_path in live_paths:
             if not self._is_websocket_upgrade():
                 self._send_body_response(
@@ -3046,10 +3117,18 @@ def build_client_portal_snapshot(server, client: str, *, range_key: str, client_
     quota = server.runtime.traffic_quota_manager.evaluate_client(client_id, server.router_config)
     router_runtime = server.router_config.runtime_snapshot()
     active_profile = router_runtime.get("active_profile") or {}
+    rule_suggestions = []
+    rule_suggestion_manager = getattr(server.runtime, "rule_suggestion_manager", None)
+    if rule_suggestion_manager is not None and client_id.startswith("user:"):
+        rule_suggestions = rule_suggestion_manager.snapshot(
+            client=client_id,
+            include_current_conflicts=True,
+        )
     return {
         "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "client": client_id,
         "client_ip": client_ip,
+        "can_suggest_rules": client_id.startswith("user:"),
         "portal_url": server.runtime.self_endpoints.client_portal_url(),
         "ca_install_url": server.runtime.self_endpoints.client_portal_ca_install_url(),
         "ca_certificate_url": server.runtime.self_endpoints.client_portal_ca_certificate_url(),
@@ -3067,6 +3146,7 @@ def build_client_portal_snapshot(server, client: str, *, range_key: str, client_
             "id": active_profile.get("id") or DEFAULT_ROUTING_PROFILE_ID,
             "name": active_profile.get("name") or "Shared",
         },
+        "rule_suggestions": rule_suggestions,
     }
 
 
@@ -3567,6 +3647,8 @@ def render_client_portal_html(snapshot) -> str:
     recent_failures = list(snapshot.get("recent_failures") or [])
     top_destinations = list(history.get("top_destinations") or [])
     period_totals = list(history.get("period_totals") or [])
+    rule_suggestions = list(snapshot.get("rule_suggestions") or [])
+    can_suggest_rules = bool(snapshot.get("can_suggest_rules"))
 
     if quota.get("exempt"):
         quota_status_text = "Exempt from quota"
@@ -3680,6 +3762,28 @@ def render_client_portal_html(snapshot) -> str:
     if not failure_rows:
         failure_rows.append('<tr><td colspan="4" class="empty">No recent failures recorded for this device.</td></tr>')
 
+    suggestion_rows = []
+    for item in rule_suggestions:
+        rule = item.get("rule") or {}
+        stored_conflicts = item.get("conflicts") or []
+        current_conflicts = item.get("current_conflicts") or []
+        conflict_count = len(current_conflicts or stored_conflicts)
+        message = str(item.get("admin_message") or "").strip()
+        suggestion_rows.append(
+            "<tr>"
+            f"<td>{html.escape(format_portal_timestamp_text(item.get('requested_at')))}</td>"
+            f"<td>{html.escape(str(item.get('status') or 'pending').title())}</td>"
+            f"<td>{html.escape(str(rule.get('pattern') or ''))}</td>"
+            f"<td>{html.escape(str(rule.get('match') or 'suffix'))}</td>"
+            f"<td>{html.escape(str(rule.get('action') or 'proxy'))}</td>"
+            f"<td>{html.escape(str(item.get('profile_name') or 'Shared'))}</td>"
+            f"<td>{html.escape(str(conflict_count))}</td>"
+            f"<td>{html.escape(message)}</td>"
+            "</tr>"
+        )
+    if not suggestion_rows:
+        suggestion_rows.append('<tr><td colspan="8" class="empty">No rule suggestions submitted from this device yet.</td></tr>')
+
     history_summary = history.get("summary") or {}
     history_range_title = html.escape(str(history.get("range_title") or "Selected range"))
     history_requests = html.escape(str(history_summary.get("count") or 0))
@@ -3784,6 +3888,20 @@ def render_client_portal_html(snapshot) -> str:
         }).join("");
       }
 
+      function renderSuggestionRows(snapshot) {
+        const suggestions = snapshot && Array.isArray(snapshot.rule_suggestions) ? snapshot.rule_suggestions : [];
+        if (!suggestions.length) {
+          return '<tr><td colspan="8" class="empty">No rule suggestions submitted from this device yet.</td></tr>';
+        }
+        return suggestions.map((item) => {
+          const rule = item.rule || {};
+          const currentConflicts = Array.isArray(item.current_conflicts) ? item.current_conflicts : [];
+          const storedConflicts = Array.isArray(item.conflicts) ? item.conflicts : [];
+          const conflictCount = currentConflicts.length || storedConflicts.length;
+          return `<tr><td>${escapeHtml(formatTimestamp(item.requested_at))}</td><td>${escapeHtml(item.status || "pending")}</td><td>${escapeHtml(rule.pattern || "")}</td><td>${escapeHtml(rule.match || "suffix")}</td><td>${escapeHtml(rule.action || "proxy")}</td><td>${escapeHtml(item.profile_name || "Shared")}</td><td>${escapeHtml(conflictCount)}</td><td>${escapeHtml(item.admin_message || "")}</td></tr>`;
+        }).join("");
+      }
+
       function setRows(id, rows, emptyHtml) {
         const element = document.getElementById(id);
         if (element) {
@@ -3803,6 +3921,7 @@ def render_client_portal_html(snapshot) -> str:
 
         setText("client-ip", snapshot.client || "unknown");
         setText("active-profile", profile.name || "Shared");
+        setText("suggestion-profile", profile.name || "Shared");
         setText("quota-status", quotaText);
         setText("updated-at", formatTimestamp(snapshot.requested_at));
         setText("total-data", formatMb(totals.total_bytes));
@@ -3861,6 +3980,74 @@ def render_client_portal_html(snapshot) -> str:
           ),
           '<tr><td colspan="4" class="empty">No recent failures recorded for this device.</td></tr>',
         );
+
+        const suggestionRows = document.getElementById("suggestion-rows");
+        if (suggestionRows) suggestionRows.innerHTML = renderSuggestionRows(snapshot);
+      }
+
+      function describeConflicts(conflicts) {
+        if (!Array.isArray(conflicts) || !conflicts.length) {
+          return "";
+        }
+        return conflicts.map((issue) => {
+          const left = issue.left || {};
+          const right = issue.right || {};
+          return `<li>${escapeHtml(issue.message || "Rule conflict")}<br><small>${escapeHtml(left.scope_label || "")}: ${escapeHtml(left.pattern || "")} ${escapeHtml(left.action || "")} / ${escapeHtml(right.scope_label || "")}: ${escapeHtml(right.pattern || "")} ${escapeHtml(right.action || "")}</small></li>`;
+        }).join("");
+      }
+
+      async function submitRuleSuggestion(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const notice = document.getElementById("suggestion-notice");
+        const confirmInput = document.getElementById("suggestion-confirm-conflicts");
+        if (notice) notice.textContent = "Submitting suggestion...";
+        const payload = {
+          rule: {
+            pattern: form.elements.namedItem("pattern").value,
+            match: form.elements.namedItem("match").value,
+            action: form.elements.namedItem("action").value,
+            duration: form.elements.namedItem("duration").value,
+          },
+          request_note: form.elements.namedItem("request_note").value,
+          confirm_conflicts: Boolean(confirmInput && confirmInput.checked),
+        };
+        try {
+          const response = await fetch("/api/client/rule-suggestions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const body = await response.json().catch(() => ({ error: "invalid JSON response" }));
+          if (response.status === 409) {
+            if (notice) {
+              notice.innerHTML = `Conflicts found. Review them, tick the confirmation box, and submit again.<ul>${describeConflicts(body.conflicts || [])}</ul>`;
+            }
+            if (confirmInput) {
+              confirmInput.disabled = false;
+              confirmInput.closest("label").hidden = false;
+            }
+            return;
+          }
+          if (!response.ok) {
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          form.reset();
+          if (confirmInput) {
+            confirmInput.checked = false;
+            confirmInput.disabled = true;
+            confirmInput.closest("label").hidden = true;
+          }
+          if (notice) notice.textContent = "Rule suggestion submitted.";
+          updatePortal(body.snapshot);
+        } catch (error) {
+          if (notice) notice.textContent = `Suggestion failed: ${error.message}`;
+        }
+      }
+
+      const suggestionForm = document.getElementById("rule-suggestion-form");
+      if (suggestionForm) {
+        suggestionForm.addEventListener("submit", submitRuleSuggestion);
       }
 
       function setLiveStatusText(value) {
@@ -3955,6 +4142,78 @@ def render_client_portal_html(snapshot) -> str:
     })();
   </script>
 """.replace("__CLIENT_PORTAL_LIVE_URL__", client_live_url_json)
+
+    if can_suggest_rules:
+        suggestion_form_html = """
+          <form id="rule-suggestion-form">
+            <div class="suggestion-grid">
+              <label>Host pattern
+                <input name="pattern" type="text" placeholder="example.com" required>
+              </label>
+              <label>Match
+                <select name="match">
+                  <option value="suffix">Suffix</option>
+                  <option value="exact">Exact</option>
+                  <option value="contains">Contains</option>
+                </select>
+              </label>
+              <label>Action
+                <select name="action">
+                  <option value="proxy">Proxy</option>
+                  <option value="direct">Direct</option>
+                  <option value="block">Block</option>
+                </select>
+              </label>
+              <label>Duration
+                <select name="duration">
+                  <option value="always">Always</option>
+                  <option value="1h">1h</option>
+                  <option value="1d">1d</option>
+                  <option value="7d">7d</option>
+                  <option value="30d">30d</option>
+                  <option value="90d">90d</option>
+                </select>
+              </label>
+            </div>
+            <label class="suggestion-note">Request note
+              <input name="request_note" type="text" placeholder="optional context for the admin">
+            </label>
+            <label class="suggestion-confirm" hidden>
+              <input id="suggestion-confirm-conflicts" type="checkbox" disabled>
+              <span>I reviewed the conflicting existing rules and still want to submit this suggestion.</span>
+            </label>
+            <button class="suggestion-submit" type="submit">Submit suggestion</button>
+            <div class="suggestion-notice" id="suggestion-notice"></div>
+          </form>
+"""
+    else:
+        suggestion_form_html = (
+            '<p class="note">Sign in with proxy credentials from this device to submit routing rule suggestions.</p>'
+        )
+
+    suggestion_panel_html = f"""
+    <section class="content-grid">
+      <article>
+        <div class="portal-card">
+          <div class="panel-head">
+            <h2>Rule suggestions</h2>
+            <span class="muted">Profile: <span id="suggestion-profile">{active_profile_name}</span></span>
+          </div>
+          {suggestion_form_html}
+          <div class="table-responsive" style="margin-top:14px">
+          <table class="table portal-table align-middle">
+            <thead>
+              <tr><th>Requested</th><th>Status</th><th>Pattern</th><th>Match</th><th>Action</th><th>Profile</th><th>Conflicts</th><th>Admin message</th></tr>
+            </thead>
+            <tbody id="suggestion-rows">
+              {''.join(suggestion_rows)}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      </article>
+    </section>
+"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -4134,6 +4393,58 @@ def render_client_portal_html(snapshot) -> str:
       background: var(--accent-soft);
       border-color: rgba(15, 118, 110, 0.28);
       color: var(--accent);
+    }}
+    .suggestion-grid {{
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      margin-bottom: 12px;
+    }}
+    .suggestion-grid label,
+    .suggestion-note {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 0.92rem;
+      font-weight: 600;
+    }}
+    .suggestion-grid input,
+    .suggestion-grid select,
+    .suggestion-note input {{
+      min-height: 42px;
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 11px;
+      color: var(--ink);
+      background: #ffffff;
+      font: inherit;
+    }}
+    .suggestion-confirm {{
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin: 10px 0;
+      color: var(--warn);
+      font-weight: 700;
+    }}
+    .suggestion-confirm input {{
+      margin-top: 4px;
+    }}
+    .suggestion-submit {{
+      min-height: 44px;
+      border: 1px solid var(--accent);
+      border-radius: 10px;
+      background: var(--accent);
+      color: #ffffff;
+      padding: 10px 14px;
+      font-weight: 700;
+    }}
+    .suggestion-notice {{
+      margin: 10px 0 0;
+      color: var(--warn);
+      line-height: 1.55;
     }}
     .quota-banner {{
       margin-bottom: 14px;
@@ -4327,6 +4638,8 @@ def render_client_portal_html(snapshot) -> str:
         <a class="install-button secondary" href="{ca_check_url}">Check trust</a>
       </div>
     </section>
+
+    {suggestion_panel_html}
 
     <div class="layout">
       <section class="metrics-grid">

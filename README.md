@@ -91,6 +91,7 @@ Compose mounts `./data` into `/data`, so state survives:
 Persisted backend files:
 
 - `./data/router-config.json`
+- `./data/router-config-rule-suggestions.json`
 - `./data/router-config-auto-proxy-state.json`
 - `./data/router-config-https-interception-state.json`
 - `./data/router-config-https-discovery-state.json`
@@ -169,7 +170,8 @@ Client self-service portal:
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
 - Devices can open `https://proxy.router/ca-check` after installation to confirm CA trust and clear temporary adaptive bypasses
-- This portal is separate from the admin dashboard and does not expose routing or config controls
+- Authenticated devices can suggest routing rules for the currently active profile; conflicting suggestions show the conflicts and require explicit confirmation before they enter the admin queue
+- This portal is separate from the admin dashboard and does not expose direct routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens
 - The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP; `proxy.router` pages open the socket against the direct listener address to avoid browser-specific WebSocket proxy handling
 
@@ -190,6 +192,8 @@ Current dashboard behaviors:
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures use the Routing tab's configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
+- The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
+- Approving a suggestion keeps the same rule validation as manual edits, so still-conflicting suggestions must be resolved before approval succeeds.
 - `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles

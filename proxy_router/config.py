@@ -6,11 +6,246 @@ import socket
 import struct
 import subprocess
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 from .constants import *
 from .util import *
+
+
+class RuleSuggestionConflictError(ValueError):
+    def __init__(self, message: str, *, rule: dict | None = None, conflicts: list[dict] | None = None):
+        super().__init__(message)
+        self.rule = rule or {}
+        self.conflicts = conflicts or []
+
+
+def normalize_rule_suggestion_rule(payload) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("rule suggestion rule must be an object")
+
+    pattern = normalize_rule_pattern(str(payload.get("pattern", "")))
+    if not pattern:
+        raise ValueError("rule suggestion pattern is required")
+
+    match_type = str(payload.get("match", "suffix")).strip().lower()
+    if match_type not in RULE_MATCH_TYPES:
+        raise ValueError(f"rule suggestion match must be one of: {', '.join(sorted(RULE_MATCH_TYPES))}")
+
+    action = str(payload.get("action", "proxy")).strip().lower()
+    if action not in RULE_ROUTE_ACTIONS:
+        raise ValueError(f"rule suggestion action must be one of: {', '.join(sorted(RULE_ROUTE_ACTIONS))}")
+
+    duration = str(payload.get("duration", "always")).strip().lower()
+    if duration not in RULE_DURATION_SECONDS:
+        raise ValueError(f"rule suggestion duration must be one of: {', '.join(RULE_DURATION_ORDER)}")
+
+    return {
+        "pattern": pattern,
+        "match": match_type,
+        "action": action,
+        "enabled": True,
+        "note": str(payload.get("note", "")).strip(),
+        "source": "manual",
+        "duration": duration,
+        "expires_at": None,
+    }
+
+
+def normalize_rule_suggestion_status(value: str | None) -> str:
+    normalized = str(value or "pending").strip().lower()
+    return normalized if normalized in {"pending", "approved", "rejected"} else "pending"
+
+
+def sanitize_rule_suggestion(item) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    suggestion_id = str(item.get("id") or "").strip()
+    if not suggestion_id:
+        return None
+    try:
+        rule = normalize_rule_suggestion_rule(item.get("rule") or {})
+    except ValueError:
+        return None
+    status = normalize_rule_suggestion_status(item.get("status"))
+    return {
+        "id": suggestion_id,
+        "status": status,
+        "requested_at": str(item.get("requested_at") or "").strip(),
+        "resolved_at": str(item.get("resolved_at") or "").strip() or None,
+        "requester": str(item.get("requester") or "").strip(),
+        "requester_username": str(item.get("requester_username") or "").strip(),
+        "requester_label": str(item.get("requester_label") or "").strip(),
+        "requester_ip": str(item.get("requester_ip") or "").strip(),
+        "profile_id": str(item.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID).strip() or DEFAULT_ROUTING_PROFILE_ID,
+        "profile_name": str(item.get("profile_name") or "Shared").strip() or "Shared",
+        "rule": rule,
+        "request_note": str(item.get("request_note") or "").strip(),
+        "conflict_confirmed": bool(item.get("conflict_confirmed", False)),
+        "conflicts": list(item.get("conflicts") or []),
+        "admin_message": str(item.get("admin_message") or "").strip(),
+    }
+
+
+class RuleSuggestionManager:
+    def __init__(self, state_file: Path, router_config, *, change_callback=None):
+        self.state_file = state_file
+        self.router_config = router_config
+        self._change_callback = change_callback
+        self._lock = threading.Lock()
+        self._suggestions = []
+        self._load()
+
+    def _notify_change(self):
+        if callable(self._change_callback):
+            self._change_callback("rule-suggestions")
+
+    def _load(self):
+        try:
+            content = self.state_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self._suggestions = []
+            return
+        if not content.strip():
+            self._suggestions = []
+            return
+        payload = json.loads(content)
+        raw_items = payload.get("suggestions") if isinstance(payload, dict) else payload
+        self._suggestions = [
+            suggestion
+            for suggestion in (sanitize_rule_suggestion(item) for item in (raw_items or []))
+            if suggestion is not None
+        ]
+
+    def _write_locked(self):
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"suggestions": self._suggestions}
+        self.state_file.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def snapshot(self, *, client: str | None = None, include_current_conflicts: bool = False) -> list[dict]:
+        normalized_client = str(client or "").strip()
+        with self._lock:
+            suggestions = json.loads(json.dumps(self._suggestions))
+        if normalized_client:
+            suggestions = [item for item in suggestions if item.get("requester") == normalized_client]
+        suggestions.sort(key=lambda item: str(item.get("requested_at") or ""), reverse=True)
+        if include_current_conflicts:
+            for item in suggestions:
+                if item.get("status") != "pending":
+                    item["current_conflicts"] = []
+                    continue
+                try:
+                    item["current_conflicts"] = self.router_config.rule_issues_for_candidate(
+                        item.get("profile_id"),
+                        item.get("rule") or {},
+                    )
+                except ValueError as exc:
+                    item["current_conflicts"] = []
+                    item["current_error"] = str(exc)
+        return suggestions
+
+    def submit(
+        self,
+        *,
+        requester_identity: dict,
+        requester_ip: str,
+        profile: dict,
+        rule_payload,
+        request_note: str,
+        confirm_conflicts: bool = False,
+    ) -> dict:
+        requester = str((requester_identity or {}).get("id") or "").strip()
+        if not requester.startswith("user:"):
+            raise PermissionError("only authenticated users can suggest routing rules")
+
+        rule = normalize_rule_suggestion_rule(rule_payload)
+        profile_id = str((profile or {}).get("id") or DEFAULT_ROUTING_PROFILE_ID).strip() or DEFAULT_ROUTING_PROFILE_ID
+        profile_name = str((profile or {}).get("name") or "Shared").strip() or "Shared"
+        conflicts = self.router_config.rule_issues_for_candidate(profile_id, rule)
+        if conflicts and not confirm_conflicts:
+            raise RuleSuggestionConflictError(
+                "rule suggestion conflicts with existing routing rules",
+                rule=rule,
+                conflicts=conflicts,
+            )
+
+        suggestion = {
+            "id": uuid.uuid4().hex,
+            "status": "pending",
+            "requested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "resolved_at": None,
+            "requester": requester,
+            "requester_username": str((requester_identity or {}).get("username") or "").strip(),
+            "requester_label": str((requester_identity or {}).get("label") or "").strip(),
+            "requester_ip": str(requester_ip or "").strip(),
+            "profile_id": profile_id,
+            "profile_name": profile_name,
+            "rule": rule,
+            "request_note": str(request_note or "").strip(),
+            "conflict_confirmed": bool(conflicts and confirm_conflicts),
+            "conflicts": conflicts,
+            "admin_message": "",
+        }
+        with self._lock:
+            self._suggestions.append(suggestion)
+            self._write_locked()
+        self._notify_change()
+        return json.loads(json.dumps(suggestion))
+
+    def approve(self, suggestion_id: str) -> dict:
+        normalized_id = str(suggestion_id or "").strip()
+        with self._lock:
+            suggestion = next((item for item in self._suggestions if item.get("id") == normalized_id), None)
+            if suggestion is None:
+                raise KeyError(normalized_id)
+            if suggestion.get("status") != "pending":
+                raise ValueError("only pending rule suggestions can be approved")
+            pending = json.loads(json.dumps(suggestion))
+
+        conflicts = self.router_config.rule_issues_for_candidate(pending.get("profile_id"), pending.get("rule") or {})
+        if conflicts:
+            raise RuleSuggestionConflictError(
+                "rule suggestion still conflicts with existing routing rules",
+                rule=pending.get("rule") or {},
+                conflicts=conflicts,
+            )
+
+        approved_rule = dict(pending.get("rule") or {})
+        if not str(approved_rule.get("note") or "").strip():
+            requester = pending.get("requester") or "authenticated user"
+            request_note = str(pending.get("request_note") or "").strip()
+            approved_rule["note"] = request_note or f"suggested by {requester}"
+        saved_config = self.router_config.add_manual_rule(pending.get("profile_id"), approved_rule)
+
+        with self._lock:
+            suggestion = next((item for item in self._suggestions if item.get("id") == normalized_id), None)
+            if suggestion is None:
+                raise KeyError(normalized_id)
+            suggestion["status"] = "approved"
+            suggestion["resolved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            suggestion["admin_message"] = ""
+            self._write_locked()
+            saved_suggestion = json.loads(json.dumps(suggestion))
+        self._notify_change()
+        return {"suggestion": saved_suggestion, "router_config": saved_config}
+
+    def reject(self, suggestion_id: str, *, message: str = "") -> dict:
+        normalized_id = str(suggestion_id or "").strip()
+        with self._lock:
+            suggestion = next((item for item in self._suggestions if item.get("id") == normalized_id), None)
+            if suggestion is None:
+                raise KeyError(normalized_id)
+            if suggestion.get("status") != "pending":
+                raise ValueError("only pending rule suggestions can be rejected")
+            suggestion["status"] = "rejected"
+            suggestion["resolved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            suggestion["admin_message"] = str(message or "").strip()
+            self._write_locked()
+            saved_suggestion = json.loads(json.dumps(suggestion))
+        self._notify_change()
+        return saved_suggestion
+
 
 class NetworkProfileMonitor:
     def __init__(
@@ -583,6 +818,35 @@ class RouterConfigManager:
             if profile is None:
                 return None
             return json.loads(json.dumps(profile))
+
+    def rule_issues_for_candidate(self, profile_id: str | None, rule) -> list[dict]:
+        candidate_rule = normalize_rule_suggestion_rule(rule)
+        with self._lock:
+            self._prune_expired_rules_locked()
+            config = json.loads(json.dumps(self._config))
+            target_profile = self._find_mutable_profile_locked(config, profile_id)
+            if target_profile is None:
+                raise ValueError("routing profile for rule suggestion was not found")
+            target_profile.setdefault("rules", []).append(candidate_rule)
+            normalized = normalize_router_config(config)
+        return find_router_rule_issues(normalized)
+
+    def add_manual_rule(self, profile_id: str | None, rule) -> dict:
+        candidate_rule = normalize_rule_suggestion_rule(rule)
+        candidate_rule["source"] = "manual"
+        with self._lock:
+            self._prune_expired_rules_locked()
+            config = json.loads(json.dumps(self._config))
+            target_profile = self._find_mutable_profile_locked(config, profile_id)
+            if target_profile is None:
+                raise ValueError("routing profile for rule suggestion was not found")
+            target_profile.setdefault("rules", []).append(candidate_rule)
+            normalized = normalize_router_config(config)
+            validate_router_rule_issues(normalized)
+            self._write_config_locked(normalized)
+            saved = json.loads(json.dumps(self._config))
+        self._notify_change("router-config")
+        return saved
 
     def update(self, payload):
         normalized = normalize_router_config(payload)

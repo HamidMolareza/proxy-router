@@ -9,6 +9,7 @@ import struct
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from .config import RuleSuggestionConflictError
 from .constants import *
 from .output import DEBUG_LOGGER, debug_log
 from .records import HttpsTrafficCache, UsageHistoryCache, build_failure_snapshot_from_records
@@ -193,6 +194,13 @@ def build_dashboard_snapshot(server):
         snapshot["known_clients"],
         server.router_config,
     )
+    rule_suggestion_manager = getattr(server.runtime, "rule_suggestion_manager", None)
+    if rule_suggestion_manager is not None:
+        snapshot["rule_suggestions"] = rule_suggestion_manager.snapshot(
+            include_current_conflicts=True
+        )
+    else:
+        snapshot["rule_suggestions"] = []
     snapshot["router_runtime"] = router_runtime_snapshot
     return snapshot
 
@@ -352,6 +360,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self.server.router_config.snapshot())
             return
 
+        if route_path in {"/api/rule-suggestions", "/api/rule-suggestions.json"}:
+            manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+            if manager is None:
+                self._send_json({"suggestions": []})
+                return
+            self._send_json({"suggestions": manager.snapshot(include_current_conflicts=True)})
+            return
+
         if route_path in {"/api/https-interception/status", "/api/https-interception/status.json"}:
             self._send_json(
                 self.server.runtime.https_interception_status(
@@ -419,6 +435,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/dashboard",
                     "/api/history",
                     "/api/router-config",
+                    "/api/rule-suggestions",
                     "/api/https-interception/status",
                     "/api/https-interception/ca.crt",
                     "/api/https-traffic",
@@ -465,6 +482,70 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 },
                 status=200,
             )
+            return
+
+        if route_path.startswith("/api/rule-suggestions/") and (
+            route_path.endswith("/approve") or route_path.endswith("/reject")
+        ):
+            manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+            if manager is None:
+                self._send_json({"error": "rule suggestions are unavailable"}, status=503)
+                return
+            parts = [part for part in route_path.split("/") if part]
+            if len(parts) != 4 or parts[0] != "api" or parts[1] != "rule-suggestions":
+                self.send_error(404, "Not Found")
+                return
+            suggestion_id = parts[2]
+            action = parts[3]
+            try:
+                payload = self._read_json_body() if self.headers.get("Content-Length") else {}
+                if action == "approve":
+                    result = manager.approve(suggestion_id)
+                    saved_config = result.get("router_config")
+                    if self.server.runtime.auto_proxy_failure_manager is not None:
+                        self.server.runtime.auto_proxy_failure_manager.reconcile_config_state()
+                    self.server.runtime.refresh_upstream_status(saved_config)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "suggestion": result.get("suggestion"),
+                            "router_config": saved_config,
+                            "suggestions": manager.snapshot(include_current_conflicts=True),
+                        },
+                        status=200,
+                    )
+                    return
+                if action == "reject":
+                    suggestion = manager.reject(suggestion_id, message=str((payload or {}).get("message") or ""))
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "suggestion": suggestion,
+                            "suggestions": manager.snapshot(include_current_conflicts=True),
+                        },
+                        status=200,
+                    )
+                    return
+            except KeyError:
+                self._send_json({"error": "rule suggestion not found"}, status=404)
+                return
+            except RuleSuggestionConflictError as exc:
+                self._send_json(
+                    {"error": str(exc), "rule": exc.rule, "conflicts": exc.conflicts},
+                    status=409,
+                )
+                return
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except json.JSONDecodeError as exc:
+                self._send_json({"error": f"invalid JSON body: {exc.msg}"}, status=400)
+                return
+            except OSError as exc:
+                self._send_json({"error": f"failed to update rule suggestion: {exc}"}, status=500)
+                return
+
+            self.send_error(404, "Not Found")
             return
 
         if route_path not in {"/api/router-config", "/api/router-config.json"}:

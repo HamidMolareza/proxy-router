@@ -858,6 +858,7 @@ class AppRuntime:
         self.traffic_quota_manager = TrafficQuotaManager()
         self.auto_proxy_failure_manager = None
         self.https_discovery_manager = None
+        self.rule_suggestion_manager = None
         self.self_endpoints = SelfEndpoints()
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
         self.https_interception = HttpsCertificateManager(
@@ -976,6 +977,7 @@ class AppRuntime:
             )
 
     def attach_router_config(self, router_config):
+        self.rule_suggestion_manager = None
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.shutdown()
             self.auto_proxy_failure_manager = None
@@ -983,6 +985,13 @@ class AppRuntime:
             self.https_discovery_manager.shutdown()
             self.https_discovery_manager = None
         if router_config is not None:
+            from .config import RuleSuggestionManager
+
+            self.rule_suggestion_manager = RuleSuggestionManager(
+                rule_suggestions_state_file_path(router_config.config_file),
+                router_config,
+                change_callback=self.notify_dashboard_update,
+            )
             self.auto_proxy_failure_manager = AutoProxyFailureManager(router_config)
             self.https_discovery_manager = HttpsDiscoveryManager(
                 router_config,
