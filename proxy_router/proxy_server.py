@@ -1197,6 +1197,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         live_paths = {"/api/client/live", "/client.live"}
         suggestion_paths = {"/api/client/rule-suggestions", "/api/client/rule-suggestions.json"}
         suggestion_clear_paths = {"/api/client/rule-suggestions/clear", "/api/client/rule-suggestions/clear.json"}
+        suggestion_delete_prefix = "/api/client/rule-suggestions/"
         quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
@@ -1253,6 +1254,49 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     return True
                 except OSError as exc:
                     self._send_json_response({"error": f"failed to clear rule suggestion history: {exc}"}, status=500)
+                    return True
+
+            if route_path.startswith(suggestion_delete_prefix) and route_path.endswith("/delete"):
+                manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+                if manager is None:
+                    self._send_json_response({"error": "rule suggestions are unavailable"}, status=503)
+                    return True
+                parts = [part for part in route_path.split("/") if part]
+                if len(parts) != 5 or parts[:3] != ["api", "client", "rule-suggestions"] or parts[4] != "delete":
+                    self._send_json_response({"error": "invalid rule suggestion delete path"}, status=404)
+                    return True
+                try:
+                    user_identity = resolve_client_portal_user_identity(
+                        self.server,
+                        portal_client_id,
+                        client_ip=self.client_address[0],
+                    )
+                    if not user_identity:
+                        raise PermissionError("only authenticated users can delete their rule suggestions")
+                    deleted = manager.delete(parts[3], client=user_identity)
+                    response_snapshot = build_client_portal_snapshot(
+                        self.server,
+                        user_identity,
+                        range_key=range_key,
+                        client_ip=self.client_address[0],
+                    )
+                    self._send_json_response(
+                        {
+                            "ok": True,
+                            "deleted": deleted,
+                            "snapshot": response_snapshot,
+                        },
+                        status=200,
+                    )
+                    return True
+                except PermissionError as exc:
+                    self._send_json_response({"error": str(exc)}, status=403)
+                    return True
+                except KeyError:
+                    self._send_json_response({"error": "rule suggestion not found"}, status=404)
+                    return True
+                except OSError as exc:
+                    self._send_json_response({"error": f"failed to delete rule suggestion: {exc}"}, status=500)
                     return True
 
             if route_path not in suggestion_paths:
@@ -3973,10 +4017,15 @@ def render_client_portal_html(snapshot) -> str:
             f"<td>{html.escape(str(item.get('profile_name') or 'Shared'))}</td>"
             f"<td>{html.escape(str(conflict_count))}</td>"
             f"<td>{html.escape(message)}</td>"
+            '<td><button class="suggestion-inline-button" type="button" '
+            f'data-suggestion-id="{html.escape(str(item.get("id") or ""), quote=True)}" '
+            f'data-suggestion-status="{html.escape(str(item.get("status") or "pending"), quote=True)}">'
+            f'{html.escape("Cancel" if str(item.get("status") or "pending") == "pending" else "Delete")}'
+            "</button></td>"
             "</tr>"
         )
     if not suggestion_rows:
-        suggestion_rows.append('<tr><td colspan="8" class="empty">No rule suggestions submitted from this device yet.</td></tr>')
+        suggestion_rows.append('<tr><td colspan="9" class="empty">No rule suggestions submitted from this device yet.</td></tr>')
 
     history_summary = history.get("summary") or {}
     history_range_title = html.escape(str(history.get("range_title") or "Selected range"))
@@ -4085,14 +4134,16 @@ def render_client_portal_html(snapshot) -> str:
       function renderSuggestionRows(snapshot) {
         const suggestions = snapshot && Array.isArray(snapshot.rule_suggestions) ? snapshot.rule_suggestions : [];
         if (!suggestions.length) {
-          return '<tr><td colspan="8" class="empty">No rule suggestions submitted from this device yet.</td></tr>';
+          return '<tr><td colspan="9" class="empty">No rule suggestions submitted from this device yet.</td></tr>';
         }
         return suggestions.map((item) => {
           const rule = item.rule || {};
           const currentConflicts = Array.isArray(item.current_conflicts) ? item.current_conflicts : [];
           const storedConflicts = Array.isArray(item.conflicts) ? item.conflicts : [];
           const conflictCount = currentConflicts.length || storedConflicts.length;
-          return `<tr><td>${escapeHtml(formatTimestamp(item.requested_at))}</td><td>${escapeHtml(item.status || "pending")}</td><td>${escapeHtml(rule.pattern || "")}</td><td>${escapeHtml(rule.match || "suffix")}</td><td>${escapeHtml(rule.action || "proxy")}</td><td>${escapeHtml(item.profile_name || "Shared")}</td><td>${escapeHtml(conflictCount)}</td><td>${escapeHtml(item.admin_message || "")}</td></tr>`;
+          const status = item.status || "pending";
+          const label = status === "pending" ? "Cancel" : "Delete";
+          return `<tr><td>${escapeHtml(formatTimestamp(item.requested_at))}</td><td>${escapeHtml(status)}</td><td>${escapeHtml(rule.pattern || "")}</td><td>${escapeHtml(rule.match || "suffix")}</td><td>${escapeHtml(rule.action || "proxy")}</td><td>${escapeHtml(item.profile_name || "Shared")}</td><td>${escapeHtml(conflictCount)}</td><td>${escapeHtml(item.admin_message || "")}</td><td><button class="suggestion-inline-button" type="button" data-suggestion-id="${escapeHtml(item.id || "")}" data-suggestion-status="${escapeHtml(status)}">${label}</button></td></tr>`;
         }).join("");
       }
 
@@ -4266,6 +4317,31 @@ def render_client_portal_html(snapshot) -> str:
         }
       }
 
+      async function deleteRuleSuggestion(suggestionId, status) {
+        const normalizedId = String(suggestionId || "").trim();
+        if (!normalizedId) return;
+        const actionText = status === "pending" ? "Cancel" : "Delete";
+        const notice = document.getElementById("suggestion-notice");
+        if (!window.confirm(`${actionText} this Rule Suggestions request?`)) {
+          return;
+        }
+        if (notice) notice.textContent = "Processing rule suggestion...";
+        try {
+          const response = await fetch(`/api/client/rule-suggestions/${encodeURIComponent(normalizedId)}/delete${rangeQuery}`, {
+            method: "POST",
+            headers: { "Accept": "application/json" },
+          });
+          const body = await response.json().catch(() => ({ error: "invalid JSON response" }));
+          if (!response.ok) {
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          updatePortal(body.snapshot);
+          if (notice) notice.textContent = `Rule suggestion ${status === "pending" ? "canceled" : "deleted"}.`;
+        } catch (error) {
+          if (notice) notice.textContent = `Rule suggestion ${actionText.toLowerCase()} failed: ${error.message}`;
+        }
+      }
+
       const suggestionForm = document.getElementById("rule-suggestion-form");
       if (suggestionForm) {
         suggestionForm.addEventListener("submit", submitRuleSuggestion);
@@ -4275,6 +4351,12 @@ def render_client_portal_html(snapshot) -> str:
       if (clearSuggestionHistoryButton) {
         clearSuggestionHistoryButton.addEventListener("click", clearRuleSuggestionHistory);
       }
+
+      document.addEventListener("click", (event) => {
+        const button = event.target && event.target.closest ? event.target.closest("[data-suggestion-id]") : null;
+        if (!button) return;
+        deleteRuleSuggestion(button.dataset.suggestionId, button.dataset.suggestionStatus || "pending");
+      });
 
       function setLiveStatusText(value) {
         if (liveStatus) liveStatus.textContent = value;
@@ -4432,7 +4514,7 @@ def render_client_portal_html(snapshot) -> str:
           <div class="table-responsive" style="margin-top:14px">
           <table class="table portal-table align-middle">
             <thead>
-              <tr><th>Requested</th><th>Status</th><th>Pattern</th><th>Match</th><th>Action</th><th>Profile</th><th>Conflicts</th><th>Admin message</th></tr>
+              <tr><th>Requested</th><th>Status</th><th>Pattern</th><th>Match</th><th>Action</th><th>Profile</th><th>Conflicts</th><th>Admin message</th><th>Manage</th></tr>
             </thead>
             <tbody id="suggestion-rows">
               {''.join(suggestion_rows)}
@@ -4683,6 +4765,15 @@ def render_client_portal_html(snapshot) -> str:
     .suggestion-submit:disabled {{
       cursor: not-allowed;
       opacity: 0.7;
+    }}
+    .suggestion-inline-button {{
+      min-height: 36px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #ffffff;
+      color: var(--warn);
+      padding: 7px 10px;
+      font-weight: 700;
     }}
     .suggestion-notice {{
       margin: 10px 0 0;

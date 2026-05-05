@@ -166,6 +166,34 @@ class RuleSuggestionManager:
             "remaining": remaining_count,
         }
 
+    def delete(self, suggestion_id: str, *, client: str | None = None) -> dict:
+        normalized_id = str(suggestion_id or "").strip()
+        if not normalized_id:
+            raise KeyError(normalized_id)
+        normalized_client = str(client or "").strip()
+        with self._lock:
+            suggestion_index = next(
+                (
+                    index
+                    for index, item in enumerate(self._suggestions)
+                    if item.get("id") == normalized_id
+                ),
+                None,
+            )
+            if suggestion_index is None:
+                raise KeyError(normalized_id)
+            suggestion = self._suggestions[suggestion_index]
+            if normalized_client and suggestion.get("requester") != normalized_client:
+                raise PermissionError("rule suggestion belongs to another requester")
+            deleted = self._suggestions.pop(suggestion_index)
+            remaining_count = len(self._suggestions)
+            self._write_locked()
+        self._notify_change()
+        return {
+            "suggestion": json.loads(json.dumps(deleted)),
+            "remaining": remaining_count,
+        }
+
     def submit(
         self,
         *,

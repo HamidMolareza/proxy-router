@@ -172,6 +172,7 @@ Client self-service portal:
 - Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
 - Devices can open `https://proxy.router/ca-check` after installation to confirm CA trust and clear temporary adaptive bypasses
 - Authenticated devices can suggest routing rules for the currently active profile; conflicting suggestions show the conflicts and require explicit confirmation before they enter the admin queue
+- Authenticated devices can cancel/delete individual Rule Suggestions requests they submitted
 - Authenticated devices can clear their own Rule Suggestions history; admins can clear the full Rule Suggestions table from the dashboard
 - This portal is separate from the admin dashboard and does not expose direct routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens

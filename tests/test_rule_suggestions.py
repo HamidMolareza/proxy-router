@@ -195,6 +195,61 @@ class RuleSuggestionTests(unittest.TestCase):
             finally:
                 router_config.shutdown()
 
+    def test_delete_removes_one_requester_suggestion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "router.json"
+            router_config = RouterConfigManager(config_path)
+            manager = RuleSuggestionManager(rule_suggestions_state_file_path(config_path), router_config)
+            try:
+                phone = manager.submit(
+                    requester_identity=requester(),
+                    requester_ip="192.168.1.20",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "phone.example", "action": "direct"},
+                    request_note="phone rule",
+                )
+                manager.submit(
+                    requester_identity={
+                        "id": "user:tablet",
+                        "username": "tablet",
+                        "label": "Tablet",
+                    },
+                    requester_ip="192.168.1.21",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "tablet.example", "action": "direct"},
+                    request_note="tablet rule",
+                )
+
+                result = manager.delete(phone["id"], client="user:phone")
+
+                self.assertEqual(result["suggestion"]["id"], phone["id"])
+                self.assertEqual(result["remaining"], 1)
+                self.assertEqual(manager.snapshot(client="user:phone"), [])
+                self.assertEqual(manager.snapshot(client="user:tablet")[0]["rule"]["pattern"], "tablet.example")
+            finally:
+                router_config.shutdown()
+
+    def test_delete_rejects_other_requester_suggestion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "router.json"
+            router_config = RouterConfigManager(config_path)
+            manager = RuleSuggestionManager(rule_suggestions_state_file_path(config_path), router_config)
+            try:
+                phone = manager.submit(
+                    requester_identity=requester(),
+                    requester_ip="192.168.1.20",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "phone.example", "action": "direct"},
+                    request_note="phone rule",
+                )
+
+                with self.assertRaises(PermissionError):
+                    manager.delete(phone["id"], client="user:tablet")
+
+                self.assertEqual(manager.snapshot(client="user:phone")[0]["id"], phone["id"])
+            finally:
+                router_config.shutdown()
+
     def test_anonymous_clients_cannot_submit_suggestions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "router.json"
