@@ -49,6 +49,7 @@ const RULE_DURATION_SECONDS = {
   always: null,
 }
 const RULES_PAGE_SIZE = 10
+const RULE_SUGGESTIONS_PAGE_SIZE = 10
 const DEFAULT_FAILURE_PAGE_SIZE = 10
 const BYTES_IN_MB = 1_000_000
 const MB_IN_GB = 1024
@@ -2141,7 +2142,10 @@ function App() {
   const [clientBlockDraftDurations, setClientBlockDraftDurations] = useState({})
   const [currentFailurePage, setCurrentFailurePage] = useState(1)
   const [currentRulesPage, setCurrentRulesPage] = useState(1)
+  const [currentRuleSuggestionsPage, setCurrentRuleSuggestionsPage] = useState(1)
   const [currentRulesSearchTerm, setCurrentRulesSearchTerm] = useState('')
+  const [ruleSuggestionsSearchTerm, setRuleSuggestionsSearchTerm] = useState('')
+  const [ruleSuggestionsStatusFilter, setRuleSuggestionsStatusFilter] = useState('all')
   const [currentEditorProfileId, setCurrentEditorProfileId] = useState(DEFAULT_ROUTING_PROFILE_ID)
   const [quotaDeviceSort, setQuotaDeviceSort] = useState({ key: 'active', direction: 'desc' })
   const [usersSearchTerm, setUsersSearchTerm] = useState('')
@@ -2266,6 +2270,73 @@ function App() {
   const knownClients = Array.isArray(dashboardSnapshot.known_clients) ? dashboardSnapshot.known_clients : []
   const ruleSuggestions = Array.isArray(dashboardSnapshot.rule_suggestions) ? dashboardSnapshot.rule_suggestions : []
   const pendingRuleSuggestions = ruleSuggestions.filter((item) => item && item.status === 'pending')
+  const normalizedRuleSuggestionsSearchTerm = String(ruleSuggestionsSearchTerm || '').trim().toLowerCase()
+  const filteredRuleSuggestions = ruleSuggestions
+    .filter((suggestion) => {
+      const status = String((suggestion && suggestion.status) || 'pending')
+      if (ruleSuggestionsStatusFilter !== 'all' && status !== ruleSuggestionsStatusFilter) {
+        return false
+      }
+      if (!normalizedRuleSuggestionsSearchTerm) {
+        return true
+      }
+      const rule = (suggestion && suggestion.rule) || {}
+      const conflicts = [
+        ...(
+          Array.isArray(suggestion.current_conflicts)
+            ? suggestion.current_conflicts
+            : []
+        ),
+        ...(
+          Array.isArray(suggestion.conflicts)
+            ? suggestion.conflicts
+            : []
+        ),
+      ]
+      const searchText = [
+        status,
+        suggestion.requested_at,
+        suggestion.resolved_at,
+        suggestion.requester,
+        suggestion.requester_username,
+        suggestion.requester_label,
+        suggestion.requester_ip,
+        suggestion.profile_id,
+        suggestion.profile_name,
+        suggestion.request_note,
+        suggestion.admin_message,
+        suggestion.current_error,
+        rule.pattern,
+        rule.match,
+        rule.action,
+        rule.duration,
+        rule.note,
+        ...conflicts.map((issue) => issue && issue.message),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+      return searchText.includes(normalizedRuleSuggestionsSearchTerm)
+    })
+    .sort((left, right) => {
+      const leftDate = parseDateText(left && left.requested_at)
+      const rightDate = parseDateText(right && right.requested_at)
+      const leftMs = leftDate ? leftDate.getTime() : 0
+      const rightMs = rightDate ? rightDate.getTime() : 0
+      if (leftMs !== rightMs) {
+        return rightMs - leftMs
+      }
+      return String(right && right.id ? right.id : '').localeCompare(String(left && left.id ? left.id : ''))
+    })
+  const totalRuleSuggestionPages = Math.max(
+    1,
+    Math.ceil(filteredRuleSuggestions.length / RULE_SUGGESTIONS_PAGE_SIZE),
+  )
+  const ruleSuggestionsPage = clamp(currentRuleSuggestionsPage, 1, totalRuleSuggestionPages)
+  const ruleSuggestionPageItems = filteredRuleSuggestions.slice(
+    (ruleSuggestionsPage - 1) * RULE_SUGGESTIONS_PAGE_SIZE,
+    ruleSuggestionsPage * RULE_SUGGESTIONS_PAGE_SIZE,
+  )
   const snapshotClientBlockStatus = dashboardSnapshot.client_block_status || {}
   const historyNote = historyError || buildHistoryNote(historyData)
   const historyPeriodTotals = Array.isArray(historyData.period_totals) ? historyData.period_totals : []
@@ -4296,6 +4367,63 @@ function App() {
                     </div>
                   ) : null}
 
+                  <div className={cx(controlsClass, 'mt-3')}>
+                    <label className={cx(controlClass, 'sm:min-w-80')}>
+                      <span>Search suggestions</span>
+                      <input
+                        type="search"
+                        value={ruleSuggestionsSearchTerm}
+                        placeholder="requester, pattern, profile, note, status"
+                        onChange={(event) => {
+                          setRuleSuggestionsSearchTerm(event.target.value)
+                          setCurrentRuleSuggestionsPage(1)
+                        }}
+                      />
+                    </label>
+                    <label className={controlClass}>
+                      <span>Status</span>
+                      <select
+                        value={ruleSuggestionsStatusFilter}
+                        onChange={(event) => {
+                          setRuleSuggestionsStatusFilter(event.target.value)
+                          setCurrentRuleSuggestionsPage(1)
+                        }}
+                      >
+                        <option value="all">All</option>
+                        <option value="pending">Pending</option>
+                        <option value="approved">Approved</option>
+                        <option value="rejected">Rejected</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="mt-3 mb-2 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+                    <div className={mutedClass}>
+                      {filteredRuleSuggestions.length
+                        ? `${filteredRuleSuggestions.length} of ${ruleSuggestions.length} suggestions shown · newest first`
+                        : ruleSuggestions.length
+                          ? 'No rule suggestions match the current filters.'
+                          : 'No rule suggestions submitted yet.'}
+                    </div>
+                    <div className="grid w-full grid-cols-1 items-center gap-2 min-[361px]:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:w-auto sm:flex sm:flex-wrap">
+                      <button
+                        type="button"
+                        disabled={ruleSuggestionsPage <= 1}
+                        onClick={() => setCurrentRuleSuggestionsPage((page) => Math.max(1, page - 1))}
+                      >
+                        Previous
+                      </button>
+                      <span className={mutedClass}>{`Page ${ruleSuggestionsPage} / ${totalRuleSuggestionPages}`}</span>
+                      <button
+                        type="button"
+                        disabled={ruleSuggestionsPage >= totalRuleSuggestionPages}
+                        onClick={() => setCurrentRuleSuggestionsPage((page) => page + 1)}
+                      >
+                        Next
+                      </button>
+                    </div>
+                  </div>
+
                   <div className={cx(tableWrapClass, 'mt-3')}>
                     <table className="min-w-[88rem]">
                       <thead>
@@ -4311,8 +4439,8 @@ function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {ruleSuggestions.length ? (
-                          ruleSuggestions.map((suggestion) => {
+                        {ruleSuggestionPageItems.length ? (
+                          ruleSuggestionPageItems.map((suggestion) => {
                             const rule = suggestion.rule || {}
                             const currentConflicts = Array.isArray(suggestion.current_conflicts)
                               ? suggestion.current_conflicts
@@ -4411,7 +4539,9 @@ function App() {
                         ) : (
                           <tr>
                             <td colSpan="8" className="pt-2 text-[#6a6f73]">
-                              No rule suggestions submitted yet.
+                              {ruleSuggestions.length
+                                ? 'No rule suggestions match the current filters.'
+                                : 'No rule suggestions submitted yet.'}
                             </td>
                           </tr>
                         )}
