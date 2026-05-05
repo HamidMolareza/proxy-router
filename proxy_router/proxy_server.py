@@ -48,6 +48,18 @@ def build_client_live_update_message(server, client: str, range_key: str, event_
     }
 
 
+def resolve_client_portal_user_identity(server, client: str | None, client_ip: str | None = None) -> str:
+    client_id = str(client or client_ip or "").strip()
+    if not client_id.startswith("user:"):
+        identity_by_client_ip = server.runtime.dashboard_state.snapshot().get("identity_by_client_ip") or {}
+        mapped_identity = identity_by_client_ip.get(client_id)
+        if mapped_identity is None and client_ip and client_ip != client_id:
+            mapped_identity = identity_by_client_ip.get(client_ip)
+        if mapped_identity:
+            client_id = str(mapped_identity).strip()
+    return client_id if client_id.startswith("user:") else ""
+
+
 def is_retryable_upstream_error(exc: Exception) -> bool:
     if isinstance(exc, (TimeoutError, socket.timeout, socket.gaierror, ConnectionError, http.client.HTTPException)):
         return True
@@ -1184,6 +1196,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
         live_paths = {"/api/client/live", "/client.live"}
         suggestion_paths = {"/api/client/rule-suggestions", "/api/client/rule-suggestions.json"}
+        clear_history_paths = {"/api/client/history/clear", "/api/client/history/clear.json"}
         quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
@@ -1206,6 +1219,43 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return True
 
         if self.command == "POST":
+            if route_path in clear_history_paths:
+                try:
+                    user_identity = resolve_client_portal_user_identity(
+                        self.server,
+                        portal_client_id,
+                        client_ip=self.client_address[0],
+                    )
+                    client_id = user_identity or portal_client_id
+                    client_ids = {client_id}
+                    if portal_client_id and portal_client_id != client_id:
+                        client_ids.add(portal_client_id)
+                    cleared = self.server.runtime.clear_client_history(
+                        client_ids=client_ids,
+                        client_ips={self.client_address[0]},
+                    )
+                    self.server.history_cache.clear()
+                    if hasattr(self.server, "https_traffic_cache"):
+                        self.server.https_traffic_cache.clear()
+                    response_snapshot = build_client_portal_snapshot(
+                        self.server,
+                        client_id,
+                        range_key=range_key,
+                        client_ip=self.client_address[0],
+                    )
+                    self._send_json_response(
+                        {
+                            "ok": True,
+                            "cleared": cleared,
+                            "snapshot": response_snapshot,
+                        },
+                        status=200,
+                    )
+                    return True
+                except OSError as exc:
+                    self._send_json_response({"error": f"failed to clear history: {exc}"}, status=500)
+                    return True
+
             if route_path not in suggestion_paths:
                 if is_alias_host:
                     self._send_body_response(
@@ -4130,6 +4180,33 @@ def render_client_portal_html(snapshot) -> str:
         if (suggestionRows) suggestionRows.innerHTML = renderSuggestionRows(snapshot);
       }
 
+      async function clearClientHistory() {
+        const button = document.getElementById("clear-history-button");
+        const notice = document.getElementById("clear-history-notice");
+        if (!window.confirm("Clear the history recorded for this device? Router rules and credentials will not be changed.")) {
+          return;
+        }
+        if (button) button.disabled = true;
+        if (notice) notice.textContent = "Clearing history...";
+        try {
+          const response = await fetch(`/api/client/history/clear${rangeQuery}`, {
+            method: "POST",
+            headers: { "Accept": "application/json" },
+          });
+          const body = await response.json().catch(() => ({ error: "invalid JSON response" }));
+          if (!response.ok) {
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          updatePortal(body.snapshot);
+          const removed = body.cleared && Number.isFinite(Number(body.cleared.total)) ? Number(body.cleared.total) : 0;
+          if (notice) notice.textContent = `History cleared (${removed} records removed).`;
+        } catch (error) {
+          if (notice) notice.textContent = `History clear failed: ${error.message}`;
+        } finally {
+          if (button) button.disabled = false;
+        }
+      }
+
       function describeConflicts(conflicts) {
         if (!Array.isArray(conflicts) || !conflicts.length) {
           return "";
@@ -4193,6 +4270,11 @@ def render_client_portal_html(snapshot) -> str:
       const suggestionForm = document.getElementById("rule-suggestion-form");
       if (suggestionForm) {
         suggestionForm.addEventListener("submit", submitRuleSuggestion);
+      }
+
+      const clearHistoryButton = document.getElementById("clear-history-button");
+      if (clearHistoryButton) {
+        clearHistoryButton.addEventListener("click", clearClientHistory);
       }
 
       function setLiveStatusText(value) {
@@ -4643,6 +4725,15 @@ def render_client_portal_html(snapshot) -> str:
       background: #fff;
       color: var(--accent);
     }}
+    .install-button.danger {{
+      border-color: #b42318;
+      background: #b42318;
+      color: #fff;
+    }}
+    .install-button:disabled {{
+      cursor: not-allowed;
+      opacity: 0.7;
+    }}
     .table-responsive {{
       width: 100%;
       max-width: 100%;
@@ -4781,6 +4872,17 @@ def render_client_portal_html(snapshot) -> str:
         <a class="install-button" href="{ca_certificate_url}">Download CA</a>
         <a class="install-button secondary" href="{ca_install_url}">Install guide</a>
         <a class="install-button secondary" href="{ca_check_url}">Check trust</a>
+      </div>
+    </section>
+
+    <section class="install-panel">
+      <div>
+        <h2>History controls</h2>
+        <p>Clear the usage, failure, and captured HTTPS history recorded for this device. Router rules, quotas, and credentials are unchanged.</p>
+      </div>
+      <div class="install-actions">
+        <button class="install-button danger" id="clear-history-button" type="button">Clear history</button>
+        <div class="suggestion-notice" id="clear-history-notice" role="status"></div>
       </div>
     </section>
 
