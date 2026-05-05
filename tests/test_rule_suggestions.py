@@ -130,6 +130,71 @@ class RuleSuggestionTests(unittest.TestCase):
             finally:
                 router_config.shutdown()
 
+    def test_clear_history_can_remove_only_one_requester(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "router.json"
+            router_config = RouterConfigManager(config_path)
+            manager = RuleSuggestionManager(rule_suggestions_state_file_path(config_path), router_config)
+            try:
+                manager.submit(
+                    requester_identity=requester(),
+                    requester_ip="192.168.1.20",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "phone.example", "action": "direct"},
+                    request_note="phone rule",
+                )
+                manager.submit(
+                    requester_identity={
+                        "id": "user:tablet",
+                        "username": "tablet",
+                        "label": "Tablet",
+                    },
+                    requester_ip="192.168.1.21",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "tablet.example", "action": "direct"},
+                    request_note="tablet rule",
+                )
+
+                result = manager.clear_history(client="user:phone")
+
+                self.assertEqual(result, {"removed": 1, "remaining": 1})
+                self.assertEqual(manager.snapshot(client="user:phone"), [])
+                self.assertEqual(manager.snapshot(client="user:tablet")[0]["rule"]["pattern"], "tablet.example")
+            finally:
+                router_config.shutdown()
+
+    def test_clear_history_without_client_removes_all_suggestions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "router.json"
+            router_config = RouterConfigManager(config_path)
+            manager = RuleSuggestionManager(rule_suggestions_state_file_path(config_path), router_config)
+            try:
+                manager.submit(
+                    requester_identity=requester(),
+                    requester_ip="192.168.1.20",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "phone.example", "action": "direct"},
+                    request_note="phone rule",
+                )
+                manager.submit(
+                    requester_identity={
+                        "id": "user:tablet",
+                        "username": "tablet",
+                        "label": "Tablet",
+                    },
+                    requester_ip="192.168.1.21",
+                    profile={"id": "default", "name": "Shared"},
+                    rule_payload={"pattern": "tablet.example", "action": "direct"},
+                    request_note="tablet rule",
+                )
+
+                result = manager.clear_history()
+
+                self.assertEqual(result, {"removed": 2, "remaining": 0})
+                self.assertEqual(manager.snapshot(), [])
+            finally:
+                router_config.shutdown()
+
     def test_anonymous_clients_cannot_submit_suggestions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "router.json"

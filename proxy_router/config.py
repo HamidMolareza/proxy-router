@@ -145,6 +145,27 @@ class RuleSuggestionManager:
                     item["current_error"] = str(exc)
         return suggestions
 
+    def clear_history(self, *, client: str | None = None) -> dict:
+        normalized_client = str(client or "").strip()
+        with self._lock:
+            before_count = len(self._suggestions)
+            if normalized_client:
+                self._suggestions = [
+                    item for item in self._suggestions if item.get("requester") != normalized_client
+                ]
+            else:
+                self._suggestions = []
+            removed_count = before_count - len(self._suggestions)
+            remaining_count = len(self._suggestions)
+            if removed_count:
+                self._write_locked()
+        if removed_count:
+            self._notify_change()
+        return {
+            "removed": removed_count,
+            "remaining": remaining_count,
+        }
+
     def submit(
         self,
         *,

@@ -1196,6 +1196,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         json_paths = {"/api/client", "/api/client.json", "/client.json"}
         live_paths = {"/api/client/live", "/client.live"}
         suggestion_paths = {"/api/client/rule-suggestions", "/api/client/rule-suggestions.json"}
+        suggestion_clear_paths = {"/api/client/rule-suggestions/clear", "/api/client/rule-suggestions/clear.json"}
         quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
@@ -1218,6 +1219,42 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return True
 
         if self.command == "POST":
+            if route_path in suggestion_clear_paths:
+                manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+                if manager is None:
+                    self._send_json_response({"error": "rule suggestions are unavailable"}, status=503)
+                    return True
+                try:
+                    user_identity = resolve_client_portal_user_identity(
+                        self.server,
+                        portal_client_id,
+                        client_ip=self.client_address[0],
+                    )
+                    if not user_identity:
+                        raise PermissionError("only authenticated users can clear their rule suggestion history")
+                    cleared = manager.clear_history(client=user_identity)
+                    response_snapshot = build_client_portal_snapshot(
+                        self.server,
+                        user_identity,
+                        range_key=range_key,
+                        client_ip=self.client_address[0],
+                    )
+                    self._send_json_response(
+                        {
+                            "ok": True,
+                            "cleared": cleared,
+                            "snapshot": response_snapshot,
+                        },
+                        status=200,
+                    )
+                    return True
+                except PermissionError as exc:
+                    self._send_json_response({"error": str(exc)}, status=403)
+                    return True
+                except OSError as exc:
+                    self._send_json_response({"error": f"failed to clear rule suggestion history: {exc}"}, status=500)
+                    return True
+
             if route_path not in suggestion_paths:
                 if is_alias_host:
                     self._send_body_response(
@@ -4202,9 +4239,41 @@ def render_client_portal_html(snapshot) -> str:
         }
       }
 
+      async function clearRuleSuggestionHistory() {
+        const button = document.getElementById("clear-suggestion-history-button");
+        const notice = document.getElementById("suggestion-notice");
+        if (!window.confirm("Clear your Rule Suggestions history? Pending suggestions you submitted will be removed from the admin queue.")) {
+          return;
+        }
+        if (button) button.disabled = true;
+        if (notice) notice.textContent = "Clearing rule suggestion history...";
+        try {
+          const response = await fetch(`/api/client/rule-suggestions/clear${rangeQuery}`, {
+            method: "POST",
+            headers: { "Accept": "application/json" },
+          });
+          const body = await response.json().catch(() => ({ error: "invalid JSON response" }));
+          if (!response.ok) {
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          updatePortal(body.snapshot);
+          const removed = body.cleared && Number.isFinite(Number(body.cleared.removed)) ? Number(body.cleared.removed) : 0;
+          if (notice) notice.textContent = `Rule Suggestions history cleared (${removed} removed).`;
+        } catch (error) {
+          if (notice) notice.textContent = `Rule Suggestions history clear failed: ${error.message}`;
+        } finally {
+          if (button) button.disabled = false;
+        }
+      }
+
       const suggestionForm = document.getElementById("rule-suggestion-form");
       if (suggestionForm) {
         suggestionForm.addEventListener("submit", submitRuleSuggestion);
+      }
+
+      const clearSuggestionHistoryButton = document.getElementById("clear-suggestion-history-button");
+      if (clearSuggestionHistoryButton) {
+        clearSuggestionHistoryButton.addEventListener("click", clearRuleSuggestionHistory);
       }
 
       function setLiveStatusText(value) {
@@ -4339,7 +4408,10 @@ def render_client_portal_html(snapshot) -> str:
               <input id="suggestion-confirm-conflicts" type="checkbox" disabled>
               <span>I reviewed the conflicting existing rules and still want to submit this suggestion.</span>
             </label>
-            <button class="suggestion-submit" type="submit">Submit suggestion</button>
+            <div class="suggestion-actions">
+              <button class="suggestion-submit" type="submit">Submit suggestion</button>
+              <button class="suggestion-submit secondary" id="clear-suggestion-history-button" type="button">Clear history</button>
+            </div>
             <div class="suggestion-notice" id="suggestion-notice"></div>
           </form>
 """
@@ -4597,6 +4669,20 @@ def render_client_portal_html(snapshot) -> str:
       color: #ffffff;
       padding: 10px 14px;
       font-weight: 700;
+    }}
+    .suggestion-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }}
+    .suggestion-submit.secondary {{
+      background: #ffffff;
+      color: var(--accent);
+    }}
+    .suggestion-submit:disabled {{
+      cursor: not-allowed;
+      opacity: 0.7;
     }}
     .suggestion-notice {{
       margin: 10px 0 0;

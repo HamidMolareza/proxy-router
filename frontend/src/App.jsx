@@ -3512,6 +3512,39 @@ function App() {
     }
   }
 
+  async function clearRuleSuggestionHistory() {
+    if (!window.confirm('Clear all Rule Suggestions history? Pending suggestions will be removed from the admin queue.')) {
+      return
+    }
+    try {
+      const response = await fetch('/api/rule-suggestions/clear', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+        },
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `rule suggestions clear HTTP ${response.status}`)
+      }
+      setDashboardSnapshot((existingSnapshot) => ({
+        ...existingSnapshot,
+        rule_suggestions: Array.isArray(payload.suggestions) ? payload.suggestions : [],
+      }))
+      setRuleSuggestionRejectMessages({})
+      setCurrentRuleSuggestionsPage(1)
+      setRuleSuggestionActionStatus({
+        text: `Rule Suggestions history cleared (${payload.cleared?.removed || 0} removed).`,
+        warning: false,
+      })
+    } catch (error) {
+      setRuleSuggestionActionStatus({
+        text: `Rule Suggestions history clear failed: ${error.message}`,
+        warning: true,
+      })
+    }
+  }
+
   function renderRuleIssueActions(ref) {
     if (!ref || ref.source === 'auto') {
       return ref ? (
@@ -4356,9 +4389,19 @@ function App() {
                         Pending suggestions from authenticated users can be approved after conflicts are resolved.
                       </div>
                     </div>
-                    <span className={cx(pillClass, pendingRuleSuggestions.length && warningPillClass)}>
-                      {`${pendingRuleSuggestions.length} pending`}
-                    </span>
+                    <div className={tightButtonRowClass}>
+                      <span className={cx(pillClass, pendingRuleSuggestions.length && warningPillClass)}>
+                        {`${pendingRuleSuggestions.length} pending`}
+                      </span>
+                      <button
+                        className={warnButtonClass}
+                        type="button"
+                        disabled={!ruleSuggestions.length}
+                        onClick={clearRuleSuggestionHistory}
+                      >
+                        Clear history
+                      </button>
+                    </div>
                   </div>
 
                   {ruleSuggestionActionStatus ? (

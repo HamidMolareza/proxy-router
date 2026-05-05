@@ -436,6 +436,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/history",
                     "/api/router-config",
                     "/api/rule-suggestions",
+                    "/api/rule-suggestions/clear",
                     "/api/https-interception/status",
                     "/api/https-interception/ca.crt",
                     "/api/https-traffic",
@@ -467,6 +468,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "history": self.server.history_cache.build_history_payload(
                         range_key=HISTORY_DEFAULT_RANGE
                     ),
+                },
+                status=200,
+            )
+            return
+
+        if route_path in {"/api/rule-suggestions/clear", "/api/rule-suggestions/clear.json"}:
+            manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
+            if manager is None:
+                self._send_json({"error": "rule suggestions are unavailable"}, status=503)
+                return
+            try:
+                result = manager.clear_history()
+            except OSError as exc:
+                self._send_json({"error": f"failed to clear rule suggestions: {exc}"}, status=500)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    "cleared": result,
+                    "suggestions": manager.snapshot(include_current_conflicts=True),
                 },
                 status=200,
             )
