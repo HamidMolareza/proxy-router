@@ -470,6 +470,22 @@ class InterceptedHTTPSProtocolView:
         self.https_interception_capture = True
 
 
+class ClientPortalProtocolView:
+    def __init__(self, server, *, client_identity=None):
+        self.allowed_networks = server.allowed_networks
+        self.timeout_seconds = server.timeout_seconds
+        self.verbose = server.verbose
+        self.debug = server.debug
+        self.proxy_label = server.proxy_label
+        self.client_tracker = server.client_tracker
+        self.router_config = server.router_config
+        self.runtime = server.runtime
+        self.history_cache = server.history_cache
+        self.server_address = server.server_address
+        self.client_identity = client_identity
+        self.https_interception_capture = False
+
+
 class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -604,6 +620,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not settings.get("enabled", False):
             self._set_client_identity(self._anonymous_client_identity())
             return
+        if not str(self.headers.get("Proxy-Authorization") or "").strip():
+            inherited_identity = getattr(self.server, "client_identity", None)
+            if str((inherited_identity or {}).get("id") or "").startswith("user:"):
+                self._set_client_identity(inherited_identity)
+                return
         identity = self._build_http_basic_identity(settings) or self._anonymous_client_identity()
         self._set_client_identity(identity)
 
@@ -2536,6 +2557,26 @@ class ClientPortalHTTPSRequestHandler(ProxyRequestHandler):
         return "https", host, port, self.path or "/"
 
 
+
+class ClientPortalSocksRequestHandler(ProxyRequestHandler):
+    def handle(self):
+        BaseHTTPRequestHandler.handle(self)
+
+    def _forward_http_request(self):
+        try:
+            scheme, host, port, target_path = self._extract_target()
+            if self._handle_client_portal_request(scheme, host, port, target_path):
+                return
+            self._send_body_response(
+                404,
+                "Not Found",
+                b"Not Found\n",
+                content_type="text/plain; charset=utf-8",
+            )
+        finally:
+            self.close_connection = True
+
+
 class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -2562,6 +2603,7 @@ class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.runtime = runtime
         self.client_tracker = ClientTracker(self.proxy_label, runtime)
         self.router_config = router_config
+        self.history_cache = UsageHistoryCache(runtime.usage_log_path)
 
 class Socks5RequestHandler(socketserver.BaseRequestHandler):
     def _client_label(self) -> str:
@@ -2695,6 +2737,103 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         self._silently_close_connection()
         return True
 
+
+    def _is_client_portal_http_target(self, host: str, port: int) -> bool:
+        self_endpoints = self.server.runtime.self_endpoints
+        if self_endpoints.is_client_portal_host(host):
+            return int(port) == 80 or int(port) in self_endpoints.proxy_listener_ports
+        return self_endpoints.resolve_target_kind(host, port) == "listener"
+
+    def _is_client_portal_https_target(self, host: str, port: int) -> bool:
+        return self.server.runtime.self_endpoints.is_client_portal_host(host) and int(port) == 443
+
+    def _handle_client_portal_http_stream(self, host: str, port: int):
+        self._debug(f"SOCKS5 client portal HTTP target={host}:{port}")
+        bind_host, bind_port = self.request.getsockname()[:2]
+        self._send_success_reply(bind_host, bind_port)
+        portal_server = ClientPortalProtocolView(
+            self.server,
+            client_identity=self._client_identity(),
+        )
+        ClientPortalSocksRequestHandler(self.request, self.client_address, portal_server)
+
+    def _handle_client_portal_https_stream(self, host: str, port: int):
+        self._debug(f"SOCKS5 client portal HTTPS target={host}:{port}")
+        try:
+            tls_context = self.server.runtime.https_interception.server_ssl_context(host or CLIENT_PORTAL_PRIMARY_HOST)
+        except Exception as exc:
+            self.server.runtime.record_failure(
+                proxy_label=self.server.proxy_label,
+                client=self._client_id(),
+                client_ip=self.client_address[0],
+                client_auth_type=self._client_identity().get("auth_type"),
+                client_auth_username=self._client_identity().get("username"),
+                client_auth_label=self._client_identity().get("label"),
+                method="CONNECT",
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                error=str(exc),
+                context="HTTPS CA trust check certificate setup",
+                route_label="local",
+                matched_rule=None,
+                profile_id=DEFAULT_ROUTING_PROFILE_ID,
+            )
+            self._send_reply(0x01)
+            return
+
+        bind_host, bind_port = self.request.getsockname()[:2]
+        self._send_success_reply(bind_host, bind_port)
+        tls_connection = None
+        try:
+            try:
+                tls_connection = tls_context.wrap_socket(self.request, server_side=True)
+            except (ssl.SSLError, ConnectionResetError, BrokenPipeError, OSError) as exc:
+                message = f"HTTPS CA trust check TLS handshake failed: {exc}"
+                self._debug(message, level="WARNING")
+                self.server.runtime.record_https_interception_failure(
+                    self.client_address[0],
+                    host,
+                    error=message,
+                    context="HTTPS CA trust check",
+                    source="trust-check",
+                )
+                self.server.runtime.record_failure(
+                    proxy_label=self.server.proxy_label,
+                    client=self._client_id(),
+                    client_ip=self.client_address[0],
+                    client_auth_type=self._client_identity().get("auth_type"),
+                    client_auth_username=self._client_identity().get("username"),
+                    client_auth_label=self._client_identity().get("label"),
+                    method="CONNECT",
+                    destination=f"{host}:{port}",
+                    host=None,
+                    port=port,
+                    error=message,
+                    context="HTTPS CA trust check",
+                    route_label="local",
+                    matched_rule=None,
+                    profile_id=DEFAULT_ROUTING_PROFILE_ID,
+                )
+                return
+
+            self.server.runtime.record_https_interception_success(
+                self.client_address[0],
+                host,
+                source="trust-check",
+            )
+            portal_server = ClientPortalProtocolView(
+                self.server,
+                client_identity=self._client_identity(),
+            )
+            ClientPortalHTTPSRequestHandler(tls_connection, self.client_address, portal_server)
+        finally:
+            if tls_connection is not None:
+                try:
+                    tls_connection.close()
+                except OSError:
+                    pass
+
     def handle(self):
         client_ip = self.client_address[0]
         self._dashboard_client_id = client_ip
@@ -2736,6 +2875,12 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 host=destination_host,
                 port=destination_port,
             ):
+                return
+            if self._is_client_portal_http_target(destination_host, destination_port):
+                self._handle_client_portal_http_stream(destination_host, destination_port)
+                return
+            if self._is_client_portal_https_target(destination_host, destination_port):
+                self._handle_client_portal_https_stream(destination_host, destination_port)
                 return
             quota_evaluation = self.server.runtime.traffic_quota_manager.evaluate_client(
                 self._client_id(), self.server.router_config

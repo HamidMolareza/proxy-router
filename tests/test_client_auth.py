@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import proxy_router.proxy_server as proxy_server
+
 from proxy_router.constants import SOCKS_AUTH_NO_ACCEPTABLE, SOCKS_AUTH_NO_AUTH, SOCKS_VERSION
 from proxy_router.config import RouterConfigManager
 from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler, is_loopback_client_ip
@@ -256,6 +258,78 @@ class ClientAuthTests(unittest.TestCase):
 
         self.assertFalse(handler._negotiate_authentication(bytes([SOCKS_AUTH_NO_AUTH])))
         self.assertEqual(writes, [bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE])])
+
+
+    def test_client_portal_keeps_inherited_socks_identity(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.headers = {}
+        inherited_identity = {
+            "id": "user:phone",
+            "ip": "192.168.1.23",
+            "auth_type": "socks5",
+            "username": "phone",
+            "label": "",
+        }
+        handler.server = SimpleNamespace(
+            client_identity=inherited_identity,
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {
+                    "enabled": True,
+                    "allow_anonymous": False,
+                    "credentials": [],
+                }
+            ),
+            client_tracker=SimpleNamespace(reidentified=lambda *_args, **_kwargs: None),
+        )
+
+        handler._apply_optional_http_client_identity()
+
+        self.assertEqual(handler._client_identity(), inherited_identity)
+
+    def test_socks_client_portal_http_stream_serves_local_portal_with_identity(self):
+        writes = []
+        captured = []
+        original_handler = proxy_server.ClientPortalSocksRequestHandler
+        proxy_server.ClientPortalSocksRequestHandler = (
+            lambda request, client_address, server: captured.append((request, client_address, server))
+        )
+        try:
+            handler = Socks5RequestHandler.__new__(Socks5RequestHandler)
+            handler.client_address = ("192.168.1.23", 50000)
+            handler.request = SimpleNamespace(
+                getsockname=lambda: ("192.168.1.44", 8900),
+                sendall=lambda data: writes.append(data),
+            )
+            identity = {
+                "id": "user:phone",
+                "ip": "192.168.1.23",
+                "auth_type": "socks5",
+                "username": "phone",
+                "label": "",
+            }
+            handler._proxy_client_identity = identity
+            handler.server = SimpleNamespace(
+                allowed_networks=[],
+                timeout_seconds=30,
+                verbose=False,
+                debug=False,
+                proxy_label="socks5",
+                client_tracker=SimpleNamespace(),
+                router_config=SimpleNamespace(),
+                runtime=SimpleNamespace(),
+                history_cache=SimpleNamespace(),
+                server_address=("0.0.0.0", 8900),
+            )
+
+            handler._handle_client_portal_http_stream("proxy.router", 80)
+
+            self.assertEqual(writes, [bytes([SOCKS_VERSION, 0, 0, 1, 192, 168, 1, 44, 34, 196])])
+            self.assertEqual(len(captured), 1)
+            self.assertIs(captured[0][2].client_identity, identity)
+            self.assertEqual(captured[0][2].proxy_label, "socks5")
+        finally:
+            proxy_server.ClientPortalSocksRequestHandler = original_handler
 
     def test_loopback_detection_includes_ipv4_and_ipv6(self):
         self.assertTrue(is_loopback_client_ip("127.0.0.1"))

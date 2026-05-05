@@ -166,6 +166,7 @@ The dashboard includes seven main areas:
 Client self-service portal:
 
 - Devices using the HTTP proxy can open `http://proxy.router/` to view only their own usage and quota data
+- Devices using SOCKS5 can also open `http://proxy.router/`; the proxy serves the same portal locally after the SOCKS connection is established
 - The client portal includes the same daily/weekly/monthly/yearly usage totals for the current device alongside range-based history
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
