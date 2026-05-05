@@ -1011,6 +1011,193 @@ function getEditorVisibleRuleEntries(config, profileId) {
   return [...profileEntries, ...sharedEntries]
 }
 
+function ruleIdentity(rule) {
+  return {
+    pattern: normalizeRulePattern(rule && rule.pattern),
+    match: ['exact', 'suffix', 'contains'].includes(rule && rule.match) ? rule.match : 'suffix',
+  }
+}
+
+function suffixPatternsOverlap(leftPattern, rightPattern) {
+  return (
+    leftPattern === rightPattern ||
+    leftPattern.endsWith(`.${rightPattern}`) ||
+    rightPattern.endsWith(`.${leftPattern}`)
+  )
+}
+
+function rulePatternsOverlap(leftRule, rightRule) {
+  const left = ruleIdentity(leftRule)
+  const right = ruleIdentity(rightRule)
+  if (!left.pattern || !right.pattern) {
+    return false
+  }
+  if (left.match === 'exact' && right.match === 'exact') {
+    return left.pattern === right.pattern
+  }
+  if (left.match === 'exact' && right.match === 'suffix') {
+    return left.pattern === right.pattern || left.pattern.endsWith(`.${right.pattern}`)
+  }
+  if (left.match === 'suffix' && right.match === 'exact') {
+    return right.pattern === left.pattern || right.pattern.endsWith(`.${left.pattern}`)
+  }
+  if (left.match === 'suffix' && right.match === 'suffix') {
+    return suffixPatternsOverlap(left.pattern, right.pattern)
+  }
+  if (left.match === 'contains' && right.match === 'contains') {
+    return true
+  }
+  if (left.match === 'contains' && right.match === 'exact') {
+    return right.pattern.includes(left.pattern)
+  }
+  if (left.match === 'exact' && right.match === 'contains') {
+    return left.pattern.includes(right.pattern)
+  }
+  if (left.match === 'contains' && right.match === 'suffix') {
+    return true
+  }
+  if (left.match === 'suffix' && right.match === 'contains') {
+    return true
+  }
+  return false
+}
+
+function ruleIssueRef(entry) {
+  const rule = entry.rule || {}
+  return {
+    scope: entry.scope,
+    scope_label: entry.scope_label,
+    index: entry.index,
+    pattern: normalizeRulePattern(rule.pattern),
+    match: ['exact', 'suffix', 'contains'].includes(rule.match) ? rule.match : 'suffix',
+    action: ['direct', 'proxy', 'block'].includes(rule.action) ? rule.action : 'direct',
+    enabled: rule.enabled !== false,
+    source: normalizeRuleSource(rule),
+  }
+}
+
+function ruleRefKey(ref) {
+  return `${ref.scope}:${ref.index}`
+}
+
+function ruleIssueKey(issue) {
+  return `${issue.type}:${issue.context_id}:${ruleRefKey(issue.left)}:${ruleRefKey(issue.right)}`
+}
+
+function findRuleIssuesForEntries(entries, contextId, contextLabel) {
+  const issues = []
+  const seenIdentities = new Map()
+  entries.forEach((entry) => {
+    const identity = ruleIdentity(entry.rule)
+    if (!identity.pattern) {
+      return
+    }
+    const identityKey = `${identity.pattern}:${identity.match}`
+    const existing = seenIdentities.get(identityKey)
+    if (existing) {
+      issues.push({
+        type: 'duplicate',
+        context_id: contextId,
+        context_label: contextLabel,
+        message: `Duplicate ${identity.match} rule for ${identity.pattern} in ${contextLabel}.`,
+        left: ruleIssueRef(existing),
+        right: ruleIssueRef(entry),
+      })
+      return
+    }
+    seenIdentities.set(identityKey, entry)
+  })
+
+  entries.forEach((leftEntry, leftIndex) => {
+    const leftRule = leftEntry.rule || {}
+    if (leftRule.enabled === false) {
+      return
+    }
+    entries.slice(leftIndex + 1).forEach((rightEntry) => {
+      const rightRule = rightEntry.rule || {}
+      if (rightRule.enabled === false || leftRule.action === rightRule.action) {
+        return
+      }
+      if (!rulePatternsOverlap(leftRule, rightRule)) {
+        return
+      }
+      issues.push({
+        type: 'conflict',
+        context_id: contextId,
+        context_label: contextLabel,
+        message: `Conflicting actions for ${normalizeRulePattern(leftRule.pattern)} and ${normalizeRulePattern(
+          rightRule.pattern,
+        )} in ${contextLabel}.`,
+        left: ruleIssueRef(leftEntry),
+        right: ruleIssueRef(rightEntry),
+      })
+    })
+  })
+  return issues
+}
+
+function findRouterRuleIssues(config, profileId) {
+  const normalized = normalizeRouterConfig(config)
+  const sharedEntries = (normalized.rules || []).map((rule, index) => ({
+    scope: DEFAULT_ROUTING_PROFILE_ID,
+    scope_label: 'Shared',
+    index,
+    rule,
+  }))
+  const contexts = []
+  if (!profileId || profileId === DEFAULT_ROUTING_PROFILE_ID) {
+    contexts.push({
+      id: DEFAULT_ROUTING_PROFILE_ID,
+      label: 'Shared',
+      entries: sharedEntries,
+    })
+    ;(normalized.routing_profiles || [])
+      .filter((profile) => profile.enabled !== false)
+      .forEach((profile) => {
+        const profileEntries = (profile.rules || []).map((rule, index) => ({
+          scope: profile.id,
+          scope_label: profile.name || 'Profile',
+          index,
+          rule,
+        }))
+        contexts.push({
+          id: profile.id,
+          label: `${profile.name || 'Profile'} + Shared`,
+          entries: [...profileEntries, ...sharedEntries],
+        })
+      })
+  } else {
+    const profile = getRoutingTargetById(normalized, profileId)
+    if (profile && profile.enabled !== false) {
+      const profileEntries = (profile.rules || []).map((rule, index) => ({
+        scope: profile.id,
+        scope_label: profile.name || 'Profile',
+        index,
+        rule,
+      }))
+      contexts.push({
+        id: profile.id,
+        label: `${profile.name || 'Profile'} + Shared`,
+        entries: [...profileEntries, ...sharedEntries],
+      })
+    }
+  }
+
+  const issues = []
+  const seenIssues = new Set()
+  contexts.forEach((context) => {
+    findRuleIssuesForEntries(context.entries, context.id, context.label).forEach((issue) => {
+      const key = ruleIssueKey(issue)
+      if (seenIssues.has(key)) {
+        return
+      }
+      seenIssues.add(key)
+      issues.push(issue)
+    })
+  })
+  return issues
+}
+
 function ruleMatchesSearch(rule, searchTerm) {
   const normalizedSearch = String(searchTerm || '').trim().toLowerCase()
   if (!normalizedSearch) {
@@ -1942,6 +2129,8 @@ function App() {
   const [usersSearchTerm, setUsersSearchTerm] = useState('')
   const [usersSort, setUsersSort] = useState({ key: 'active', direction: 'desc' })
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
+  const [showAllRuleIssues, setShowAllRuleIssues] = useState(false)
+  const [ruleConflictCheckStatus, setRuleConflictCheckStatus] = useState(null)
   const [isClearingTraffic, setIsClearingTraffic] = useState(false)
   const [isSavingRouter, setIsSavingRouter] = useState(false)
   const [routerSaveError, setRouterSaveError] = useState('')
@@ -1988,6 +2177,13 @@ function App() {
     )
   })()
   const editorDiffersFromActiveProfile = safeEditorProfileId !== currentActiveProfileId
+  const currentRuleIssues = findRouterRuleIssues(currentRouterConfig, safeEditorProfileId)
+  const allRuleIssues = findRouterRuleIssues(currentRouterConfig, DEFAULT_ROUTING_PROFILE_ID)
+  const routerBlockingRuleIssues = allRuleIssues
+  const visibleRuleIssues = showAllRuleIssues ? allRuleIssues : currentRuleIssues
+  const ruleIssueRowKeys = new Set(
+    visibleRuleIssues.flatMap((issue) => [ruleRefKey(issue.left), ruleRefKey(issue.right)]),
+  )
   const routerPersistableConfig = buildPersistableRouterConfig(currentRouterConfig)
   const savedRouterPersistableConfig = buildPersistableRouterConfig(lastSavedRouterConfig)
   const routerPersistableFingerprint = routerConfigFingerprint(routerPersistableConfig)
@@ -1995,8 +2191,14 @@ function App() {
   const routerDirty = routerPersistableFingerprint !== lastSavedRouterFingerprint
   const routerDraftCount = countRouterDraftItems(currentRouterConfig)
   const routerHasLocalChanges = routerDirty || routerDraftCount > 0
-  const routerStatus =
-    routerStatusOverride || {
+  const routerStatus = routerBlockingRuleIssues.length
+    ? {
+        text: `${routerBlockingRuleIssues.length} rule issue${
+          routerBlockingRuleIssues.length === 1 ? '' : 's'
+        } block sync · editing ${getEditorTargetLabel(currentRouterConfig, safeEditorProfileId)}`,
+        warning: true,
+      }
+    : routerStatusOverride || {
       text: buildRouterStatusText(currentRouterConfig, lastSavedRouterConfig, safeEditorProfileId, {
         draftCount: routerDraftCount,
         isSaving: isSavingRouter,
@@ -2703,7 +2905,7 @@ function App() {
   }, [activeTab, httpsTrafficFilters])
 
   useEffect(() => {
-    if (!routerDirty) {
+    if (!routerDirty || routerBlockingRuleIssues.length) {
       return undefined
     }
 
@@ -2757,7 +2959,7 @@ function App() {
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [routerDirty, routerEditVersion, routerPersistableFingerprint])
+  }, [routerDirty, routerEditVersion, routerPersistableFingerprint, routerBlockingRuleIssues.length])
 
   function setLocalRouterConfig(nextConfig, options = {}) {
     setCurrentRouterConfig(normalizeRouterConfig(nextConfig))
@@ -2780,6 +2982,7 @@ function App() {
     } else {
       setRouterStatusOverride(null)
     }
+    setRuleConflictCheckStatus(null)
   }
 
   function addRule(rule = null) {
@@ -2823,6 +3026,58 @@ function App() {
       ensureRuleExpiration(rule, false)
     }
     setLocalRouterConfig(nextConfig)
+  }
+
+  function removeRule(scope, index) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    const targetScope = getRoutingTargetById(nextConfig, scope)
+    if (!targetScope || !targetScope.rules[index]) {
+      return
+    }
+    targetScope.rules.splice(index, 1)
+    setLocalRouterConfig(nextConfig, {
+      message: 'Rule removed. Syncing automatically.',
+    })
+  }
+
+  function disableRule(scope, index) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    const targetScope = getRoutingTargetById(nextConfig, scope)
+    const rule = targetScope && targetScope.rules ? targetScope.rules[index] : null
+    if (!rule || rule.source === 'auto') {
+      return
+    }
+    rule.enabled = false
+    setLocalRouterConfig(nextConfig, {
+      message: 'Rule disabled. Syncing automatically.',
+    })
+  }
+
+  function checkExistingRuleConflicts() {
+    setShowAllRuleIssues(true)
+    if (allRuleIssues.length) {
+      const text = `${allRuleIssues.length} existing rule issue${
+        allRuleIssues.length === 1 ? '' : 's'
+      } found across enabled rulesets.`
+      setRuleConflictCheckStatus({
+        text,
+        warning: true,
+      })
+      setRouterStatusOverride({
+        text,
+        warning: true,
+      })
+      return
+    }
+    const text = 'No rule conflicts or duplicates found across enabled rulesets.'
+    setRuleConflictCheckStatus({
+      text,
+      warning: false,
+    })
+    setRouterStatusOverride({
+      text,
+      warning: false,
+    })
   }
 
   function addClientAuthCredential(credential = null) {
@@ -3109,6 +3364,26 @@ function App() {
         warning: true,
       })
     }
+  }
+
+  function renderRuleIssueActions(ref) {
+    if (!ref || ref.source === 'auto') {
+      return ref ? (
+        <button type="button" onClick={() => ignoreAutoRule(ref.scope, ref.index)}>
+          Ignore auto
+        </button>
+      ) : null
+    }
+    return (
+      <>
+        <button type="button" onClick={() => disableRule(ref.scope, ref.index)} disabled={!ref.enabled}>
+          Disable
+        </button>
+        <button className={warnButtonClass} type="button" onClick={() => removeRule(ref.scope, ref.index)}>
+          Delete
+        </button>
+      </>
+    )
   }
 
   async function clearTrafficData() {
@@ -3934,6 +4209,9 @@ function App() {
                       <button id="add-rule-button" type="button" onClick={() => addRule()}>
                         Add rule
                       </button>
+                      <button id="check-rule-conflicts-button" type="button" onClick={checkExistingRuleConflicts}>
+                        Check conflicts
+                      </button>
                       <button className={warnButtonClass} id="clear-rules-button" type="button" onClick={clearCurrentScopeRules}>
                         Clear rules
                       </button>
@@ -4032,6 +4310,47 @@ function App() {
                     </div>
                   ) : null}
 
+                  {ruleConflictCheckStatus ? (
+                    <div className={cx('mt-3', pillClass, ruleConflictCheckStatus.warning && warningPillClass)}>
+                      {ruleConflictCheckStatus.text}
+                    </div>
+                  ) : null}
+
+                  {visibleRuleIssues.length ? (
+                    <section className="mt-3 rounded-[10px] border border-[#e4c980] bg-[#fff8e6] p-3">
+                      <h3>Rule conflicts</h3>
+                      <div className={noteClass}>
+                        {showAllRuleIssues
+                          ? 'All enabled rulesets are being checked. Resolve these items before the config syncs.'
+                          : 'Resolve these items before the config syncs.'}
+                      </div>
+                      <div className="mt-3 grid grid-cols-1 gap-2">
+                        {visibleRuleIssues.map((issue) => (
+                          <div
+                            className="rounded-[8px] border border-[#ead79e] bg-white p-3"
+                            key={ruleIssueKey(issue)}
+                          >
+                            <div className="font-semibold">{issue.message}</div>
+                            <div className="mt-2 grid grid-cols-1 gap-2 lg:grid-cols-2">
+                              {[issue.left, issue.right].map((ref) => (
+                                <div
+                                  className="flex min-w-0 flex-col gap-2 rounded-[8px] border border-[#ece5d8] p-2"
+                                  key={ruleRefKey(ref)}
+                                >
+                                  <div className={ruleMetaClass}>
+                                    <strong>{`${ref.scope_label}: ${ref.pattern}`}</strong>
+                                    <small>{`${ref.match} · ${ref.action} · ${ref.enabled ? 'enabled' : 'disabled'} · ${ref.source}`}</small>
+                                  </div>
+                                  <div className={ruleActionsClass}>{renderRuleIssueActions(ref)}</div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null}
+
                   <div className="mt-3 mb-2 flex flex-col items-stretch justify-between gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                     <div className={mutedClass}>
                       {orderedRules.length
@@ -4082,8 +4401,9 @@ function App() {
                         {orderedRules.length ? (
                           pagedRules.map((entry) => {
                             const rule = entry.rule
+                            const hasRuleIssue = ruleIssueRowKeys.has(ruleRefKey(entry))
                             return (
-                              <tr key={`${entry.scope}-${entry.index}`}>
+                              <tr className={cx(hasRuleIssue && 'bg-[#fff8e6]')} key={`${entry.scope}-${entry.index}`}>
                                 <td className="min-w-32">
                                   <span className={rulePillClass}>{entry.scope_label}</span>
                                 </td>

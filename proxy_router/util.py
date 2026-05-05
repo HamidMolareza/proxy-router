@@ -124,6 +124,190 @@ def prioritize_router_rules(rules):
     return prioritized_rules + auto_rules
 
 
+def router_rule_identity(rule) -> tuple[str, str]:
+    return (
+        normalize_rule_pattern(str(rule.get("pattern", ""))),
+        str(rule.get("match", "suffix")).strip().lower(),
+    )
+
+
+def suffix_patterns_overlap(left_pattern: str, right_pattern: str) -> bool:
+    return (
+        left_pattern == right_pattern
+        or left_pattern.endswith(f".{right_pattern}")
+        or right_pattern.endswith(f".{left_pattern}")
+    )
+
+
+def rule_patterns_overlap(left_rule, right_rule) -> bool:
+    left_pattern, left_match = router_rule_identity(left_rule)
+    right_pattern, right_match = router_rule_identity(right_rule)
+    if not left_pattern or not right_pattern:
+        return False
+
+    if left_match == "exact" and right_match == "exact":
+        return left_pattern == right_pattern
+    if left_match == "exact" and right_match == "suffix":
+        return left_pattern == right_pattern or left_pattern.endswith(f".{right_pattern}")
+    if left_match == "suffix" and right_match == "exact":
+        return right_pattern == left_pattern or right_pattern.endswith(f".{left_pattern}")
+    if left_match == "suffix" and right_match == "suffix":
+        return suffix_patterns_overlap(left_pattern, right_pattern)
+    if left_match == "contains" and right_match == "contains":
+        return True
+    if left_match == "contains" and right_match == "exact":
+        return left_pattern in right_pattern
+    if left_match == "exact" and right_match == "contains":
+        return right_pattern in left_pattern
+    if left_match == "contains" and right_match == "suffix":
+        return True
+    if left_match == "suffix" and right_match == "contains":
+        return True
+    return False
+
+
+def router_rule_issue_ref(entry) -> dict:
+    rule = entry["rule"]
+    return {
+        "scope": entry["scope"],
+        "scope_label": entry["scope_label"],
+        "index": entry["index"],
+        "pattern": str(rule.get("pattern", "")),
+        "match": str(rule.get("match", "")),
+        "action": str(rule.get("action", "")),
+        "enabled": bool(rule.get("enabled", True)),
+        "source": normalize_rule_source(rule.get("source"), rule.get("note")),
+    }
+
+
+def find_rule_issues_for_entries(entries, *, context_id: str, context_label: str) -> list[dict]:
+    issues = []
+    seen_identities = {}
+    for entry in entries:
+        identity = router_rule_identity(entry["rule"])
+        if not identity[0]:
+            continue
+        existing = seen_identities.get(identity)
+        if existing is not None:
+            issues.append(
+                {
+                    "type": "duplicate",
+                    "context_id": context_id,
+                    "context_label": context_label,
+                    "message": (
+                        f"duplicate {identity[1]} rule for {identity[0]} "
+                        f"in {context_label}"
+                    ),
+                    "left": router_rule_issue_ref(existing),
+                    "right": router_rule_issue_ref(entry),
+                }
+            )
+        else:
+            seen_identities[identity] = entry
+
+    for left_index, left_entry in enumerate(entries):
+        left_rule = left_entry["rule"]
+        if not left_rule.get("enabled", True):
+            continue
+        for right_entry in entries[left_index + 1:]:
+            right_rule = right_entry["rule"]
+            if not right_rule.get("enabled", True):
+                continue
+            if str(left_rule.get("action")) == str(right_rule.get("action")):
+                continue
+            if not rule_patterns_overlap(left_rule, right_rule):
+                continue
+            issues.append(
+                {
+                    "type": "conflict",
+                    "context_id": context_id,
+                    "context_label": context_label,
+                    "message": (
+                        f"conflicting actions for overlapping rules "
+                        f"{left_rule.get('pattern')} and {right_rule.get('pattern')} "
+                        f"in {context_label}"
+                    ),
+                    "left": router_rule_issue_ref(left_entry),
+                    "right": router_rule_issue_ref(right_entry),
+                }
+            )
+    return issues
+
+
+def find_router_rule_issues(config) -> list[dict]:
+    shared_entries = [
+        {
+            "scope": DEFAULT_ROUTING_PROFILE_ID,
+            "scope_label": "Shared",
+            "index": index,
+            "rule": rule,
+        }
+        for index, rule in enumerate(config.get("rules", []))
+    ]
+    contexts = [
+        {
+            "id": DEFAULT_ROUTING_PROFILE_ID,
+            "label": "Shared",
+            "entries": shared_entries,
+        }
+    ]
+    for profile in config.get("routing_profiles", []):
+        if not profile.get("enabled", True):
+            continue
+        profile_id = str(profile.get("id") or "").strip()
+        profile_label = str(profile.get("name") or profile_id or "Profile").strip()
+        profile_entries = [
+            {
+                "scope": profile_id,
+                "scope_label": profile_label,
+                "index": index,
+                "rule": rule,
+            }
+            for index, rule in enumerate(profile.get("rules", []))
+        ]
+        contexts.append(
+            {
+                "id": profile_id,
+                "label": f"{profile_label} + Shared",
+                "entries": [*profile_entries, *shared_entries],
+            }
+        )
+
+    issues = []
+    seen_issue_keys = set()
+    for context in contexts:
+        for issue in find_rule_issues_for_entries(
+            context["entries"],
+            context_id=context["id"],
+            context_label=context["label"],
+        ):
+            key = (
+                issue["type"],
+                issue["context_id"],
+                issue["left"]["scope"],
+                issue["left"]["index"],
+                issue["right"]["scope"],
+                issue["right"]["index"],
+            )
+            if key in seen_issue_keys:
+                continue
+            seen_issue_keys.add(key)
+            issues.append(issue)
+    return issues
+
+
+def validate_router_rule_issues(config) -> None:
+    issues = find_router_rule_issues(config)
+    if not issues:
+        return
+    issue_count = len(issues)
+    issue_word = "issue" if issue_count == 1 else "issues"
+    preview = "; ".join(issue["message"] for issue in issues[:3])
+    if issue_count > 3:
+        preview = f"{preview}; and {issue_count - 3} more"
+    raise ValueError(f"router rules have {issue_count} blocking {issue_word}: {preview}")
+
+
 def default_routing_fields():
     return {
         "default_action": "direct",

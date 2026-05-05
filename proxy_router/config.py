@@ -586,6 +586,7 @@ class RouterConfigManager:
 
     def update(self, payload):
         normalized = normalize_router_config(payload)
+        validate_router_rule_issues(normalized)
         with self._lock:
             self._write_config_locked(normalized)
             saved = json.loads(json.dumps(self._config))

@@ -186,6 +186,8 @@ Current dashboard behaviors:
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback status, including temporary raw-CONNECT bypasses after TLS trust failures
 - Transient upstream connection/setup failures use the Routing tab's configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
+- Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
+- `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
 - `Ignore` on an automatic rule converts it into a permanent manual `Direct` rule
