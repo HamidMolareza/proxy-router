@@ -150,6 +150,7 @@ HTTPS interception note:
 - Profile-specific rules win over shared rules.
 - Auto-proxy state is tracked per effective profile.
 - `action: proxy` rules can optionally pin a `proxy_id`; otherwise the router tries allowed proxies by priority.
+- Private proxy `allowed_clients` entries can be authenticated identities such as `user:phone`, plain usernames such as `phone`, single IPs such as `127.0.0.1`, or CIDR ranges such as `127.0.0.0/8`.
 - Auto-proxy rules created after direct failures keep the working proxy id, so later requests for the same domain reuse that proxy unless the rule is changed.
 
 Typical setup:
@@ -163,7 +164,7 @@ The dashboard includes eight main areas:
 
 - `Overview`: current activity, totals, recent traffic, active clients
 - `History`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, and top destinations filtered by range, proxy type, client, and upstream proxy
-- `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
+- `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, check-all connectivity results, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
 - `Routing`: rules, routing profiles, and auto-proxy controls
 - `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
 - `Users`: configured proxy-auth users plus observed client identities/IPs, with silent block/unblock controls
@@ -195,6 +196,7 @@ Current dashboard behaviors:
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
+- The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
 - Unmanaged direct HTTPS domains are learned in the background. The router probes direct TLS and upstream TLS without requiring a device CA; if direct fails and upstream succeeds, the existing temporary auto-proxy rule flow is activated.
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.

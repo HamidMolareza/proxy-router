@@ -1,7 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from proxy_router.config import RouterConfigManager
 from proxy_router.proxy_server import retry_upstream_operation
+from proxy_router.runtime import AppRuntime
 from proxy_router.util import normalize_router_config, proxy_allows_client
 
 
@@ -153,6 +157,103 @@ class UpstreamRetryConfigTests(unittest.TestCase):
         self.assertTrue(proxy_allows_client(config["proxies"][1], "user:tablet"))
         self.assertFalse(proxy_allows_client(config["proxies"][1], "192.168.1.50"))
         self.assertEqual(config["proxies"][0]["traffic_limit"]["max_past_week_mb"], 5000)
+
+    def test_private_proxy_allowed_clients_can_match_source_ip_for_authenticated_client(self):
+        config = normalize_router_config(
+            {
+                "proxies": [
+                    {
+                        "id": "localhost-only",
+                        "enabled": True,
+                        "type": "socks5",
+                        "host": "127.0.0.1",
+                        "port": 9050,
+                        "access_mode": "private",
+                        "allowed_clients": ["127.0.0.1"],
+                    },
+                ],
+                "default_action": "proxy",
+            }
+        )
+
+        proxy = config["proxies"][0]
+        self.assertTrue(proxy_allows_client(proxy, "127.0.0.1"))
+        self.assertTrue(proxy_allows_client(proxy, "user:local-tool", client_ip="127.0.0.1"))
+        self.assertFalse(proxy_allows_client(proxy, "user:local-tool", client_ip="192.168.1.50"))
+
+    def test_route_decision_filters_private_proxies_by_client_ip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "proxies": [
+                            {
+                                "id": "localhost-only",
+                                "enabled": True,
+                                "type": "http",
+                                "host": "127.0.0.1",
+                                "port": 8080,
+                                "access_mode": "private",
+                                "allowed_clients": ["127.0.0.1"],
+                            },
+                        ],
+                        "default_action": "proxy",
+                    }
+                )
+
+                local_route = manager.decide(
+                    "example.com",
+                    client_id="user:local-tool",
+                    client_ip="127.0.0.1",
+                )
+                remote_route = manager.decide(
+                    "example.com",
+                    client_id="user:local-tool",
+                    client_ip="192.168.1.50",
+                )
+
+                self.assertEqual(local_route["upstream"]["id"], "localhost-only")
+                self.assertIsNone(remote_route["upstream"])
+            finally:
+                manager.shutdown()
+
+    def test_check_upstream_proxies_reports_each_proxy_result(self):
+        runtime = AppRuntime()
+        config = normalize_router_config(
+            {
+                "proxies": [
+                    {
+                        "id": "enabled-proxy",
+                        "enabled": True,
+                        "type": "http",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                    },
+                    {
+                        "id": "disabled-proxy",
+                        "enabled": False,
+                        "type": "socks5",
+                        "host": "127.0.0.1",
+                        "port": 9050,
+                    },
+                ],
+            }
+        )
+
+        with patch("proxy_router.runtime._probe_upstream_connectivity") as probe:
+            probe.return_value = {
+                "status": "reachable",
+                "checked_at": "2026-05-07T12:00:00+00:00",
+                "message": "TCP connection succeeded.",
+                "protocol_verified": False,
+            }
+            payload = runtime.check_upstream_proxies(config)
+
+        self.assertEqual([item["id"] for item in payload["results"]], ["enabled-proxy", "disabled-proxy"])
+        self.assertEqual(payload["results"][0]["status"], "reachable")
+        self.assertEqual(payload["results"][1]["status"], "disabled")
+        probe.assert_called_once()
 
 
 if __name__ == "__main__":

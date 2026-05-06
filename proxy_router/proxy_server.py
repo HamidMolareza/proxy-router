@@ -2017,10 +2017,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             client_id = self._client_id()
         except AttributeError:
             client_id = None
+        client_ip = self.client_address[0] if getattr(self, "client_address", None) else None
         try:
-            route_decision = self.server.router_config.decide(host, client_id=client_id)
+            route_decision = self.server.router_config.decide(
+                host,
+                client_id=client_id,
+                client_ip=client_ip,
+            )
         except TypeError:
-            route_decision = self.server.router_config.decide(host)
+            try:
+                route_decision = self.server.router_config.decide(host, client_id=client_id)
+            except TypeError:
+                route_decision = self.server.router_config.decide(host)
         if apply_auto_proxy_probe:
             route_decision = self.server.runtime.apply_auto_proxy_probe_route(host, route_decision)
         matched_rule = route_decision["matched_rule"]
@@ -2077,7 +2085,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         for proxy in candidates:
             if not isinstance(proxy, dict) or not proxy.get("enabled", True):
                 continue
-            if not proxy_allows_client(proxy, self._client_id()):
+            client_ip = self.client_address[0] if getattr(self, "client_address", None) else None
+            if not proxy_allows_client(proxy, self._client_id(), client_ip=client_ip):
                 continue
             if not self.server.runtime.traffic_quota_manager.proxy_allowed(proxy, client=self._client_id()):
                 continue
@@ -3061,7 +3070,8 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         for proxy in candidates:
             if not isinstance(proxy, dict) or not proxy.get("enabled", True):
                 continue
-            if not proxy_allows_client(proxy, self._client_id()):
+            client_ip = self.client_address[0] if getattr(self, "client_address", None) else None
+            if not proxy_allows_client(proxy, self._client_id(), client_ip=client_ip):
                 continue
             if not self.server.runtime.traffic_quota_manager.proxy_allowed(proxy, client=self._client_id()):
                 continue
@@ -3373,9 +3383,19 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 )
             else:
                 try:
-                    route_decision = self.server.router_config.decide(destination_host, client_id=self._client_id())
+                    route_decision = self.server.router_config.decide(
+                        destination_host,
+                        client_id=self._client_id(),
+                        client_ip=self.client_address[0],
+                    )
                 except TypeError:
-                    route_decision = self.server.router_config.decide(destination_host)
+                    try:
+                        route_decision = self.server.router_config.decide(
+                            destination_host,
+                            client_id=self._client_id(),
+                        )
+                    except TypeError:
+                        route_decision = self.server.router_config.decide(destination_host)
                 route_decision = self.server.runtime.apply_auto_proxy_probe_route(
                     destination_host,
                     route_decision,

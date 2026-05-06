@@ -148,6 +148,7 @@ Important routes:
 - `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
 - `GET /api/router-config`
 - `POST /api/router-config`
+- `POST /api/proxies/check`
 - `GET /api/https-interception/status`
 - `GET /api/https-interception/ca.crt`
 - `GET /api/https-traffic` with optional `client`, `host`, `method`, `status_code`, `search`, `sort`, `direction`, and `limit` query parameters

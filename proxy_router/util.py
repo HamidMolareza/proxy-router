@@ -948,16 +948,21 @@ def upstream_proxy_label(proxy) -> str:
     return f"{proxy.get('type', 'http')}://{proxy.get('host', '')}:{proxy.get('port', '')}"
 
 
-def proxy_allows_client(proxy, client_id: str | None) -> bool:
+def proxy_allows_client(proxy, client_id: str | None = None, *, client_ip: str | None = None) -> bool:
     mode = normalize_proxy_access_mode((proxy or {}).get("access_mode"))
     if mode == "public":
         return True
     normalized_client = str(client_id or "").strip()
     if mode == "authenticated":
         return normalized_client.startswith("user:")
+    client_candidates = []
+    for candidate in (normalized_client, str(client_ip or "").strip()):
+        if candidate and candidate not in client_candidates:
+            client_candidates.append(candidate)
     for target in (proxy or {}).get("allowed_clients") or []:
-        if client_ip_matches_limit_target(normalized_client, target):
-            return True
+        for candidate in client_candidates:
+            if client_ip_matches_limit_target(candidate, target):
+                return True
     return False
 
 

@@ -1237,6 +1237,49 @@ class AppRuntime:
             timeout_seconds=UPSTREAM_STATUS_PROBE_TIMEOUT_SECONDS,
         )
 
+    def check_upstream_proxies(self, router_config):
+        results = []
+        for proxy in (router_config or {}).get("proxies", []):
+            proxy_id = str((proxy or {}).get("id") or "").strip()
+            payload = {
+                "id": proxy_id,
+                "name": str((proxy or {}).get("name") or proxy_id).strip() or proxy_id,
+                "enabled": bool((proxy or {}).get("enabled", True)),
+                "priority": int((proxy or {}).get("priority") or 0),
+                "type": str((proxy or {}).get("type") or "http"),
+                "host": str((proxy or {}).get("host") or ""),
+                "port": int((proxy or {}).get("port") or 0),
+                "access_mode": str((proxy or {}).get("access_mode") or "public"),
+            }
+            if not payload["enabled"]:
+                payload.update(
+                    {
+                        "status": "disabled",
+                        "checked_at": _timestamp_now(),
+                        "message": "Proxy is disabled.",
+                        "protocol_verified": False,
+                    }
+                )
+            else:
+                try:
+                    result = _probe_upstream_connectivity(
+                        proxy,
+                        timeout_seconds=UPSTREAM_STATUS_PROBE_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    result = {
+                        "status": "error",
+                        "checked_at": _timestamp_now(),
+                        "message": _describe_upstream_probe_error(exc),
+                        "protocol_verified": False,
+                    }
+                payload.update(result)
+            results.append(payload)
+        return {
+            "checked_at": _timestamp_now(),
+            "results": results,
+        }
+
     def record_upstream_route_success(self, route_decision, *, destination: str, proxy_label: str):
         if route_decision is None or route_decision.get("action") != "proxy":
             return

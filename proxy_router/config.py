@@ -1260,12 +1260,22 @@ class RouterConfigManager:
                 "profile_id": target_profile.get("id", DEFAULT_ROUTING_PROFILE_ID),
             }
 
-    def upstream_proxies(self, *, client_id: str | None = None, preferred_proxy_id: str | None = None):
+    def upstream_proxies(
+        self,
+        *,
+        client_id: str | None = None,
+        client_ip: str | None = None,
+        preferred_proxy_id: str | None = None,
+    ):
         with self._lock:
             proxies = json.loads(json.dumps(self._config.get("proxies", [])))
         enabled = [proxy for proxy in proxies if proxy.get("enabled", True)]
-        if client_id is not None:
-            enabled = [proxy for proxy in enabled if proxy_allows_client(proxy, client_id)]
+        if client_id is not None or client_ip is not None:
+            enabled = [
+                proxy
+                for proxy in enabled
+                if proxy_allows_client(proxy, client_id, client_ip=client_ip)
+            ]
         preferred_id = normalize_upstream_proxy_id(preferred_proxy_id)
         enabled.sort(
             key=lambda proxy: (
@@ -1276,7 +1286,7 @@ class RouterConfigManager:
         )
         return enabled
 
-    def decide(self, host: str, *, client_id: str | None = None):
+    def decide(self, host: str, *, client_id: str | None = None, client_ip: str | None = None):
         normalized_host = normalize_host(host)
         network_state = self._network_monitor.snapshot()
         with self._lock:
@@ -1298,7 +1308,7 @@ class RouterConfigManager:
             upstream_candidates = [
                 proxy
                 for proxy in json.loads(json.dumps(config.get("proxies", [])))
-                if proxy.get("enabled", True) and proxy_allows_client(proxy, client_id)
+                if proxy.get("enabled", True) and proxy_allows_client(proxy, client_id, client_ip=client_ip)
             ]
             preferred_proxy_id = normalize_upstream_proxy_id(preferred_proxy_id)
             upstream_candidates.sort(

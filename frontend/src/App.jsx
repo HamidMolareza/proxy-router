@@ -1690,6 +1690,30 @@ function buildUpstreamConnectivityPillClass(upstreamStatus) {
   return pillClass
 }
 
+function buildProxyCheckStatus(result) {
+  if (!result) {
+    return {
+      label: 'Not checked',
+      message: 'Run a proxy check to test this upstream.',
+      pillClassName: cx(pillClass, mutedPillClass),
+    }
+  }
+  const connectivity = {
+    status: String(result.status || 'unknown'),
+    protocol_verified: Boolean(result.protocol_verified),
+  }
+  const label = buildUpstreamConnectivityLabel({ connectivity })
+  const messageParts = [String(result.message || '').trim()].filter(Boolean)
+  if (result.checked_at) {
+    messageParts.push(`Checked at ${formatStatusDateTime(result.checked_at)}`)
+  }
+  return {
+    label,
+    message: messageParts.join(' · ') || 'No check details.',
+    pillClassName: buildUpstreamConnectivityPillClass({ connectivity }),
+  }
+}
+
 function buildUpstreamTrafficHeadline(upstreamStatus) {
   if (!upstreamStatus.enabled) {
     return 'Not in use'
@@ -2282,6 +2306,8 @@ function App() {
   const [usersSearchTerm, setUsersSearchTerm] = useState('')
   const [usersSort, setUsersSort] = useState({ key: 'active', direction: 'desc' })
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
+  const [proxyCheckResults, setProxyCheckResults] = useState({})
+  const [isCheckingProxies, setIsCheckingProxies] = useState(false)
   const [showAllRuleIssues, setShowAllRuleIssues] = useState(false)
   const [ruleConflictCheckStatus, setRuleConflictCheckStatus] = useState(null)
   const [ruleSuggestionActionStatus, setRuleSuggestionActionStatus] = useState(null)
@@ -3717,6 +3743,40 @@ function App() {
     }
   }
 
+  async function triggerAllProxyChecks() {
+    setIsCheckingProxies(true)
+    try {
+      const response = await fetch('/api/proxies/check', {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+        },
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `proxy check HTTP ${response.status}`)
+      }
+      const resultsById = {}
+      for (const result of payload.results || []) {
+        if (result && result.id) {
+          resultsById[result.id] = result
+        }
+      }
+      setProxyCheckResults(resultsById)
+      setRouterStatusOverride({
+        text: `Checked ${Object.keys(resultsById).length} upstream proxies.`,
+        warning: false,
+      })
+    } catch (error) {
+      setRouterStatusOverride({
+        text: `Could not check upstream proxies: ${error.message}`,
+        warning: true,
+      })
+    } finally {
+      setIsCheckingProxies(false)
+    }
+  }
+
   async function applyRuleSuggestionAction(suggestionId, action) {
     const normalizedId = String(suggestionId || '').trim()
     if (!normalizedId || !['approve', 'reject'].includes(action)) {
@@ -4347,12 +4407,21 @@ function App() {
                     Ordered upstream proxies, access policy, quota windows, and recorded traffic per proxy.
                   </div>
                 </div>
-                <button type="button" onClick={() => addUpstreamProxy()}>
-                  Add proxy
-                </button>
+                <div className={buttonRowClass}>
+                  <button
+                    type="button"
+                    onClick={triggerAllProxyChecks}
+                    disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
+                  >
+                    {isCheckingProxies ? 'Checking proxies…' : 'Check all proxies'}
+                  </button>
+                  <button type="button" onClick={() => addUpstreamProxy()}>
+                    Add proxy
+                  </button>
+                </div>
               </div>
               <div className={tableWrapClass}>
-                <table className="min-w-[92rem]">
+                <table className="min-w-[100rem]">
                   <thead>
                     <tr>
                       <th>Enabled</th>
@@ -4366,6 +4435,7 @@ function App() {
                       <th>Allowed clients</th>
                       <th>Global limits MB</th>
                       <th>Per-user limits MB</th>
+                      <th>Check</th>
                       <th>Traffic</th>
                       <th>Actions</th>
                     </tr>
@@ -4376,6 +4446,7 @@ function App() {
                         const quota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
                         const summary =
                           (dashboardSnapshot.totals_by_upstream_proxy || {})[proxy.id] || emptyUsageSummary()
+                        const checkStatus = buildProxyCheckStatus(proxyCheckResults[proxy.id])
                         return (
                           <tr key={`proxy-${proxy.id}-${index}`}>
                             <td>
@@ -4504,6 +4575,14 @@ function App() {
                             })}
                             <td>
                               <div className={ruleMetaClass}>
+                                <strong>
+                                  <span className={checkStatus.pillClassName}>{checkStatus.label}</span>
+                                </strong>
+                                <small>{checkStatus.message}</small>
+                              </div>
+                            </td>
+                            <td>
+                              <div className={ruleMetaClass}>
                                 <strong>{formatPanelTraffic(summary.total_bytes || 0)}</strong>
                                 <small>{quota.allowed === false ? 'Quota reached' : `${summary.count || 0} requests`}</small>
                               </div>
@@ -4527,7 +4606,7 @@ function App() {
                       })
                     ) : (
                       <tr>
-                        <td colSpan="13" className="pt-2 text-[#6a6f73]">
+                        <td colSpan="14" className="pt-2 text-[#6a6f73]">
                           No upstream proxies yet.
                         </td>
                       </tr>

@@ -449,6 +449,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/failures",
                     "/api/traffic-data/clear",
                     "/api/upstream/check",
+                    "/api/proxies/check",
                     "/api/live",
                 ],
             }
@@ -506,6 +507,17 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "status": self.server.runtime.upstream_status.snapshot(),
+                },
+                status=200,
+            )
+            return
+
+        if route_path in {"/api/proxies/check", "/api/proxies/check.json"}:
+            current_config = self.server.router_config.snapshot()
+            self._send_json(
+                {
+                    "ok": True,
+                    **self.server.runtime.check_upstream_proxies(current_config),
                 },
                 status=200,
             )
