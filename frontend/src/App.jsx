@@ -11,6 +11,7 @@ const HISTORY_RANGE_OPTIONS = [
 const TAB_DEFINITIONS = [
   { id: 'overview', label: 'Overview' },
   { id: 'history', label: 'History' },
+  { id: 'proxies', label: 'Proxies' },
   { id: 'routing', label: 'Routing' },
   { id: 'https', label: 'HTTPS' },
   { id: 'users', label: 'Users' },
@@ -118,6 +119,14 @@ function compareNumbers(left, right, direction) {
   return direction === 'asc' ? leftValue - rightValue : rightValue - leftValue
 }
 
+function compareStrings(left, right, direction) {
+  const compared = String(left || '').localeCompare(String(right || ''), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  })
+  return direction === 'asc' ? compared : -compared
+}
+
 function formatRelativeElapsed(seconds) {
   const remaining = Math.max(0, Math.floor(Number(seconds) || 0))
   if (remaining < 60) {
@@ -181,6 +190,20 @@ function emptyUsageSummary() {
     uploaded_bytes: 0,
     downloaded_bytes: 0,
     total_bytes: 0,
+    duration_sample_count: 0,
+    duration_sample_bytes: 0,
+    duration_ms_total: 0,
+    duration_ms_avg: null,
+    duration_ms_max: null,
+    upstream_setup_sample_count: 0,
+    upstream_setup_ms_total: 0,
+    upstream_setup_ms_avg: null,
+    upstream_setup_ms_max: null,
+    relay_sample_count: 0,
+    relay_ms_total: 0,
+    relay_ms_avg: null,
+    relay_ms_max: null,
+    throughput_bps: null,
   }
 }
 
@@ -191,6 +214,7 @@ function emptyDashboardSnapshot() {
     active_by_proxy: {},
     totals_by_proxy: {},
     totals_by_route: {},
+    totals_by_upstream_proxy: {},
     recent_requests: [],
     recent_failures: [],
     latest_request: null,
@@ -198,6 +222,7 @@ function emptyDashboardSnapshot() {
     known_clients: [],
     client_block_status: {},
     client_quota_status: {},
+    proxy_quota_status: {},
     rule_suggestions: [],
     failure_summary: {
       grouped_visible: [],
@@ -295,6 +320,7 @@ function emptyHistoryData() {
     invalid_lines: 0,
     available_proxy_types: [],
     available_clients: [],
+    available_upstream_proxies: [],
     time_range: {
       from: null,
       to: null,
@@ -345,6 +371,13 @@ function formatBytes(byteCount) {
     return `${(value / 1000).toFixed(1)} KB`
   }
   return formatMb(value)
+}
+
+function formatRate(byteCountPerSecond) {
+  if (byteCountPerSecond === null || byteCountPerSecond === undefined || byteCountPerSecond === '') {
+    return 'n/a'
+  }
+  return `${formatBytes(byteCountPerSecond)}/s`
 }
 
 function formatPercent(numerator, denominator) {
@@ -717,6 +750,44 @@ function normalizeClientAuthCredential(credential) {
   }
 }
 
+function normalizeProxyTrafficLimit(limit) {
+  const source = limit && typeof limit === 'object' ? limit : {}
+  return {
+    enabled: Boolean(source.enabled),
+    max_past_hour_mb: normalizeOptionalLimitMb(source.max_past_hour_mb),
+    max_past_3h_mb: normalizeOptionalLimitMb(source.max_past_3h_mb),
+    max_past_week_mb: normalizeOptionalLimitMb(source.max_past_week_mb),
+    note: String(source.note || ''),
+  }
+}
+
+function normalizeUpstreamProxy(proxy, index) {
+  const source = proxy && typeof proxy === 'object' ? proxy : {}
+  const fallbackId = `proxy-${String(index + 1)}`
+  const id = String(source.id || source.name || fallbackId)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '') || fallbackId
+  const allowedClients = Array.isArray(source.allowed_clients) ? source.allowed_clients : []
+  return {
+    id,
+    name: String(source.name || id).trim() || id,
+    enabled: source.enabled !== false,
+    priority: normalizeBoundedInteger(source.priority, index + 1, 1, 100000),
+    type: source.type === 'socks5' ? 'socks5' : 'http',
+    host: String(source.host || '127.0.0.1').trim(),
+    port: String(source.port || '8900').trim(),
+    access_mode: ['public', 'authenticated', 'private'].includes(String(source.access_mode || '').trim())
+      ? String(source.access_mode).trim()
+      : 'public',
+    allowed_clients: allowedClients.map((client) => String(client || '').trim()).filter(Boolean),
+    traffic_limit: normalizeProxyTrafficLimit(source.traffic_limit),
+    per_client_traffic_limit: normalizeProxyTrafficLimit(source.per_client_traffic_limit),
+    note: String(source.note || ''),
+  }
+}
+
 function formatClientAuthCredentialStatus(credential) {
   if (String((credential && credential.password) || '').trim()) {
     return credential.password_hash ? 'Password change pending' : 'New password pending'
@@ -730,6 +801,7 @@ function formatClientAuthCredentialStatus(credential) {
 function normalizeRouterConfig(config) {
   const source = config && typeof config === 'object' ? config : {}
   const upstream = source.upstream && typeof source.upstream === 'object' ? source.upstream : {}
+  const proxiesPayload = Array.isArray(source.proxies) ? source.proxies : []
   const autoProxyFailures =
     source.auto_proxy_failures && typeof source.auto_proxy_failures === 'object'
       ? source.auto_proxy_failures
@@ -855,6 +927,7 @@ function normalizeRouterConfig(config) {
       host: String(upstream.host || '127.0.0.1'),
       port: String(upstream.port || '8900'),
     },
+    proxies: proxiesPayload.map((proxy, index) => normalizeUpstreamProxy(proxy, index)),
     rules: defaultRoutingTarget.rules,
     routing_profiles: (Array.isArray(source.routing_profiles) ? source.routing_profiles : []).map(
       (profile, index) => normalizeRoutingProfile(profile, index),
@@ -872,6 +945,10 @@ function isPersistableClientTrafficLimit(limit) {
     return false
   }
   return limit.enabled === false || limit.max_past_hour_mb != null || limit.max_past_3h_mb != null
+}
+
+function isPersistableUpstreamProxy(proxy) {
+  return Boolean(String((proxy && proxy.id) || '').trim() && String((proxy && proxy.host) || '').trim())
 }
 
 function isPersistableClientBlock(block) {
@@ -922,6 +999,7 @@ function buildPersistableRouterConfig(config) {
     },
     client_blocks: normalized.client_blocks.filter((block) => isPersistableClientBlock(block)),
     client_traffic_limits: normalized.client_traffic_limits.filter((limit) => isPersistableClientTrafficLimit(limit)),
+    proxies: normalized.proxies.filter((proxy) => isPersistableUpstreamProxy(proxy)),
     client_traffic_exemptions: normalized.client_traffic_exemptions.filter((exemption) =>
       isPersistableClientTrafficExemption(exemption),
     ),
@@ -1227,6 +1305,42 @@ function ruleMatchesSearch(rule, searchTerm) {
   return haystack.includes(normalizedSearch)
 }
 
+function ruleDurationSortValue(rule) {
+  const duration = normalizeRuleDuration(rule && rule.duration, normalizeRuleSource(rule))
+  if (duration === 'always') {
+    return Number.MAX_SAFE_INTEGER
+  }
+  return Number(RULE_DURATION_SECONDS[duration] || 0)
+}
+
+function compareRuleEntries(left, right, sort) {
+  const direction = sort.direction === 'asc' ? 'asc' : 'desc'
+  let compared = 0
+  if (sort.key === 'order') {
+    compared = compareNumbers(left.visible_index, right.visible_index, direction)
+  } else if (sort.key === 'scope') {
+    compared = compareStrings(left.scope_label, right.scope_label, direction)
+  } else if (sort.key === 'enabled') {
+    compared = compareNumbers(left.rule && left.rule.enabled ? 1 : 0, right.rule && right.rule.enabled ? 1 : 0, direction)
+  } else if (sort.key === 'pattern') {
+    compared = compareStrings(left.rule && left.rule.pattern, right.rule && right.rule.pattern, direction)
+  } else if (sort.key === 'match') {
+    compared = compareStrings(left.rule && left.rule.match, right.rule && right.rule.match, direction)
+  } else if (sort.key === 'action') {
+    compared = compareStrings(left.rule && left.rule.action, right.rule && right.rule.action, direction)
+  } else if (sort.key === 'source') {
+    compared = compareStrings(normalizeRuleSource(left.rule), normalizeRuleSource(right.rule), direction)
+  } else if (sort.key === 'duration') {
+    compared = compareNumbers(ruleDurationSortValue(left.rule), ruleDurationSortValue(right.rule), direction)
+  } else if (sort.key === 'note') {
+    compared = compareStrings(left.rule && left.rule.note, right.rule && right.rule.note, direction)
+  }
+  if (compared !== 0) {
+    return compared
+  }
+  return left.visible_index - right.visible_index
+}
+
 function ruleMatchesHost(rule, host) {
   const normalizedHost = String(host || '').trim().toLowerCase()
   const pattern = String((rule && rule.pattern) || '').trim().toLowerCase()
@@ -1393,7 +1507,13 @@ function formatUserLastSeen(value, nowMs, activeConnections) {
 }
 
 function formatDurationMs(value) {
+  if (value === null || value === undefined || value === '') {
+    return 'n/a'
+  }
   const duration = Number(value || 0)
+  if (!Number.isFinite(duration)) {
+    return 'n/a'
+  }
   if (duration < 1000) {
     return `${duration} ms`
   }
@@ -1776,6 +1896,9 @@ function buildOverviewCards(snapshot) {
     ['Requests handled', String(overall.count)],
     ['Direct handled', `${String(directSummary.count)} (${formatPercent(directSummary.count, overall.count)})`],
     ['Proxied handled', `${String(proxySummary.count)} (${formatPercent(proxySummary.count, overall.count)})`],
+    ['Avg duration', formatDurationMs(overall.duration_ms_avg)],
+    ['Max duration', formatDurationMs(overall.duration_ms_max)],
+    ['Throughput', formatRate(overall.throughput_bps)],
     ['Direct traffic', formatPanelTraffic(directSummary.total_bytes)],
     ['Proxied traffic', formatPanelTraffic(proxySummary.total_bytes)],
     ['Total traffic', formatPanelTraffic(overall.total_bytes)],
@@ -1785,10 +1908,16 @@ function buildOverviewCards(snapshot) {
 function buildHistoryCards(history) {
   const summary = history.summary || emptyUsageSummary()
   const client = history.client && history.client !== 'all' ? history.client : 'All clients'
+  const upstreamProxy =
+    history.upstream_proxy_id && history.upstream_proxy_id !== 'all' ? history.upstream_proxy_id : 'All upstream proxies'
   return [
     ['Range', history.range_title || 'History'],
     ['Client', client],
+    ['Upstream', upstreamProxy],
     ['Matched requests', String(summary.count || 0)],
+    ['Avg duration', formatDurationMs(summary.duration_ms_avg)],
+    ['Max duration', formatDurationMs(summary.duration_ms_max)],
+    ['Throughput', formatRate(summary.throughput_bps)],
     ['Total traffic', formatPanelTraffic(summary.total_bytes || 0)],
     ['Upload', formatPanelTraffic(summary.uploaded_bytes || 0)],
     ['Download', formatPanelTraffic(summary.downloaded_bytes || 0)],
@@ -2126,6 +2255,7 @@ function App() {
   const [historyData, setHistoryData] = useState(emptyHistoryData())
   const [historyRange, setHistoryRange] = useState('24h')
   const [historyProxyType, setHistoryProxyType] = useState('all')
+  const [historyUpstreamProxyId, setHistoryUpstreamProxyId] = useState('all')
   const [historyClient, setHistoryClient] = useState('all')
   const [httpsTrafficData, setHttpsTrafficData] = useState(emptyHttpsTrafficData())
   const [httpsTrafficFilters, setHttpsTrafficFilters] = useState(() => normalizeHttpsTrafficFilters({}))
@@ -2144,6 +2274,7 @@ function App() {
   const [currentRulesPage, setCurrentRulesPage] = useState(1)
   const [currentRuleSuggestionsPage, setCurrentRuleSuggestionsPage] = useState(1)
   const [currentRulesSearchTerm, setCurrentRulesSearchTerm] = useState('')
+  const [rulesSort, setRulesSort] = useState({ key: 'order', direction: 'desc' })
   const [ruleSuggestionsSearchTerm, setRuleSuggestionsSearchTerm] = useState('')
   const [ruleSuggestionsStatusFilter, setRuleSuggestionsStatusFilter] = useState('all')
   const [currentEditorProfileId, setCurrentEditorProfileId] = useState(DEFAULT_ROUTING_PROFILE_ID)
@@ -2168,6 +2299,7 @@ function App() {
   const activeTabRef = useRef(activeTab)
   const historyRangeRef = useRef(historyRange)
   const historyProxyTypeRef = useRef(historyProxyType)
+  const historyUpstreamProxyIdRef = useRef(historyUpstreamProxyId)
   const historyClientRef = useRef(historyClient)
   const httpsTrafficRefreshTimerRef = useRef(null)
   const httpsTrafficFiltersRef = useRef(httpsTrafficFilters)
@@ -2232,20 +2364,12 @@ function App() {
     }
   const rulesEntries = getEditorVisibleRuleEntries(currentRouterConfig, safeEditorProfileId)
   const orderedRules = rulesEntries
+    .map((entry, visibleIndex) => ({
+      ...entry,
+      visible_index: visibleIndex,
+    }))
     .filter((entry) => ruleMatchesSearch({ ...entry.rule, scope: entry.scope_label }, currentRulesSearchTerm))
-    .sort((left, right) => {
-      const scopeRankLeft = left.scope === safeEditorProfileId ? 0 : 1
-      const scopeRankRight = right.scope === safeEditorProfileId ? 0 : 1
-      if (scopeRankLeft !== scopeRankRight) {
-        return scopeRankLeft - scopeRankRight
-      }
-      const leftRank = left.rule.source === 'auto' ? 1 : 0
-      const rightRank = right.rule.source === 'auto' ? 1 : 0
-      if (leftRank !== rightRank) {
-        return leftRank - rightRank
-      }
-      return left.index - right.index
-    })
+    .sort((left, right) => compareRuleEntries(left, right, rulesSort))
   const totalRulePages = Math.max(1, Math.ceil(orderedRules.length / RULES_PAGE_SIZE))
   const rulesPage = clamp(currentRulesPage, 1, totalRulePages)
   const pagedRules = orderedRules.slice((rulesPage - 1) * RULES_PAGE_SIZE, rulesPage * RULES_PAGE_SIZE)
@@ -2473,6 +2597,67 @@ function App() {
     }
     return quotaDeviceSort.direction === 'asc' ? ' ↑' : ' ↓'
   }
+  const proxyClientTrafficRows = currentRouterConfig.proxies
+    .flatMap((proxy) => {
+      const proxyQuota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
+      const clientStatusMap =
+        proxyQuota.clients && typeof proxyQuota.clients === 'object' && !Array.isArray(proxyQuota.clients)
+          ? proxyQuota.clients
+          : {}
+      return Object.entries(clientStatusMap).map(([client, status]) => {
+        const clientUsage = (status && status.client_usage) || {}
+        const used1h = Number((clientUsage['1h'] || {}).total_bytes || 0)
+        const used3h = Number((clientUsage['3h'] || {}).total_bytes || 0)
+        const used7d = Number((clientUsage['7d'] || {}).total_bytes || 0)
+        const exceededWindows = Array.isArray(status.client_exceeded_windows)
+          ? status.client_exceeded_windows
+          : []
+        const globalExceededWindows = Array.isArray(status.exceeded_windows) ? status.exceeded_windows : []
+        return {
+          allowed: status.allowed !== false,
+          client,
+          exceededWindows,
+          globalExceededWindows,
+          proxy,
+          used1h,
+          used3h,
+          used7d,
+        }
+      })
+    })
+    .filter(
+      (row) =>
+        row.used1h > 0 ||
+        row.used3h > 0 ||
+        row.used7d > 0 ||
+        !row.allowed ||
+        row.exceededWindows.length > 0 ||
+        row.globalExceededWindows.length > 0,
+    )
+    .sort((left, right) => {
+      const priorityCompare = compareNumbers(Number(left.proxy.priority || 0), Number(right.proxy.priority || 0), 'asc')
+      if (priorityCompare !== 0) {
+        return priorityCompare
+      }
+      const proxyCompare = String(left.proxy.id || '').localeCompare(String(right.proxy.id || ''))
+      if (proxyCompare !== 0) {
+        return proxyCompare
+      }
+      return String(left.client || '').localeCompare(String(right.client || ''))
+    })
+  function toggleRulesSort(key) {
+    setRulesSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'desc' ? 'asc' : 'desc',
+    }))
+    setCurrentRulesPage(1)
+  }
+  function rulesSortLabel(key) {
+    if (rulesSort.key !== key) {
+      return ''
+    }
+    return rulesSort.direction === 'asc' ? ' ↑' : ' ↓'
+  }
   function toggleUsersSort(key) {
     setUsersSort((current) => ({
       key,
@@ -2571,6 +2756,7 @@ function App() {
   async function refreshHistory(
     rangeValue = historyRange,
     proxyTypeValue = historyProxyType,
+    upstreamProxyIdValue = historyUpstreamProxyId,
     clientValue = historyClient,
   ) {
     const params = new URLSearchParams()
@@ -2582,6 +2768,9 @@ function App() {
     params.set('timezone_offset_minutes', String(-new Date().getTimezoneOffset()))
     if (proxyTypeValue !== 'all') {
       params.set('proxy_type', proxyTypeValue)
+    }
+    if (upstreamProxyIdValue !== 'all') {
+      params.set('upstream_proxy_id', upstreamProxyIdValue)
     }
     if (clientValue !== 'all') {
       params.set('client', clientValue)
@@ -2601,6 +2790,12 @@ function App() {
     setHistoryError('')
     if (proxyTypeValue !== 'all' && !history.available_proxy_types.includes(proxyTypeValue)) {
       setHistoryProxyType('all')
+    }
+    if (
+      upstreamProxyIdValue !== 'all' &&
+      !(history.available_upstream_proxies || []).includes(upstreamProxyIdValue)
+    ) {
+      setHistoryUpstreamProxyId('all')
     }
     if (clientValue !== 'all' && !(history.available_clients || []).includes(clientValue)) {
       setHistoryClient('all')
@@ -2768,10 +2963,19 @@ function App() {
     activeTabRef.current = activeTab
     historyRangeRef.current = historyRange
     historyProxyTypeRef.current = historyProxyType
+    historyUpstreamProxyIdRef.current = historyUpstreamProxyId
     historyClientRef.current = historyClient
     httpsTrafficFiltersRef.current = httpsTrafficFilters
     routerHasLocalChangesRef.current = routerHasLocalChanges
-  }, [activeTab, historyRange, historyProxyType, historyClient, httpsTrafficFilters, routerHasLocalChanges])
+  }, [
+    activeTab,
+    historyRange,
+    historyProxyType,
+    historyUpstreamProxyId,
+    historyClient,
+    httpsTrafficFilters,
+    routerHasLocalChanges,
+  ])
 
   useEffect(() => {
     if (!httpsHostPatternsFocusedRef.current) {
@@ -2828,7 +3032,12 @@ function App() {
         if (!refresh) {
           return
         }
-        refresh(historyRangeRef.current, historyProxyTypeRef.current, historyClientRef.current).catch((error) => {
+        refresh(
+          historyRangeRef.current,
+          historyProxyTypeRef.current,
+          historyUpstreamProxyIdRef.current,
+          historyClientRef.current,
+        ).catch((error) => {
           setHistoryError(`History refresh paused: ${error.message}`)
         })
       }, 250)
@@ -2970,14 +3179,14 @@ function App() {
       if (!refresh) {
         return
       }
-      refresh(historyRange, historyProxyType, historyClient).catch((error) => {
+      refresh(historyRange, historyProxyType, historyUpstreamProxyId, historyClient).catch((error) => {
         setHistoryError(`History refresh paused: ${error.message}`)
       })
     }, 0)
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [activeTab, historyRange, historyProxyType, historyClient])
+  }, [activeTab, historyRange, historyProxyType, historyUpstreamProxyId, historyClient])
 
   useEffect(() => {
     if (activeTab !== 'https') {
@@ -3198,6 +3407,55 @@ function App() {
       return
     }
     nextConfig.client_auth.credentials[index][field] = value
+    setLocalRouterConfig(nextConfig)
+  }
+
+  function addUpstreamProxy(proxy = null) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    const nextIndex = nextConfig.proxies.length
+    nextConfig.proxies.push(
+      normalizeUpstreamProxy(
+        proxy || {
+          id: `proxy-${String(nextIndex + 1)}`,
+          name: `Proxy ${String(nextIndex + 1)}`,
+          enabled: true,
+          priority: nextIndex + 1,
+          type: 'http',
+          host: '127.0.0.1',
+          port: '8900',
+          access_mode: 'public',
+          allowed_clients: [],
+          traffic_limit: {},
+          per_client_traffic_limit: {},
+          note: '',
+        },
+        nextIndex,
+      ),
+    )
+    setLocalRouterConfig(nextConfig, {
+      activateTab: 'proxies',
+      message: 'Proxy draft added. It syncs automatically after the host and port are valid.',
+    })
+  }
+
+  function updateUpstreamProxyField(index, field, value) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    if (!nextConfig.proxies[index]) {
+      return
+    }
+    nextConfig.proxies[index][field] = value
+    setLocalRouterConfig(nextConfig)
+  }
+
+  function updateUpstreamProxyLimit(index, limitKey, field, value) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    if (!nextConfig.proxies[index]) {
+      return
+    }
+    nextConfig.proxies[index][limitKey] = {
+      ...normalizeProxyTrafficLimit(nextConfig.proxies[index][limitKey]),
+      [field]: value,
+    }
     setLocalRouterConfig(nextConfig)
   }
 
@@ -3699,6 +3957,11 @@ function App() {
                     ['Auth', formatClientAuthSummary(dashboardSnapshot.latest_request)],
                     ['Destination', dashboardSnapshot.latest_request.destination],
                     ['Route', dashboardSnapshot.latest_request.route_label || 'direct'],
+                    ['Duration', formatDurationMs(dashboardSnapshot.latest_request.duration_ms)],
+                    ['Upstream setup', formatDurationMs(dashboardSnapshot.latest_request.upstream_setup_ms)],
+                    ['Relay', formatDurationMs(dashboardSnapshot.latest_request.relay_ms)],
+                    ['Retries', dashboardSnapshot.latest_request.upstream_retry_count ?? 'n/a'],
+                    ['Throughput', formatRate(dashboardSnapshot.latest_request.throughput_bps)],
                     ['Upload', formatPanelTraffic(dashboardSnapshot.latest_request.uploaded_bytes)],
                     ['Download', formatPanelTraffic(dashboardSnapshot.latest_request.downloaded_bytes)],
                     ['Total', formatPanelTraffic(dashboardSnapshot.latest_request.total_bytes)],
@@ -3723,6 +3986,9 @@ function App() {
                       <th>Proxy</th>
                       <th>Handled</th>
                       <th>Active</th>
+                      <th>Avg duration</th>
+                      <th>Upstream setup</th>
+                      <th>Throughput</th>
                       <th>Upload</th>
                       <th>Download</th>
                       <th>Total</th>
@@ -3737,6 +4003,9 @@ function App() {
                           <td>{proxyType}</td>
                           <td>{summary.count}</td>
                           <td>{activeCount}</td>
+                          <td>{formatDurationMs(summary.duration_ms_avg)}</td>
+                          <td>{formatDurationMs(summary.upstream_setup_ms_avg)}</td>
+                          <td>{formatRate(summary.throughput_bps)}</td>
                           <td>{formatMb(summary.uploaded_bytes)}</td>
                           <td>{formatMb(summary.downloaded_bytes)}</td>
                           <td>{formatMb(summary.total_bytes)}</td>
@@ -3757,6 +4026,8 @@ function App() {
                       <th>Route</th>
                       <th>Handled</th>
                       <th>Req share</th>
+                      <th>Avg duration</th>
+                      <th>Throughput</th>
                       <th>Upload</th>
                       <th>Download</th>
                       <th>Total</th>
@@ -3774,6 +4045,8 @@ function App() {
                           <td>{routeType}</td>
                           <td>{summary.count}</td>
                           <td>{formatPercent(summary.count, overall.count)}</td>
+                          <td>{formatDurationMs(summary.duration_ms_avg)}</td>
+                          <td>{formatRate(summary.throughput_bps)}</td>
                           <td>{formatMb(summary.uploaded_bytes)}</td>
                           <td>{formatMb(summary.downloaded_bytes)}</td>
                           <td>{formatMb(summary.total_bytes)}</td>
@@ -3802,6 +4075,10 @@ function App() {
                         <th>Auth</th>
                         <th>Destination</th>
                         <th>Route</th>
+                        <th>Duration</th>
+                        <th>Upstream</th>
+                        <th>Retries</th>
+                        <th>Throughput</th>
                         <th>Total</th>
                       </tr>
                     </thead>
@@ -3817,6 +4094,10 @@ function App() {
                           <td>{formatClientAuthSummary(request)}</td>
                           <td className="max-w-md break-words">{request.destination}</td>
                           <td>{request.route_label || 'direct'}</td>
+                          <td>{formatDurationMs(request.duration_ms)}</td>
+                          <td>{formatDurationMs(request.upstream_setup_ms)}</td>
+                          <td>{request.upstream_retry_count ?? 'n/a'}</td>
+                          <td>{formatRate(request.throughput_bps)}</td>
                           <td>{formatMb(request.total_bytes)}</td>
                         </tr>
                       ))}
@@ -3872,6 +4153,27 @@ function App() {
                   </select>
                 </label>
                 <label className={controlClass}>
+                  <span>Upstream</span>
+                  <select
+                    value={historyUpstreamProxyId}
+                    onChange={(event) => setHistoryUpstreamProxyId(event.target.value)}
+                  >
+                    <option value="all">All upstream proxies</option>
+                    {(historyData.available_upstream_proxies || []).map((proxyId) => {
+                      const configuredProxy = currentRouterConfig.proxies.find((proxy) => proxy.id === proxyId)
+                      const label =
+                        configuredProxy && configuredProxy.name && configuredProxy.name !== proxyId
+                          ? `${configuredProxy.name} (${proxyId})`
+                          : proxyId
+                      return (
+                        <option key={proxyId} value={proxyId}>
+                          {label}
+                        </option>
+                      )
+                    })}
+                  </select>
+                </label>
+                <label className={controlClass}>
                   <span>Client</span>
                   <select value={historyClient} onChange={(event) => setHistoryClient(event.target.value)}>
                     <option value="all">All clients</option>
@@ -3913,10 +4215,12 @@ function App() {
                         const periodSummary = period.summary || emptyUsageSummary()
                         return (
                           <div className={cardClass} key={period.key || period.title}>
-                            <div className={cardLabelClass}>{period.title || period.key || 'Period'}</div>
-                            <div className={cardValueClass}>{formatPanelTraffic(periodSummary.total_bytes || 0)}</div>
-                            <div className={noteClass}>{`${periodSummary.count || 0} requests`}</div>
-                          </div>
+                              <div className={cardLabelClass}>{period.title || period.key || 'Period'}</div>
+                              <div className={cardValueClass}>{formatPanelTraffic(periodSummary.total_bytes || 0)}</div>
+                              <div className={noteClass}>
+                                {`${periodSummary.count || 0} requests · avg ${formatDurationMs(periodSummary.duration_ms_avg)} · ${formatRate(periodSummary.throughput_bps)}`}
+                              </div>
+                            </div>
                         )
                       })}
                     </div>
@@ -3942,8 +4246,10 @@ function App() {
                         <thead>
                           <tr>
                             <th>Client</th>
-                            <th>All time</th>
-                            {historyPeriodTotals.map((period) => (
+                              <th>All time</th>
+                              <th>Avg duration</th>
+                              <th>Throughput</th>
+                              {historyPeriodTotals.map((period) => (
                               <th key={period.key || period.title}>{period.title || period.key || 'Period'}</th>
                             ))}
                             <th>Last seen</th>
@@ -3960,9 +4266,11 @@ function App() {
                                     <small>{row.proxy_types.join(', ')}</small>
                                   ) : null}
                                 </div>
-                              </td>
-                              <td>{formatMb((row.summary || emptyUsageSummary()).total_bytes || 0)}</td>
-                              {historyPeriodTotals.map((period) => {
+                                </td>
+                                <td>{formatMb((row.summary || emptyUsageSummary()).total_bytes || 0)}</td>
+                                <td>{formatDurationMs((row.summary || emptyUsageSummary()).duration_ms_avg)}</td>
+                                <td>{formatRate((row.summary || emptyUsageSummary()).throughput_bps)}</td>
+                                {historyPeriodTotals.map((period) => {
                                 const periodSummary =
                                   ((row.period_totals || {})[period.key]) || emptyUsageSummary()
                                 return <td key={`${row.client}-${period.key}`}>{formatMb(periodSummary.total_bytes || 0)}</td>
@@ -4000,24 +4308,288 @@ function App() {
                       <thead>
                         <tr>
                           <th className="w-[58%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Destination</th>
-                          <th className="w-[18%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Requests</th>
-                          <th className="w-[24%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Total</th>
+                            <th className="w-[12%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Requests</th>
+                            <th className="w-[15%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Avg</th>
+                            <th className="w-[15%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Rate</th>
+                            <th className="w-[18%] border-b border-[#ece5d8] px-2 py-2 text-left align-top text-xs font-semibold tracking-[0.05em] text-[#6a6f73] uppercase">Total</th>
                         </tr>
                       </thead>
                       <tbody>
                         {historyData.top_destinations.map((item) => (
                           <tr key={item.destination}>
-                            <td className="max-w-md break-words border-b border-[#ece5d8] px-2 py-3 align-top">{item.destination}</td>
-                            <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{item.count}</td>
-                            <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{formatMb(item.total_bytes)}</td>
+                              <td className="max-w-md break-words border-b border-[#ece5d8] px-2 py-3 align-top">{item.destination}</td>
+                              <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{item.count}</td>
+                              <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{formatDurationMs(item.duration_ms_avg)}</td>
+                              <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{formatRate(item.throughput_bps)}</td>
+                              <td className="whitespace-nowrap border-b border-[#ece5d8] px-2 py-3 align-top">{formatMb(item.total_bytes)}</td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   ) : (
-                    <div className="pt-2 text-[#6a6f73]">No destinations matched this filter.</div>
+                      <div className="pt-2 text-[#6a6f73]">No destinations matched this filter.</div>
                   )}
                 </section>
+              </div>
+            </section>
+          </section>
+        </section>
+      ) : null}
+
+      {activeTab === 'proxies' ? (
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
+                <div>
+                  <h2>Proxies</h2>
+                  <div className={noteClass}>
+                    Ordered upstream proxies, access policy, quota windows, and recorded traffic per proxy.
+                  </div>
+                </div>
+                <button type="button" onClick={() => addUpstreamProxy()}>
+                  Add proxy
+                </button>
+              </div>
+              <div className={tableWrapClass}>
+                <table className="min-w-[92rem]">
+                  <thead>
+                    <tr>
+                      <th>Enabled</th>
+                      <th>Priority</th>
+                      <th>ID</th>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Host</th>
+                      <th>Port</th>
+                      <th>Access</th>
+                      <th>Allowed clients</th>
+                      <th>Global limits MB</th>
+                      <th>Per-user limits MB</th>
+                      <th>Traffic</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentRouterConfig.proxies.length ? (
+                      currentRouterConfig.proxies.map((proxy, index) => {
+                        const quota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
+                        const summary =
+                          (dashboardSnapshot.totals_by_upstream_proxy || {})[proxy.id] || emptyUsageSummary()
+                        return (
+                          <tr key={`proxy-${proxy.id}-${index}`}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={proxy.enabled}
+                                onChange={(event) => updateUpstreamProxyField(index, 'enabled', event.target.checked)}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                min="1"
+                                value={proxy.priority}
+                                onChange={(event) =>
+                                  updateUpstreamProxyField(index, 'priority', event.target.value.trim())
+                                }
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={proxy.id}
+                                onChange={(event) => updateUpstreamProxyField(index, 'id', event.target.value)}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={proxy.name}
+                                onChange={(event) => updateUpstreamProxyField(index, 'name', event.target.value)}
+                              />
+                            </td>
+                            <td>
+                              <select
+                                value={proxy.type}
+                                onChange={(event) => updateUpstreamProxyField(index, 'type', event.target.value)}
+                              >
+                                <option value="http">HTTP</option>
+                                <option value="socks5">SOCKS5</option>
+                              </select>
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={proxy.host}
+                                onChange={(event) => updateUpstreamProxyField(index, 'host', event.target.value.trim())}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                min="1"
+                                max="65535"
+                                value={proxy.port}
+                                onChange={(event) => updateUpstreamProxyField(index, 'port', event.target.value.trim())}
+                              />
+                            </td>
+                            <td>
+                              <select
+                                value={proxy.access_mode}
+                                onChange={(event) => updateUpstreamProxyField(index, 'access_mode', event.target.value)}
+                              >
+                                <option value="public">Public</option>
+                                <option value="authenticated">Authenticated</option>
+                                <option value="private">Private</option>
+                              </select>
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={proxy.allowed_clients.join(', ')}
+                                placeholder="user:phone, 192.168.1.50"
+                                onChange={(event) =>
+                                  updateUpstreamProxyField(
+                                    index,
+                                    'allowed_clients',
+                                    event.target.value
+                                      .split(',')
+                                      .map((item) => item.trim())
+                                      .filter(Boolean),
+                                  )
+                                }
+                              />
+                            </td>
+                            {['traffic_limit', 'per_client_traffic_limit'].map((limitKey) => {
+                              const limit = proxy[limitKey] || normalizeProxyTrafficLimit({})
+                              return (
+                                <td key={limitKey}>
+                                  <label className="flex items-center gap-2">
+                                    <input
+                                      type="checkbox"
+                                      checked={limit.enabled}
+                                      onChange={(event) =>
+                                        updateUpstreamProxyLimit(index, limitKey, 'enabled', event.target.checked)
+                                      }
+                                    />
+                                    <span>On</span>
+                                  </label>
+                                  <div className="mt-2 grid grid-cols-3 gap-2">
+                                    {[
+                                      ['1h', 'max_past_hour_mb'],
+                                      ['3h', 'max_past_3h_mb'],
+                                      ['7d', 'max_past_week_mb'],
+                                    ].map(([label, field]) => (
+                                      <label className={fieldClass} key={`${limitKey}-${field}`}>
+                                        <span>{label}</span>
+                                        <input
+                                          type="number"
+                                          min="1"
+                                          value={limit[field] ?? ''}
+                                          onChange={(event) =>
+                                            updateUpstreamProxyLimit(
+                                              index,
+                                              limitKey,
+                                              field,
+                                              normalizeOptionalLimitMb(event.target.value),
+                                            )
+                                          }
+                                        />
+                                      </label>
+                                    ))}
+                                  </div>
+                                </td>
+                              )
+                            })}
+                            <td>
+                              <div className={ruleMetaClass}>
+                                <strong>{formatPanelTraffic(summary.total_bytes || 0)}</strong>
+                                <small>{quota.allowed === false ? 'Quota reached' : `${summary.count || 0} requests`}</small>
+                              </div>
+                            </td>
+                            <td className={ruleActionsClass}>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const nextConfig = cloneJson(currentRouterConfig)
+                                  nextConfig.proxies.splice(index, 1)
+                                  setLocalRouterConfig(nextConfig, {
+                                    message: 'Proxy removed. Syncing automatically.',
+                                  })
+                                }}
+                              >
+                                Delete
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })
+                    ) : (
+                      <tr>
+                        <td colSpan="13" className="pt-2 text-[#6a6f73]">
+                          No upstream proxies yet.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-6">
+                <h3>Per-user proxy traffic</h3>
+                <div className={noteClass}>
+                  Rolling proxy quota usage by client identity for the one-hour, three-hour, and seven-day windows.
+                </div>
+                {proxyClientTrafficRows.length ? (
+                  <div className={tableWrapClass}>
+                    <table className="min-w-[64rem]">
+                      <thead>
+                        <tr>
+                          <th>Proxy</th>
+                          <th>Client</th>
+                          <th>Last 1h</th>
+                          <th>Last 3h</th>
+                          <th>Last 7d</th>
+                          <th>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {proxyClientTrafficRows.map((row) => {
+                          const exceededLabels = row.exceededWindows
+                            .map((window) => window.label || window.window || '')
+                            .filter(Boolean)
+                          const globalExceededLabels = row.globalExceededWindows
+                            .map((window) => window.label || window.window || '')
+                            .filter(Boolean)
+                          const statusText = row.allowed
+                            ? 'Allowed'
+                            : exceededLabels.length
+                              ? `Per-user limit reached: ${exceededLabels.join(', ')}`
+                              : globalExceededLabels.length
+                                ? `Proxy limit reached: ${globalExceededLabels.join(', ')}`
+                                : 'Blocked'
+                          return (
+                            <tr key={`proxy-client-${row.proxy.id}-${row.client}`}>
+                              <td>
+                                <div className={ruleMetaClass}>
+                                  <strong>{row.proxy.name || row.proxy.id}</strong>
+                                  <small>{row.proxy.id}</small>
+                                </div>
+                              </td>
+                              <td>{row.client}</td>
+                              <td>{formatMb(row.used1h)}</td>
+                              <td>{formatMb(row.used3h)}</td>
+                              <td>{formatMb(row.used7d)}</td>
+                              <td>{statusText}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="pt-2 text-[#6a6f73]">No per-user proxy traffic has been recorded yet.</div>
+                )}
               </div>
             </section>
           </section>
@@ -4774,17 +5346,54 @@ function App() {
                   </div>
 
                   <div className={tableWrapClass}>
-                    <table className="min-w-[88rem]">
+                    <table className="min-w-[94rem]">
                       <thead>
                         <tr>
-                          <th>Scope</th>
-                          <th>Enabled</th>
-                          <th>Pattern</th>
-                          <th>Match</th>
-                          <th>Action</th>
-                          <th>Source</th>
-                          <th>Duration</th>
-                          <th>Note</th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('order')}>
+                              Order{rulesSortLabel('order')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('scope')}>
+                              Scope{rulesSortLabel('scope')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('enabled')}>
+                              Enabled{rulesSortLabel('enabled')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('pattern')}>
+                              Pattern{rulesSortLabel('pattern')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('match')}>
+                              Match{rulesSortLabel('match')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('action')}>
+                              Action{rulesSortLabel('action')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('source')}>
+                              Source{rulesSortLabel('source')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('duration')}>
+                              Duration{rulesSortLabel('duration')}
+                            </button>
+                          </th>
+                          <th>
+                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleRulesSort('note')}>
+                              Note{rulesSortLabel('note')}
+                            </button>
+                          </th>
                           <th>Actions</th>
                         </tr>
                       </thead>
@@ -4795,6 +5404,9 @@ function App() {
                             const hasRuleIssue = ruleIssueRowKeys.has(ruleRefKey(entry))
                             return (
                               <tr className={cx(hasRuleIssue && 'bg-[#fff8e6]')} key={`${entry.scope}-${entry.index}`}>
+                                <td className="min-w-20 font-semibold text-[#6a6f73]">
+                                  {entry.visible_index + 1}
+                                </td>
                                 <td className="min-w-32">
                                   <span className={rulePillClass}>{entry.scope_label}</span>
                                 </td>
@@ -4911,7 +5523,7 @@ function App() {
                           })
                         ) : (
                           <tr>
-                            <td colSpan="9" className="pt-2 text-[#6a6f73]">
+                            <td colSpan="10" className="pt-2 text-[#6a6f73]">
                               {currentRulesSearchTerm
                                 ? 'No rules match the current search.'
                                 : 'No rules yet. Add one to override the default action.'}
@@ -5176,12 +5788,13 @@ function App() {
                               Size{httpsTrafficSortLabel('total_bytes')}
                             </button>
                           </th>
-                          <th>
-                            <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('duration_ms')}>
-                              Duration{httpsTrafficSortLabel('duration_ms')}
-                            </button>
-                          </th>
-                          <th>Route</th>
+                            <th>
+                              <button className={sortableHeaderButtonClass} type="button" onClick={() => toggleHttpsTrafficSort('duration_ms')}>
+                                Duration{httpsTrafficSortLabel('duration_ms')}
+                              </button>
+                            </th>
+                            <th>Rate</th>
+                            <th>Route</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -5205,14 +5818,15 @@ function App() {
                               <td>{item.status_code || 'n/a'}</td>
                               <td className="max-w-64 break-words">{item.host}</td>
                               <td className="max-w-md break-words">{item.path || '/'}</td>
-                              <td>{formatBytes(item.total_bytes)}</td>
-                              <td>{formatDurationMs(item.duration_ms)}</td>
-                              <td>{item.route_label || 'direct'}</td>
+                                <td>{formatBytes(item.total_bytes)}</td>
+                                <td>{formatDurationMs(item.duration_ms)}</td>
+                                <td>{formatRate(item.throughput_bps)}</td>
+                                <td>{item.route_label || 'direct'}</td>
                             </tr>
                           ))
                         ) : (
                           <tr>
-                            <td colSpan="9" className="pt-2 text-[#6a6f73]">
+                              <td colSpan="10" className="pt-2 text-[#6a6f73]">
                               {httpsTrafficError ? 'HTTPS traffic is unavailable right now.' : 'No intercepted HTTPS requests matched this filter.'}
                             </td>
                           </tr>

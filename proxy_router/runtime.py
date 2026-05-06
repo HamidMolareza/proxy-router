@@ -29,6 +29,7 @@ class DashboardState:
         self._totals_by_proxy = {}
         self._totals_by_route = {}
         self._totals_by_client = {}
+        self._totals_by_upstream_proxy = {}
         self._recent_requests = deque(maxlen=recent_limit)
         self._recent_failures = deque(maxlen=recent_failure_limit)
 
@@ -37,6 +38,7 @@ class DashboardState:
             self._totals_by_proxy = {}
             self._totals_by_route = {}
             self._totals_by_client = {}
+            self._totals_by_upstream_proxy = {}
             self._recent_requests.clear()
             self._recent_failures.clear()
 
@@ -91,52 +93,100 @@ class DashboardState:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        relay_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         with self._lock:
             summary = self._totals_by_proxy.setdefault(proxy_label, empty_usage_summary())
-            summary["count"] += 1
-            summary["uploaded_bytes"] += uploaded_bytes
-            summary["downloaded_bytes"] += downloaded_bytes
-            summary["total_bytes"] += uploaded_bytes + downloaded_bytes
+            total_bytes = uploaded_bytes + downloaded_bytes
+            add_usage_to_summary(
+                summary,
+                uploaded_bytes=uploaded_bytes,
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=total_bytes,
+                duration_ms=duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                relay_ms=relay_ms,
+            )
 
             route_bucket = route_bucket_from_label(route_label)
             route_summary = self._totals_by_route.setdefault(route_bucket, empty_usage_summary())
-            route_summary["count"] += 1
-            route_summary["uploaded_bytes"] += uploaded_bytes
-            route_summary["downloaded_bytes"] += downloaded_bytes
-            route_summary["total_bytes"] += uploaded_bytes + downloaded_bytes
+            add_usage_to_summary(
+                route_summary,
+                uploaded_bytes=uploaded_bytes,
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=total_bytes,
+                duration_ms=duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                relay_ms=relay_ms,
+            )
 
             client_summary = self._totals_by_client.setdefault(client, empty_client_usage_summary())
-            client_summary["count"] += 1
-            client_summary["uploaded_bytes"] += uploaded_bytes
-            client_summary["downloaded_bytes"] += downloaded_bytes
-            client_summary["total_bytes"] += uploaded_bytes + downloaded_bytes
+            add_usage_to_summary(
+                client_summary,
+                uploaded_bytes=uploaded_bytes,
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=total_bytes,
+                duration_ms=duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                relay_ms=relay_ms,
+            )
             client_summary["proxy_types"].add(proxy_label)
             client_summary["last_seen_at"] = timestamp
             if client_ip and client and client != client_ip:
                 self._identity_by_client_ip[str(client_ip)] = str(client)
+            if upstream_proxy_id:
+                upstream_summary = self._totals_by_upstream_proxy.setdefault(str(upstream_proxy_id), empty_usage_summary())
+                add_usage_to_summary(
+                    upstream_summary,
+                    uploaded_bytes=uploaded_bytes,
+                    downloaded_bytes=downloaded_bytes,
+                    total_bytes=total_bytes,
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
+                )
 
-            self._recent_requests.appendleft(
-                {
-                    "timestamp": timestamp,
-                    "proxy_type": proxy_label,
-                    "kind": kind,
-                    "client": client,
-                    "destination": destination,
-                    "uploaded_bytes": uploaded_bytes,
-                    "downloaded_bytes": downloaded_bytes,
-                    "total_bytes": uploaded_bytes + downloaded_bytes,
-                    "method": method or kind.upper(),
-                    "route_label": route_label or "direct",
-                    "matched_rule": matched_rule,
-                    "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
-                    "status_code": status_code,
-                    "client_ip": client_ip,
-                    "client_auth_type": client_auth_type,
-                    "client_auth_username": client_auth_username,
-                    "client_auth_label": client_auth_label,
-                }
+            request = {
+                "timestamp": timestamp,
+                "proxy_type": proxy_label,
+                "kind": kind,
+                "client": client,
+                "destination": destination,
+                "uploaded_bytes": uploaded_bytes,
+                "downloaded_bytes": downloaded_bytes,
+                "total_bytes": total_bytes,
+                "method": method or kind.upper(),
+                "route_label": route_label or "direct",
+                "matched_rule": matched_rule,
+                "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
+                "status_code": status_code,
+                "client_ip": client_ip,
+                "client_auth_type": client_auth_type,
+                "client_auth_username": client_auth_username,
+                "client_auth_label": client_auth_label,
+                "upstream_proxy_id": upstream_proxy_id,
+                "upstream_proxy_name": upstream_proxy_name,
+                "upstream_proxy_access_mode": upstream_proxy_access_mode,
+                "proxy_failover_count": proxy_failover_count,
+            }
+            apply_usage_performance_fields(
+                request,
+                total_bytes=total_bytes,
+                duration_ms=duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                relay_ms=relay_ms,
+                upstream_retry_count=upstream_retry_count,
+                upstream_retry_delay_ms=upstream_retry_delay_ms,
             )
+            self._recent_requests.appendleft(request)
 
     def record_failure(
         self,
@@ -158,28 +208,46 @@ class DashboardState:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         with self._lock:
-            self._recent_failures.appendleft(
-                {
-                    "timestamp": timestamp,
-                    "proxy_type": proxy_label,
-                    "client": client,
-                    "method": method,
-                    "destination": destination,
-                    "host": host,
-                    "port": port,
-                    "error": error,
-                    "context": context,
-                    "route_label": route_label or "direct",
-                    "matched_rule": matched_rule,
-                    "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
-                    "client_ip": client_ip,
-                    "client_auth_type": client_auth_type,
-                    "client_auth_username": client_auth_username,
-                    "client_auth_label": client_auth_label,
-                }
+            failure = {
+                "timestamp": timestamp,
+                "proxy_type": proxy_label,
+                "client": client,
+                "method": method,
+                "destination": destination,
+                "host": host,
+                "port": port,
+                "error": error,
+                "context": context,
+                "route_label": route_label or "direct",
+                "matched_rule": matched_rule,
+                "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
+                "client_ip": client_ip,
+                "client_auth_type": client_auth_type,
+                "client_auth_username": client_auth_username,
+                "client_auth_label": client_auth_label,
+                "upstream_proxy_id": upstream_proxy_id,
+                "upstream_proxy_name": upstream_proxy_name,
+                "upstream_proxy_access_mode": upstream_proxy_access_mode,
+                "proxy_failover_count": proxy_failover_count,
+            }
+            apply_failure_performance_fields(
+                failure,
+                duration_ms=duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                upstream_retry_count=upstream_retry_count,
+                upstream_retry_delay_ms=upstream_retry_delay_ms,
             )
+            self._recent_failures.appendleft(failure)
 
     def snapshot(self):
         with self._lock:
@@ -191,16 +259,17 @@ class DashboardState:
             }
             overall = empty_usage_summary()
             for summary in totals_by_proxy.values():
-                overall["count"] += summary["count"]
-                overall["uploaded_bytes"] += summary["uploaded_bytes"]
-                overall["downloaded_bytes"] += summary["downloaded_bytes"]
-                overall["total_bytes"] += summary["total_bytes"]
+                merge_usage_summary(overall, summary)
 
             active_by_proxy = dict(sorted(self._active_by_proxy.items()))
             active_by_client = dict(
                 sorted(self._active_by_client.items(), key=lambda item: (-item[1], item[0]))
             )
             totals_by_client = []
+            totals_by_upstream_proxy = {
+                proxy_id: summary.copy()
+                for proxy_id, summary in self._totals_by_upstream_proxy.items()
+            }
             for client_ip in set(self._active_by_client) | set(self._totals_by_client):
                 usage = self._totals_by_client.get(client_ip)
                 if usage is None:
@@ -213,6 +282,20 @@ class DashboardState:
                         "uploaded_bytes": usage["uploaded_bytes"],
                         "downloaded_bytes": usage["downloaded_bytes"],
                         "total_bytes": usage["total_bytes"],
+                        "duration_sample_count": usage.get("duration_sample_count", 0),
+                        "duration_sample_bytes": usage.get("duration_sample_bytes", 0),
+                        "duration_ms_total": usage.get("duration_ms_total", 0),
+                        "duration_ms_avg": usage.get("duration_ms_avg"),
+                        "duration_ms_max": usage.get("duration_ms_max"),
+                        "upstream_setup_sample_count": usage.get("upstream_setup_sample_count", 0),
+                        "upstream_setup_ms_total": usage.get("upstream_setup_ms_total", 0),
+                        "upstream_setup_ms_avg": usage.get("upstream_setup_ms_avg"),
+                        "upstream_setup_ms_max": usage.get("upstream_setup_ms_max"),
+                        "relay_sample_count": usage.get("relay_sample_count", 0),
+                        "relay_ms_total": usage.get("relay_ms_total", 0),
+                        "relay_ms_avg": usage.get("relay_ms_avg"),
+                        "relay_ms_max": usage.get("relay_ms_max"),
+                        "throughput_bps": usage.get("throughput_bps"),
                         "proxy_types": sorted(usage["proxy_types"]),
                         "last_seen_at": usage["last_seen_at"],
                     }
@@ -228,7 +311,8 @@ class DashboardState:
             "started_at": self.started_at,
             "overall": overall,
             "totals_by_proxy": totals_by_proxy,
-            "totals_by_route": totals_by_route,
+                "totals_by_route": totals_by_route,
+                "totals_by_upstream_proxy": totals_by_upstream_proxy,
             "totals_by_client": totals_by_client,
             "active_by_proxy": active_by_proxy,
             "active_by_client": active_by_client,
@@ -588,6 +672,15 @@ class UsageLogger:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        relay_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         if self._stream is None:
             return
@@ -604,6 +697,15 @@ class UsageLogger:
             "route_label": route_label or "direct",
             "profile_id": profile_id or DEFAULT_ROUTING_PROFILE_ID,
         }
+        apply_usage_performance_fields(
+            event,
+            total_bytes=uploaded_bytes + downloaded_bytes,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+        )
         if method is not None:
             event["method"] = method
         if matched_rule is not None:
@@ -618,6 +720,14 @@ class UsageLogger:
             event["client_auth_username"] = client_auth_username
         if client_auth_label is not None:
             event["client_auth_label"] = client_auth_label
+        if upstream_proxy_id is not None:
+            event["upstream_proxy_id"] = upstream_proxy_id
+        if upstream_proxy_name is not None:
+            event["upstream_proxy_name"] = upstream_proxy_name
+        if upstream_proxy_access_mode is not None:
+            event["upstream_proxy_access_mode"] = upstream_proxy_access_mode
+        if proxy_failover_count is not None:
+            event["proxy_failover_count"] = int(proxy_failover_count)
 
         with self._lock:
             self._stream.write(json.dumps(event, sort_keys=True) + "\n")
@@ -714,6 +824,14 @@ class FailureLogger:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         event = {
             "timestamp": timestamp,
@@ -736,8 +854,23 @@ class FailureLogger:
             event["client_auth_username"] = client_auth_username
         if client_auth_label is not None:
             event["client_auth_label"] = client_auth_label
+        if upstream_proxy_id is not None:
+            event["upstream_proxy_id"] = upstream_proxy_id
+        if upstream_proxy_name is not None:
+            event["upstream_proxy_name"] = upstream_proxy_name
+        if upstream_proxy_access_mode is not None:
+            event["upstream_proxy_access_mode"] = upstream_proxy_access_mode
+        if proxy_failover_count is not None:
+            event["proxy_failover_count"] = int(proxy_failover_count)
         if matched_rule is not None:
             event["matched_rule"] = matched_rule
+        apply_failure_performance_fields(
+            event,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+        )
 
         if self._stream is not None:
             with self._lock:
@@ -938,6 +1071,15 @@ class AppRuntime:
                 client_auth_type=str(record.get("client_auth_type")) if record.get("client_auth_type") is not None else None,
                 client_auth_username=str(record.get("client_auth_username")) if record.get("client_auth_username") is not None else None,
                 client_auth_label=str(record.get("client_auth_label")) if record.get("client_auth_label") is not None else None,
+                duration_ms=record.get("duration_ms"),
+                upstream_setup_ms=record.get("upstream_setup_ms"),
+                relay_ms=record.get("relay_ms"),
+                upstream_retry_count=record.get("upstream_retry_count"),
+                upstream_retry_delay_ms=record.get("upstream_retry_delay_ms"),
+                upstream_proxy_id=str(record.get("upstream_proxy_id")) if record.get("upstream_proxy_id") is not None else None,
+                upstream_proxy_name=str(record.get("upstream_proxy_name")) if record.get("upstream_proxy_name") is not None else None,
+                upstream_proxy_access_mode=str(record.get("upstream_proxy_access_mode")) if record.get("upstream_proxy_access_mode") is not None else None,
+                proxy_failover_count=record.get("proxy_failover_count"),
             )
 
         failure_records, _ = load_failure_records(
@@ -974,6 +1116,14 @@ class AppRuntime:
                 client_auth_type=str(record.get("client_auth_type")) if record.get("client_auth_type") is not None else None,
                 client_auth_username=str(record.get("client_auth_username")) if record.get("client_auth_username") is not None else None,
                 client_auth_label=str(record.get("client_auth_label")) if record.get("client_auth_label") is not None else None,
+                duration_ms=record.get("duration_ms"),
+                upstream_setup_ms=record.get("upstream_setup_ms"),
+                upstream_retry_count=record.get("upstream_retry_count"),
+                upstream_retry_delay_ms=record.get("upstream_retry_delay_ms"),
+                upstream_proxy_id=str(record.get("upstream_proxy_id")) if record.get("upstream_proxy_id") is not None else None,
+                upstream_proxy_name=str(record.get("upstream_proxy_name")) if record.get("upstream_proxy_name") is not None else None,
+                upstream_proxy_access_mode=str(record.get("upstream_proxy_access_mode")) if record.get("upstream_proxy_access_mode") is not None else None,
+                proxy_failover_count=record.get("proxy_failover_count"),
             )
 
     def attach_router_config(self, router_config):
@@ -1019,6 +1169,11 @@ class AppRuntime:
             route_decision,
             status_code=status_code,
         )
+
+    def build_auto_proxy_direct_failure_probe_route(self, host: str | None, route_decision):
+        if self.auto_proxy_failure_manager is None:
+            return None
+        return self.auto_proxy_failure_manager.direct_failure_probe_route(host, route_decision)
 
     def https_interception_status(self, settings=None):
         status = self.https_interception.status(settings)
@@ -1117,6 +1272,15 @@ class AppRuntime:
             host,
             route_label=route_decision.get("route_label"),
             profile_id=route_decision.get("profile_id"),
+            proxy_id=self._proxy_id_from_route_decision(route_decision),
+        )
+
+    def _proxy_id_from_route_decision(self, route_decision):
+        upstream = (route_decision or {}).get("upstream") or {}
+        return (
+            (route_decision or {}).get("upstream_proxy_id")
+            or upstream.get("id")
+            or None
         )
 
     def record_usage(
@@ -1137,6 +1301,15 @@ class AppRuntime:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        relay_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.usage_logger.record(
@@ -1156,6 +1329,15 @@ class AppRuntime:
             client_auth_type=client_auth_type,
             client_auth_username=client_auth_username,
             client_auth_label=client_auth_label,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+            upstream_proxy_id=upstream_proxy_id,
+            upstream_proxy_name=upstream_proxy_name,
+            upstream_proxy_access_mode=upstream_proxy_access_mode,
+            proxy_failover_count=proxy_failover_count,
         )
         self.dashboard_state.record_request(
             proxy_label=proxy_label,
@@ -1174,11 +1356,21 @@ class AppRuntime:
             client_auth_type=client_auth_type,
             client_auth_username=client_auth_username,
             client_auth_label=client_auth_label,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+            upstream_proxy_id=upstream_proxy_id,
+            upstream_proxy_name=upstream_proxy_name,
+            upstream_proxy_access_mode=upstream_proxy_access_mode,
+            proxy_failover_count=proxy_failover_count,
         )
         self.traffic_quota_manager.record_usage(
             client=client,
             total_bytes=uploaded_bytes + downloaded_bytes,
             timestamp=timestamp,
+            upstream_proxy_id=upstream_proxy_id,
         )
         self.notify_dashboard_update("usage")
 
@@ -1250,6 +1442,9 @@ class AppRuntime:
             },
         }
         event["total_bytes"] = event["request"]["body_bytes"] + event["response"]["body_bytes"]
+        throughput_bps = calculate_throughput_bps(event["total_bytes"], event["duration_ms"])
+        if throughput_bps is not None:
+            event["throughput_bps"] = throughput_bps
         self.https_traffic_logger.record(event)
         self.notify_dashboard_update("https-traffic")
 
@@ -1271,6 +1466,14 @@ class AppRuntime:
         client_auth_type: str | None = None,
         client_auth_username: str | None = None,
         client_auth_label: str | None = None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
+        upstream_proxy_id: str | None = None,
+        upstream_proxy_name: str | None = None,
+        upstream_proxy_access_mode: str | None = None,
+        proxy_failover_count: int | None = None,
     ):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.failure_logger.record(
@@ -1290,6 +1493,14 @@ class AppRuntime:
             client_auth_type=client_auth_type,
             client_auth_username=client_auth_username,
             client_auth_label=client_auth_label,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+            upstream_proxy_id=upstream_proxy_id,
+            upstream_proxy_name=upstream_proxy_name,
+            upstream_proxy_access_mode=upstream_proxy_access_mode,
+            proxy_failover_count=proxy_failover_count,
         )
         self.dashboard_state.record_failure(
             proxy_label=proxy_label,
@@ -1308,6 +1519,14 @@ class AppRuntime:
             client_auth_type=client_auth_type,
             client_auth_username=client_auth_username,
             client_auth_label=client_auth_label,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+            upstream_proxy_id=upstream_proxy_id,
+            upstream_proxy_name=upstream_proxy_name,
+            upstream_proxy_access_mode=upstream_proxy_access_mode,
+            proxy_failover_count=proxy_failover_count,
         )
         if self.auto_proxy_failure_manager is not None:
             self.auto_proxy_failure_manager.record_failure(

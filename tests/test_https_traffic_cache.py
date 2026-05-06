@@ -25,6 +25,7 @@ class HttpsTrafficCacheTests(unittest.TestCase):
                     "status_code": 200,
                     "reason": "OK",
                     "duration_ms": 25,
+                    "throughput_bps": 4800,
                     "route_label": "direct",
                     "request": {"body_bytes": 0, "headers": [], "body_preview": {"text": ""}},
                     "response": {
@@ -61,6 +62,7 @@ class HttpsTrafficCacheTests(unittest.TestCase):
 
             self.assertEqual(payload["total"], 1)
             self.assertEqual(payload["items"][0]["id"], "first")
+            self.assertEqual(payload["items"][0]["throughput_bps"], 4800)
             self.assertEqual(payload["available_clients"], ["192.168.1.40", "user:mobile"])
             self.assertEqual(cache.detail("second")["status_code"], 403)
 

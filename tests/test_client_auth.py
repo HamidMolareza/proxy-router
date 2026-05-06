@@ -1,11 +1,11 @@
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 import proxy_router.proxy_server as proxy_server
-
 from proxy_router.constants import SOCKS_AUTH_NO_ACCEPTABLE, SOCKS_AUTH_NO_AUTH, SOCKS_VERSION
 from proxy_router.config import RouterConfigManager
 from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler, is_loopback_client_ip
@@ -44,6 +44,113 @@ class ClientAuthTests(unittest.TestCase):
         self.assertTrue(credential["password_hash"].startswith("pbkdf2_sha256:"))
         self.assertTrue(verify_client_auth_password("secret", credential["password_hash"]))
         self.assertFalse(verify_client_auth_password("wrong", credential["password_hash"]))
+
+    def test_change_client_auth_password_updates_only_target_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                saved = manager.update(
+                    {
+                        "client_auth": {
+                            "enabled": True,
+                            "allow_anonymous": True,
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret", "label": "Android phone"},
+                                {"username": "tablet", "password": "tablet-secret", "label": "Tablet"},
+                            ],
+                        }
+                    }
+                )
+                old_hash = saved["client_auth"]["credentials"][0]["password_hash"]
+
+                changed = manager.change_client_auth_password(
+                    "phone",
+                    current_password="old-secret",
+                    new_password="new-secret",
+                )
+
+                phone = changed["client_auth"]["credentials"][0]
+                tablet = changed["client_auth"]["credentials"][1]
+                self.assertEqual(phone["username"], "phone")
+                self.assertEqual(phone["label"], "Android phone")
+                self.assertNotEqual(phone["password_hash"], old_hash)
+                self.assertTrue(verify_client_auth_password("new-secret", phone["password_hash"]))
+                self.assertFalse(verify_client_auth_password("old-secret", phone["password_hash"]))
+                self.assertTrue(verify_client_auth_password("tablet-secret", tablet["password_hash"]))
+            finally:
+                manager.shutdown()
+
+    def test_change_client_auth_password_rejects_wrong_current_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret"},
+                            ],
+                        }
+                    }
+                )
+
+                with self.assertRaises(PermissionError):
+                    manager.change_client_auth_password(
+                        "phone",
+                        current_password="wrong-secret",
+                        new_password="new-secret",
+                    )
+
+                credential = manager.snapshot()["client_auth"]["credentials"][0]
+                self.assertTrue(verify_client_auth_password("old-secret", credential["password_hash"]))
+            finally:
+                manager.shutdown()
+
+    def test_change_client_auth_password_rejects_blank_new_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret"},
+                            ],
+                        }
+                    }
+                )
+
+                with self.assertRaises(ValueError):
+                    manager.change_client_auth_password(
+                        "phone",
+                        current_password="old-secret",
+                        new_password="",
+                    )
+            finally:
+                manager.shutdown()
+
+    def test_change_client_auth_password_rejects_disabled_credential(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret", "enabled": False},
+                            ],
+                        }
+                    }
+                )
+
+                with self.assertRaises(PermissionError):
+                    manager.change_client_auth_password(
+                        "phone",
+                        current_password="old-secret",
+                        new_password="new-secret",
+                    )
+            finally:
+                manager.shutdown()
 
     def test_authentication_accepts_enabled_credential(self):
         settings = {
@@ -220,6 +327,36 @@ class ClientAuthTests(unittest.TestCase):
         self.assertFalse(handler._authenticate_http_client())
         self.assertEqual(len(responses), 1)
 
+    def test_intercepted_https_reuses_authenticated_connect_identity(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.headers = {}
+        inherited_identity = {
+            "id": "user:phone",
+            "ip": "192.168.1.23",
+            "auth_type": "basic",
+            "username": "phone",
+            "label": "Phone",
+        }
+        handler.server = SimpleNamespace(
+            client_identity=inherited_identity,
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {
+                    "enabled": True,
+                    "allow_anonymous": False,
+                    "realm": "lab",
+                    "credentials": [],
+                }
+            ),
+            client_tracker=SimpleNamespace(reidentified=lambda *_args, **_kwargs: None),
+        )
+        responses = []
+        handler._send_proxy_auth_required = lambda settings, error=None: responses.append((settings, error))
+
+        self.assertTrue(handler._authenticate_http_client())
+        self.assertEqual(handler._client_identity(), inherited_identity)
+        self.assertEqual(responses, [])
+
     def test_loopback_socks_client_can_use_no_auth_when_anonymous_disabled(self):
         writes = []
         handler = Socks5RequestHandler.__new__(Socks5RequestHandler)
@@ -258,7 +395,6 @@ class ClientAuthTests(unittest.TestCase):
 
         self.assertFalse(handler._negotiate_authentication(bytes([SOCKS_AUTH_NO_AUTH])))
         self.assertEqual(writes, [bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE])])
-
 
     def test_client_portal_keeps_inherited_socks_identity(self):
         handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
@@ -336,6 +472,146 @@ class ClientAuthTests(unittest.TestCase):
         self.assertTrue(is_loopback_client_ip("127.42.0.9"))
         self.assertTrue(is_loopback_client_ip("::1"))
         self.assertFalse(is_loopback_client_ip("192.168.1.23"))
+
+    def _build_password_portal_handler(self, manager, *, body, identity=None, identity_by_client_ip=None):
+        responses = []
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        handler.command = "POST"
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.headers = {}
+        if identity is not None:
+            handler._proxy_client_identity = identity
+        handler.server = SimpleNamespace(
+            proxy_label="http",
+            router_config=manager,
+            runtime=SimpleNamespace(
+                self_endpoints=SimpleNamespace(
+                    resolve_target_kind=lambda _host, _port: "listener",
+                    is_client_portal_host=lambda _host: False,
+                ),
+                dashboard_state=SimpleNamespace(
+                    snapshot=lambda: {"identity_by_client_ip": dict(identity_by_client_ip or {})}
+                ),
+            ),
+        )
+        handler._apply_optional_http_client_identity = lambda: None
+        handler._drop_blocked_client = lambda **_kwargs: False
+        handler._read_request_body = lambda: json.dumps(body).encode("utf-8")
+        handler._send_json_response = lambda payload, status=200: responses.append((status, payload))
+        handler._send_body_response = lambda *_args, **_kwargs: responses.append(("body", _args, _kwargs))
+        return handler, responses
+
+    def test_client_portal_password_endpoint_changes_authenticated_user_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            original_snapshot_builder = proxy_server.build_client_portal_snapshot
+            proxy_server.build_client_portal_snapshot = (
+                lambda _server, client, **_kwargs: {"client": client, "can_change_password": True}
+            )
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "enabled": True,
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret"},
+                            ],
+                        }
+                    }
+                )
+                handler, responses = self._build_password_portal_handler(
+                    manager,
+                    identity={"id": "user:phone", "username": "phone", "auth_type": "basic", "label": ""},
+                    body={"current_password": "old-secret", "new_password": "new-secret"},
+                )
+
+                handled = handler._handle_client_portal_request("http", "proxy.router", 8900, "/api/client/password")
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0][0], 200)
+                self.assertTrue(responses[0][1]["ok"])
+                credential = manager.snapshot()["client_auth"]["credentials"][0]
+                self.assertTrue(verify_client_auth_password("new-secret", credential["password_hash"]))
+            finally:
+                proxy_server.build_client_portal_snapshot = original_snapshot_builder
+                manager.shutdown()
+
+    def test_client_portal_password_endpoint_rejects_anonymous_client(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                handler, responses = self._build_password_portal_handler(
+                    manager,
+                    body={"current_password": "old-secret", "new_password": "new-secret"},
+                )
+
+                handled = handler._handle_client_portal_request("http", "proxy.router", 8900, "/api/client/password")
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0][0], 403)
+            finally:
+                manager.shutdown()
+
+    def test_client_portal_password_endpoint_rejects_wrong_current_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret"},
+                            ],
+                        }
+                    }
+                )
+                handler, responses = self._build_password_portal_handler(
+                    manager,
+                    identity={"id": "user:phone", "username": "phone", "auth_type": "basic", "label": ""},
+                    body={"current_password": "wrong-secret", "new_password": "new-secret"},
+                )
+
+                handled = handler._handle_client_portal_request("http", "proxy.router", 8900, "/api/client/password")
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0][0], 403)
+                credential = manager.snapshot()["client_auth"]["credentials"][0]
+                self.assertTrue(verify_client_auth_password("old-secret", credential["password_hash"]))
+            finally:
+                manager.shutdown()
+
+    def test_client_portal_password_endpoint_uses_mapped_client_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            original_snapshot_builder = proxy_server.build_client_portal_snapshot
+            proxy_server.build_client_portal_snapshot = (
+                lambda _server, client, **_kwargs: {"client": client, "can_change_password": True}
+            )
+            try:
+                manager.update(
+                    {
+                        "client_auth": {
+                            "credentials": [
+                                {"username": "phone", "password": "old-secret"},
+                            ],
+                        }
+                    }
+                )
+                handler, responses = self._build_password_portal_handler(
+                    manager,
+                    body={"current_password": "old-secret", "new_password": "new-secret"},
+                    identity_by_client_ip={"192.168.1.23": "user:phone"},
+                )
+
+                handled = handler._handle_client_portal_request("http", "proxy.router", 8900, "/api/client/password")
+
+                self.assertTrue(handled)
+                self.assertEqual(responses[0][0], 200)
+                credential = manager.snapshot()["client_auth"]["credentials"][0]
+                self.assertTrue(verify_client_auth_password("new-secret", credential["password_hash"]))
+            finally:
+                proxy_server.build_client_portal_snapshot = original_snapshot_builder
+                manager.shutdown()
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ def normalize_rule_suggestion_rule(payload) -> dict:
     if duration not in RULE_DURATION_SECONDS:
         raise ValueError(f"rule suggestion duration must be one of: {', '.join(RULE_DURATION_ORDER)}")
 
-    return {
+    normalized = {
         "pattern": pattern,
         "match": match_type,
         "action": action,
@@ -51,6 +51,10 @@ def normalize_rule_suggestion_rule(payload) -> dict:
         "duration": duration,
         "expires_at": None,
     }
+    proxy_id = normalize_upstream_proxy_id(payload.get("proxy_id"))
+    if action == "proxy" and proxy_id:
+        normalized["proxy_id"] = proxy_id
+    return normalized
 
 
 def normalize_rule_suggestion_status(value: str | None) -> str:
@@ -906,6 +910,39 @@ class RouterConfigManager:
         self._notify_change("router-config")
         return saved
 
+    def change_client_auth_password(self, username: str, *, current_password: str, new_password: str) -> dict:
+        normalized_username = normalize_client_auth_username(username)
+        if not normalized_username:
+            raise PermissionError("authenticated user is required")
+        if not str(current_password or ""):
+            raise ValueError("current password is required")
+        if not str(new_password or ""):
+            raise ValueError("new password is required")
+
+        with self._lock:
+            config = json.loads(json.dumps(self._config))
+            credentials = (config.get("client_auth") or {}).get("credentials") or []
+            credential = next(
+                (
+                    item
+                    for item in credentials
+                    if str(item.get("username") or "") == normalized_username
+                ),
+                None,
+            )
+            if credential is None or not credential.get("enabled", True):
+                raise PermissionError("authenticated credential was not found or is disabled")
+            if not verify_client_auth_password(str(current_password), credential.get("password_hash")):
+                raise PermissionError("current password is incorrect")
+
+            credential["password_hash"] = hash_client_auth_password(str(new_password))
+            normalized = normalize_router_config(config)
+            validate_router_rule_issues(normalized)
+            self._write_config_locked(normalized)
+            saved = json.loads(json.dumps(self._config))
+        self._notify_change("router-config")
+        return saved
+
     def ignored_failure_hosts(self, profile_id: str | None = None):
         with self._lock:
             self._prune_expired_rules_locked()
@@ -1075,7 +1112,7 @@ class RouterConfigManager:
                     break
 
             enabled = bool(settings.get("enabled", False))
-            upstream_enabled = bool(self._config.get("upstream", {}).get("enabled"))
+            upstream_enabled = any(proxy.get("enabled", True) for proxy in self._config.get("proxies", []))
             ignored = bool(normalized_host) and (
                 normalized_host in ignored_hosts or (domain and domain in ignored_hosts)
             )
@@ -1102,6 +1139,7 @@ class RouterConfigManager:
         stage_index: int,
         expires_at: datetime,
         profile_id: str | None = None,
+        proxy_id: str | None = None,
     ):
         normalized_host = normalize_host(host or "")
         if not normalized_host:
@@ -1129,10 +1167,13 @@ class RouterConfigManager:
 
             if not settings.get("enabled", False):
                 return {"status": "skipped", "reason": "disabled", "pattern": pattern}
-            if not config.get("upstream", {}).get("enabled", False):
+            if not any(proxy.get("enabled", True) for proxy in config.get("proxies", [])):
                 return {"status": "skipped", "reason": "upstream-disabled", "pattern": pattern}
             if normalized_host in ignored_hosts or pattern in ignored_hosts:
                 return {"status": "skipped", "reason": "ignored", "pattern": pattern}
+            selected_proxy_id = normalize_upstream_proxy_id(proxy_id)
+            if selected_proxy_id and selected_proxy_id not in {proxy.get("id") for proxy in config.get("proxies", [])}:
+                return {"status": "skipped", "reason": "missing-proxy", "pattern": pattern}
 
             for rule in target_profile.get("rules", []):
                 if not rule.get("enabled", True):
@@ -1143,6 +1184,10 @@ class RouterConfigManager:
                     rule["source"] = "auto"
                     rule["duration"] = format_auto_proxy_duration(duration_seconds)
                     rule["expires_at"] = expires_at.isoformat()
+                    if selected_proxy_id:
+                        rule["proxy_id"] = selected_proxy_id
+                    else:
+                        rule.pop("proxy_id", None)
                     normalized = normalize_router_config(config)
                     self._write_config_locked(normalized)
                     return {
@@ -1171,6 +1216,8 @@ class RouterConfigManager:
                 "duration": format_auto_proxy_duration(duration_seconds),
                 "expires_at": expires_at.isoformat(),
             }
+            if selected_proxy_id:
+                rule["proxy_id"] = selected_proxy_id
             target_profile.setdefault("rules", []).append(rule)
             normalized = normalize_router_config(config)
             self._write_config_locked(normalized)
@@ -1213,7 +1260,23 @@ class RouterConfigManager:
                 "profile_id": target_profile.get("id", DEFAULT_ROUTING_PROFILE_ID),
             }
 
-    def decide(self, host: str):
+    def upstream_proxies(self, *, client_id: str | None = None, preferred_proxy_id: str | None = None):
+        with self._lock:
+            proxies = json.loads(json.dumps(self._config.get("proxies", [])))
+        enabled = [proxy for proxy in proxies if proxy.get("enabled", True)]
+        if client_id is not None:
+            enabled = [proxy for proxy in enabled if proxy_allows_client(proxy, client_id)]
+        preferred_id = normalize_upstream_proxy_id(preferred_proxy_id)
+        enabled.sort(
+            key=lambda proxy: (
+                0 if preferred_id and proxy.get("id") == preferred_id else 1,
+                int(proxy.get("priority", 1)),
+                str(proxy.get("id") or ""),
+            )
+        )
+        return enabled
+
+    def decide(self, host: str, *, client_id: str | None = None):
         normalized_host = normalize_host(host)
         network_state = self._network_monitor.snapshot()
         with self._lock:
@@ -1231,22 +1294,42 @@ class RouterConfigManager:
                     action = rule["action"]
                     break
 
-            upstream = dict(config["upstream"]) if config["upstream"]["enabled"] else None
+            preferred_proxy_id = matched_rule.get("proxy_id") if matched_rule else None
+            upstream_candidates = [
+                proxy
+                for proxy in json.loads(json.dumps(config.get("proxies", [])))
+                if proxy.get("enabled", True) and proxy_allows_client(proxy, client_id)
+            ]
+            preferred_proxy_id = normalize_upstream_proxy_id(preferred_proxy_id)
+            upstream_candidates.sort(
+                key=lambda proxy: (
+                    0 if preferred_proxy_id and proxy.get("id") == preferred_proxy_id else 1,
+                    int(proxy.get("priority", 1)),
+                    str(proxy.get("id") or ""),
+                )
+            )
+            upstream = dict(upstream_candidates[0]) if upstream_candidates else None
 
         return {
             "host": normalized_host,
             "action": action,
             "matched_rule": matched_rule,
             "upstream": upstream,
+            "upstream_candidates": upstream_candidates,
+            "preferred_proxy_id": preferred_proxy_id or None,
             "profile_id": profile.get("id", DEFAULT_ROUTING_PROFILE_ID),
             "profile_name": profile.get("name", "Shared"),
             "profile_signature": json.loads(
                 json.dumps(profile.get("signature") or default_routing_profile_signature())
             ),
-            "route_label": describe_route_decision(
-                {
-                    "action": action,
-                    "upstream": upstream if action == "proxy" else None,
-                }
+            "route_label": (
+                UPSTREAM_PROXY_ROUTE_LABEL
+                if action == "proxy" and upstream is None
+                else describe_route_decision(
+                    {
+                        "action": action,
+                        "upstream": upstream if action == "proxy" else None,
+                    }
+                )
             ),
         }

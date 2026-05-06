@@ -121,11 +121,21 @@ def normalize_upstream_retry_policy(policy):
     }
 
 
-def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_upstream_error, retry_policy=None):
+def retry_upstream_operation(
+    operation,
+    *,
+    on_retry,
+    should_retry=is_retryable_upstream_error,
+    retry_policy=None,
+    retry_metrics: dict | None = None,
+):
     normalized_policy = normalize_upstream_retry_policy(retry_policy)
     attempts = normalized_policy["attempts"]
     delay_seconds = normalized_policy["initial_delay_seconds"]
     max_delay_seconds = normalized_policy["max_delay_seconds"]
+    if retry_metrics is not None:
+        retry_metrics.setdefault("upstream_retry_count", 0)
+        retry_metrics.setdefault("upstream_retry_delay_ms", 0)
     for attempt in range(1, attempts + 1):
         try:
             return operation(attempt)
@@ -133,6 +143,11 @@ def retry_upstream_operation(operation, *, on_retry, should_retry=is_retryable_u
             if attempt >= attempts or not should_retry(exc):
                 raise
             on_retry(attempt, attempts, delay_seconds, exc)
+            if retry_metrics is not None:
+                retry_metrics["upstream_retry_count"] = int(retry_metrics.get("upstream_retry_count", 0)) + 1
+                retry_metrics["upstream_retry_delay_ms"] = int(
+                    retry_metrics.get("upstream_retry_delay_ms", 0)
+                ) + int(delay_seconds * 1000)
             time.sleep(delay_seconds)
             delay_seconds = min(max(delay_seconds * 2, delay_seconds), max_delay_seconds)
 
@@ -633,12 +648,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._set_client_identity(self._anonymous_client_identity())
             return
         if not str(self.headers.get("Proxy-Authorization") or "").strip():
-            inherited_identity = getattr(self.server, "client_identity", None)
-            if str((inherited_identity or {}).get("id") or "").startswith("user:"):
+            inherited_identity = self._inherited_authenticated_http_identity()
+            if inherited_identity is not None:
                 self._set_client_identity(inherited_identity)
                 return
         identity = self._build_http_basic_identity(settings) or self._anonymous_client_identity()
         self._set_client_identity(identity)
+
+    def _inherited_authenticated_http_identity(self):
+        inherited_identity = getattr(self.server, "client_identity", None)
+        if str((inherited_identity or {}).get("id") or "").startswith("user:"):
+            return inherited_identity
+        return None
 
     def _send_proxy_auth_required(self, settings, *, error: str | None = None):
         realm = sanitize_http_header_value(str((settings or {}).get("realm") or DEFAULT_CLIENT_AUTH_REALM))
@@ -665,6 +686,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         header = str(self.headers.get("Proxy-Authorization") or "").strip()
         if not header:
+            inherited_identity = self._inherited_authenticated_http_identity()
+            if inherited_identity is not None:
+                self._set_client_identity(inherited_identity)
+                return True
             if settings.get("allow_anonymous", True):
                 self._set_client_identity(self._anonymous_client_identity())
                 return True
@@ -784,8 +809,42 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
             upstream_owner = None
             upstream = None
+            upstream_metrics = {}
+            upstream_setup_ms = None
             try:
-                upstream, upstream_owner = self._open_routed_stream(host, port, route_decision)
+                upstream_setup_started = time.monotonic()
+                try:
+                    opened_stream = self._open_routed_stream(
+                        host,
+                        port,
+                        route_decision,
+                        retry_metrics=upstream_metrics,
+                    )
+                    if len(opened_stream) == 2:
+                        upstream, upstream_owner = opened_stream
+                    else:
+                        upstream, upstream_owner, route_decision = opened_stream
+                except Exception as exc:
+                    probe_route = self._build_auto_proxy_direct_failure_probe_route(host, route_decision, exc)
+                    if probe_route is None:
+                        raise
+                    self._debug(
+                        "retrying failed direct CONNECT through auto-proxy probe "
+                        f"target={host}:{port} route={probe_route['route_label']} direct_error={exc}",
+                        level="WARNING",
+                    )
+                    route_decision = probe_route
+                    opened_stream = self._open_routed_stream(
+                        host,
+                        port,
+                        route_decision,
+                        retry_metrics=upstream_metrics,
+                    )
+                    if len(opened_stream) == 2:
+                        upstream, upstream_owner = opened_stream
+                    else:
+                        upstream, upstream_owner, route_decision = opened_stream
+                upstream_setup_ms = int((time.monotonic() - upstream_setup_started) * 1000)
                 local_bind = format_client_address(upstream.getsockname())
                 remote_peer = format_client_address(upstream.getpeername())
                 self._debug(
@@ -796,6 +855,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 stats = tunnel_bidirectional(self.connection, upstream)
                 duration_ms = int((time.monotonic() - request_started) * 1000)
+                relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
                     "CONNECT tunnel closed "
                     f"duration_ms={duration_ms} "
@@ -817,6 +877,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_label=route_decision["route_label"],
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
+                    upstream_retry_count=upstream_metrics.get("upstream_retry_count"),
+                    upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms"),
+                    **self._proxy_record_kwargs(route_decision),
                 )
                 if route_decision.get("auto_proxy_probe"):
                     self.server.runtime.record_auto_proxy_success(host, route_decision)
@@ -834,6 +900,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 host=host if "host" in locals() else None,
                 port=port if "port" in locals() else None,
                 route_decision=route_decision if "route_decision" in locals() else None,
+                duration_ms=int((time.monotonic() - request_started) * 1000) if "request_started" in locals() else None,
+                upstream_setup_ms=(
+                    upstream_setup_ms
+                    if "upstream_setup_ms" in locals() and upstream_setup_ms is not None
+                    else int((time.monotonic() - upstream_setup_started) * 1000)
+                    if "upstream_setup_started" in locals()
+                    else None
+                ),
+                upstream_retry_count=upstream_metrics.get("upstream_retry_count") if "upstream_metrics" in locals() else None,
+                upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms") if "upstream_metrics" in locals() else None,
             )
 
     def do_GET(self):
@@ -1198,6 +1274,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         suggestion_paths = {"/api/client/rule-suggestions", "/api/client/rule-suggestions.json"}
         suggestion_clear_paths = {"/api/client/rule-suggestions/clear", "/api/client/rule-suggestions/clear.json"}
         suggestion_delete_prefix = "/api/client/rule-suggestions/"
+        password_paths = {"/api/client/password", "/api/client/password.json"}
         quota_paths = {"/quota", "/quota/"}
         ca_html_paths = {"/ca", "/ca/", "/cert", "/cert/", "/certificate", "/certificate/"}
         ca_cert_paths = {"/ca.crt", "/cert.crt", "/certificate.crt", "/proxy-router-ca.crt"}
@@ -1220,6 +1297,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return True
 
         if self.command == "POST":
+            if route_path in password_paths:
+                try:
+                    raw_body = self._read_request_body() or b"{}"
+                    payload = json.loads(raw_body.decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("password change payload must be an object")
+                    user_identity = resolve_client_portal_user_identity(
+                        self.server,
+                        portal_client_id,
+                        client_ip=self.client_address[0],
+                    )
+                    if not user_identity:
+                        raise PermissionError("only authenticated users can change their password")
+                    username = normalize_client_auth_username(user_identity)
+                    self.server.router_config.change_client_auth_password(
+                        username,
+                        current_password=str(payload.get("current_password") or ""),
+                        new_password=str(payload.get("new_password") or ""),
+                    )
+                    response_snapshot = build_client_portal_snapshot(
+                        self.server,
+                        user_identity,
+                        range_key=range_key,
+                        client_ip=self.client_address[0],
+                    )
+                    self._send_json_response(
+                        {
+                            "ok": True,
+                            "snapshot": response_snapshot,
+                        },
+                        status=200,
+                    )
+                    return True
+                except PermissionError as exc:
+                    self._send_json_response({"error": str(exc)}, status=403)
+                    return True
+                except json.JSONDecodeError as exc:
+                    self._send_json_response({"error": f"invalid JSON body: {exc.msg}"}, status=400)
+                    return True
+                except ValueError as exc:
+                    self._send_json_response({"error": str(exc)}, status=400)
+                    return True
+                except OSError as exc:
+                    self._send_json_response({"error": f"failed to change password: {exc}"}, status=500)
+                    return True
+
             if route_path in suggestion_clear_paths:
                 manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
                 if manager is None:
@@ -1698,7 +1821,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
             self._debug(f"outbound-headers={format_headers_for_log(outbound_headers)}")
             self._debug(body_details)
-            connection, response = self._perform_upstream_request(
+            upstream_metrics = {}
+            upstream_setup_started = time.monotonic()
+            connection, response, route_decision = self._perform_upstream_request(
                 scheme,
                 host,
                 port,
@@ -1706,6 +1831,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 body,
                 outbound_headers,
                 route_decision=route_decision,
+                retry_metrics=upstream_metrics,
             )
             retry_result = self._retry_forbidden_https_with_proxy(
                 scheme,
@@ -1717,10 +1843,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 connection,
                 response,
                 route_decision,
+                retry_metrics=upstream_metrics,
             )
             if retry_result is None:
                 return
             connection, response, route_decision = retry_result
+            upstream_setup_ms = int((time.monotonic() - upstream_setup_started) * 1000)
             self._write_response(
                 connection,
                 response,
@@ -1734,6 +1862,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 method=self.command,
                 kind="https" if scheme == "https" else "http",
                 route_decision=route_decision,
+                upstream_setup_ms=upstream_setup_ms,
+                upstream_retry_count=upstream_metrics.get("upstream_retry_count"),
+                upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms"),
             )
         except Exception as exc:
             destination = "forward request"
@@ -1747,6 +1878,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 host=host if "host" in locals() else None,
                 port=port if "port" in locals() else None,
                 route_decision=route_decision if "route_decision" in locals() else None,
+                duration_ms=int((time.monotonic() - request_started) * 1000) if "request_started" in locals() else None,
+                upstream_setup_ms=(
+                    int((time.monotonic() - upstream_setup_started) * 1000)
+                    if "upstream_setup_started" in locals()
+                    else None
+                ),
+                upstream_retry_count=upstream_metrics.get("upstream_retry_count") if "upstream_metrics" in locals() else None,
+                upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms") if "upstream_metrics" in locals() else None,
             )
 
     def _extract_target(self):
@@ -1874,7 +2013,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
             return route_decision
 
-        route_decision = self.server.router_config.decide(host)
+        try:
+            client_id = self._client_id()
+        except AttributeError:
+            client_id = None
+        try:
+            route_decision = self.server.router_config.decide(host, client_id=client_id)
+        except TypeError:
+            route_decision = self.server.router_config.decide(host)
         if apply_auto_proxy_probe:
             route_decision = self.server.runtime.apply_auto_proxy_probe_route(host, route_decision)
         matched_rule = route_decision["matched_rule"]
@@ -1891,6 +2037,68 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 f"action={route_decision['route_label']}"
             )
         return route_decision
+
+    def _route_with_selected_proxy(self, route_decision, proxy, *, failover_count: int = 0):
+        selected = dict(route_decision)
+        selected["upstream"] = dict(proxy)
+        selected["upstream_candidates"] = [dict(proxy)]
+        selected["route_label"] = (
+            build_auto_proxy_probe_route_label(proxy)
+            if selected.get("auto_proxy_probe")
+            else describe_route_decision({"action": "proxy", "upstream": proxy})
+        )
+        selected["upstream_proxy_id"] = proxy.get("id")
+        selected["upstream_proxy_name"] = proxy.get("name")
+        selected["upstream_proxy_access_mode"] = proxy.get("access_mode")
+        selected["proxy_failover_count"] = int(failover_count)
+        return selected
+
+    def _proxy_record_kwargs(self, route_decision):
+        if not route_decision or route_decision.get("action") != "proxy":
+            return {}
+        upstream = route_decision.get("upstream") or {}
+        return {
+            "upstream_proxy_id": route_decision.get("upstream_proxy_id") or upstream.get("id"),
+            "upstream_proxy_name": route_decision.get("upstream_proxy_name") or upstream.get("name"),
+            "upstream_proxy_access_mode": (
+                route_decision.get("upstream_proxy_access_mode")
+                or upstream.get("access_mode")
+            ),
+            "proxy_failover_count": route_decision.get("proxy_failover_count"),
+        }
+
+    def _available_proxy_candidates(self, route_decision):
+        if route_decision.get("action") != "proxy":
+            return []
+        candidates = route_decision.get("upstream_candidates") or []
+        if not candidates and route_decision.get("upstream") is not None:
+            candidates = [route_decision["upstream"]]
+        available = []
+        for proxy in candidates:
+            if not isinstance(proxy, dict) or not proxy.get("enabled", True):
+                continue
+            if not proxy_allows_client(proxy, self._client_id()):
+                continue
+            if not self.server.runtime.traffic_quota_manager.proxy_allowed(proxy, client=self._client_id()):
+                continue
+            available.append(proxy)
+        return available
+
+    def _build_auto_proxy_direct_failure_probe_route(self, host: str, route_decision, exc: Exception):
+        if route_decision is None:
+            return None
+        if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        if route_decision.get("auto_proxy_probe"):
+            return None
+        if route_decision.get("upstream") is None:
+            return None
+        if not is_retryable_upstream_error(exc):
+            return None
+        builder = getattr(self.server.runtime, "build_auto_proxy_direct_failure_probe_route", None)
+        if builder is None:
+            return None
+        return builder(host, route_decision)
 
     def _reject_routed_request(self, *, method: str, destination: str, host: str | None, port: int | None, route_decision):
         is_self_target = route_decision["route_label"] == "self:listener-block"
@@ -1934,13 +2142,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return
         self._safe_send_error_response(response_code, message)
 
-    def _open_routed_stream(self, host: str, port: int, route_decision):
+    def _open_routed_stream(self, host: str, port: int, route_decision, *, retry_metrics: dict | None = None):
         def open_once(_attempt):
             return self._open_routed_stream_once(host, port, route_decision)
 
         return retry_upstream_operation(
             open_once,
             retry_policy=self.server.router_config.upstream_retry_settings(),
+            retry_metrics=retry_metrics,
             on_retry=lambda attempt, attempts, delay, exc: self._debug(
                 "retrying upstream stream setup "
                 f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
@@ -2043,6 +2252,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         reason = ""
         uploaded_bytes = 0
         downloaded_bytes = 0
+        upstream_metrics = {}
+        upstream_setup_ms = None
         request_headers = headers_for_record(websocket_upgrade_headers_for_upstream(self.headers, host, port))
         request_head = build_websocket_upgrade_request(self.command, target_path, self.headers, host, port)
 
@@ -2059,7 +2270,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             current_owner = None
             current_stream = None
             try:
-                raw_stream, current_owner = self._open_routed_stream(host, port, current_route_decision)
+                raw_stream, current_owner = self._open_routed_stream(
+                    host,
+                    port,
+                    current_route_decision,
+                    retry_metrics=upstream_metrics,
+                )
                 current_stream = raw_stream
                 if scheme == "https":
                     current_stream = ssl.create_default_context().wrap_socket(raw_stream, server_hostname=host)
@@ -2088,6 +2304,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 raise
 
         try:
+            upstream_setup_started = time.monotonic()
             (
                 upstream,
                 upstream_owner,
@@ -2121,11 +2338,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     reason,
                     response_headers,
                 ) = open_and_send_upgrade(route_decision)
+            upstream_setup_ms = int((time.monotonic() - upstream_setup_started) * 1000)
 
             self.connection.sendall(response_head)
 
             if status_code != 101:
                 downloaded_bytes = self._relay_response_body_after_head(upstream, leftover, response_headers)
+                duration_ms = int((time.monotonic() - request_started) * 1000)
                 self.server.runtime.record_failure(
                     proxy_label=self.server.proxy_label,
                     client=self._client_id(),
@@ -2142,6 +2361,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_label=route_decision["route_label"],
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    upstream_retry_count=upstream_metrics.get("upstream_retry_count"),
+                    upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms"),
                 )
                 return
 
@@ -2155,6 +2378,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             downloaded_bytes += stats["right_to_left_bytes"]
         finally:
             duration_ms = int((time.monotonic() - request_started) * 1000)
+            relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
             if status_code:
                 if kind == "https" and getattr(self.server, "https_interception_capture", False):
                     self.server.runtime.record_https_traffic(
@@ -2199,34 +2423,74 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
                     status_code=status_code,
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
+                    upstream_retry_count=upstream_metrics.get("upstream_retry_count"),
+                    upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms"),
+                    **self._proxy_record_kwargs(route_decision),
                 )
                 if status_code == 101:
                     self.server.runtime.record_auto_proxy_success(host, route_decision)
             self.close_connection = True
             close_upstream_resources()
 
-    def _perform_upstream_request(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
+    def _perform_upstream_request(
+        self,
+        scheme,
+        host,
+        port,
+        target_path,
+        body,
+        outbound_headers,
+        *,
+        route_decision,
+        retry_metrics: dict | None = None,
+    ):
         should_retry = lambda exc: can_retry_http_request(self.command, body) and is_retryable_upstream_error(exc)
+        route_attempts = [route_decision]
+        if route_decision.get("action") == "proxy":
+            route_attempts = [
+                self._route_with_selected_proxy(route_decision, proxy, failover_count=index)
+                for index, proxy in enumerate(self._available_proxy_candidates(route_decision))
+            ]
+            if not route_attempts:
+                raise OSError("no configured upstream proxy is available for this client or proxy quota")
 
-        return retry_upstream_operation(
-            lambda _attempt: self._perform_upstream_request_once(
-                scheme,
-                host,
-                port,
-                target_path,
-                body,
-                outbound_headers,
-                route_decision=route_decision,
-            ),
-            should_retry=should_retry,
-            retry_policy=self.server.router_config.upstream_retry_settings(),
-            on_retry=lambda attempt, attempts, delay, exc: self._debug(
-                "retrying upstream HTTP request "
-                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
-                f"method={self.command} target={host}:{port} route={route_decision['route_label']} error={exc}",
-                level="WARNING",
-            ),
-        )
+        last_error = None
+        for attempt_index, selected_route in enumerate(route_attempts):
+            try:
+                connection, response = retry_upstream_operation(
+                    lambda _attempt: self._perform_upstream_request_once(
+                        scheme,
+                        host,
+                        port,
+                        target_path,
+                        body,
+                        outbound_headers,
+                        route_decision=selected_route,
+                    ),
+                    should_retry=should_retry,
+                    retry_policy=self.server.router_config.upstream_retry_settings(),
+                    retry_metrics=retry_metrics,
+                    on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                        "retrying upstream HTTP request "
+                        f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                        f"method={self.command} target={host}:{port} route={selected_route['route_label']} error={exc}",
+                        level="WARNING",
+                    ),
+                )
+                return connection, response, selected_route
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= len(route_attempts) - 1 or not should_retry(exc):
+                    raise
+                self._debug(
+                    "failing over to next upstream proxy "
+                    f"target={host}:{port} failed_route={selected_route['route_label']} error={exc}",
+                    level="WARNING",
+                )
+        raise last_error or OSError("upstream proxy selection failed")
 
     def _perform_upstream_request_once(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
         request_target = target_path
@@ -2318,6 +2582,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         connection,
         response,
         route_decision,
+        *,
+        retry_metrics: dict | None = None,
     ):
         if scheme != "https" or response.status != 403:
             return connection, response, route_decision
@@ -2336,7 +2602,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             level="INFO",
         )
         try:
-            retry_connection, retry_response = self._perform_upstream_request(
+            retry_connection, retry_response, probe_route = self._perform_upstream_request(
                 scheme,
                 host,
                 port,
@@ -2344,6 +2610,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 body,
                 outbound_headers,
                 route_decision=probe_route,
+                retry_metrics=retry_metrics,
             )
         except Exception as exc:
             for upstream_resource in (response, connection):
@@ -2384,6 +2651,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         method: str,
         kind: str,
         route_decision,
+        upstream_setup_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
     ):
         bytes_written = 0
         response_preview = bytearray()
@@ -2399,6 +2669,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         )
         try:
             if response.status == 403:
+                failure_duration_ms = int((time.monotonic() - request_started) * 1000)
                 self.server.runtime.record_failure(
                     proxy_label=self.server.proxy_label,
                     client=self._client_id(),
@@ -2415,6 +2686,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     route_label=route_decision["route_label"],
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
+                    duration_ms=failure_duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    upstream_retry_count=upstream_retry_count,
+                    upstream_retry_delay_ms=upstream_retry_delay_ms,
                 )
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
@@ -2435,6 +2710,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 bytes_written += len(chunk)
             self.wfile.flush()
             total_elapsed_ms = int((time.monotonic() - request_started) * 1000)
+            relay_ms = max(0, total_elapsed_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
             self._debug(
                 f"response relayed target={truncate_for_log(target_description)} status={response.status} "
                 f"bytes={bytes_written} total_elapsed_ms={total_elapsed_ms}"
@@ -2481,6 +2757,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 level="INFO",
             )
         finally:
+            final_duration_ms = int((time.monotonic() - request_started) * 1000)
+            final_relay_ms = (
+                max(0, final_duration_ms - upstream_setup_ms)
+                if upstream_setup_ms is not None
+                else None
+            )
             self.server.runtime.record_usage(
                 proxy_label=self.server.proxy_label,
                 kind=kind,
@@ -2497,6 +2779,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 matched_rule=route_decision["matched_rule"],
                 profile_id=route_decision.get("profile_id"),
                 status_code=response.status,
+                duration_ms=final_duration_ms,
+                upstream_setup_ms=upstream_setup_ms,
+                relay_ms=final_relay_ms,
+                upstream_retry_count=upstream_retry_count,
+                upstream_retry_delay_ms=upstream_retry_delay_ms,
+                **self._proxy_record_kwargs(route_decision),
             )
             self.close_connection = True
             if response.status != 403:
@@ -2514,6 +2802,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         host: str | None,
         port: int | None,
         route_decision=None,
+        duration_ms: int | None = None,
+        upstream_setup_ms: int | None = None,
+        upstream_retry_count: int | None = None,
+        upstream_retry_delay_ms: int | None = None,
     ):
         log_event(
             self.server.proxy_label,
@@ -2547,6 +2839,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             route_label=route_label,
             matched_rule=matched_rule,
             profile_id=profile_id,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            upstream_retry_count=upstream_retry_count,
+            upstream_retry_delay_ms=upstream_retry_delay_ms,
+            **self._proxy_record_kwargs(route_decision),
         )
         self._safe_send_error_response(502, error_message)
 
@@ -2650,7 +2947,6 @@ class ClientPortalHTTPSRequestHandler(ProxyRequestHandler):
         return "https", host, port, self.path or "/"
 
 
-
 class ClientPortalSocksRequestHandler(ProxyRequestHandler):
     def handle(self):
         BaseHTTPRequestHandler.handle(self)
@@ -2728,6 +3024,49 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         if previous_client != next_client:
             self.server.client_tracker.reidentified(previous_client, next_client)
             self._dashboard_client_id = next_client
+
+    def _route_with_selected_proxy(self, route_decision, proxy, *, failover_count: int = 0):
+        selected = dict(route_decision)
+        selected["upstream"] = dict(proxy)
+        selected["upstream_candidates"] = [dict(proxy)]
+        selected["route_label"] = (
+            build_auto_proxy_probe_route_label(proxy)
+            if selected.get("auto_proxy_probe")
+            else describe_route_decision({"action": "proxy", "upstream": proxy})
+        )
+        selected["upstream_proxy_id"] = proxy.get("id")
+        selected["upstream_proxy_name"] = proxy.get("name")
+        selected["upstream_proxy_access_mode"] = proxy.get("access_mode")
+        selected["proxy_failover_count"] = int(failover_count)
+        return selected
+
+    def _proxy_record_kwargs(self, route_decision):
+        if not route_decision or route_decision.get("action") != "proxy":
+            return {}
+        upstream = route_decision.get("upstream") or {}
+        return {
+            "upstream_proxy_id": route_decision.get("upstream_proxy_id") or upstream.get("id"),
+            "upstream_proxy_name": route_decision.get("upstream_proxy_name") or upstream.get("name"),
+            "upstream_proxy_access_mode": route_decision.get("upstream_proxy_access_mode") or upstream.get("access_mode"),
+            "proxy_failover_count": route_decision.get("proxy_failover_count"),
+        }
+
+    def _available_proxy_candidates(self, route_decision):
+        if route_decision.get("action") != "proxy":
+            return []
+        candidates = route_decision.get("upstream_candidates") or []
+        if not candidates and route_decision.get("upstream") is not None:
+            candidates = [route_decision["upstream"]]
+        available = []
+        for proxy in candidates:
+            if not isinstance(proxy, dict) or not proxy.get("enabled", True):
+                continue
+            if not proxy_allows_client(proxy, self._client_id()):
+                continue
+            if not self.server.runtime.traffic_quota_manager.proxy_allowed(proxy, client=self._client_id()):
+                continue
+            available.append(proxy)
+        return available
 
     def _is_local_client(self) -> bool:
         return is_loopback_client_ip(self.client_address[0])
@@ -2830,7 +3169,6 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         self._silently_close_connection()
         return True
 
-
     def _is_client_portal_http_target(self, host: str, port: int) -> bool:
         self_endpoints = self.server.runtime.self_endpoints
         if self_endpoints.is_client_portal_host(host):
@@ -2929,6 +3267,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self):
         client_ip = self.client_address[0]
+        request_started = time.monotonic()
         self._dashboard_client_id = client_ip
         self.server.client_tracker.connected(client_ip, client=self._dashboard_client_id)
         try:
@@ -3033,7 +3372,10 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     f"matched=<self-listener> action={route_decision['route_label']}"
                 )
             else:
-                route_decision = self.server.router_config.decide(destination_host)
+                try:
+                    route_decision = self.server.router_config.decide(destination_host, client_id=self._client_id())
+                except TypeError:
+                    route_decision = self.server.router_config.decide(destination_host)
                 route_decision = self.server.runtime.apply_auto_proxy_probe_route(
                     destination_host,
                     route_decision,
@@ -3091,12 +3433,21 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 return
             upstream_owner = None
             upstream = None
+            upstream_metrics = {}
+            upstream_setup_ms = None
             try:
-                upstream, upstream_owner = self._open_routed_stream(
+                upstream_setup_started = time.monotonic()
+                opened_stream = self._open_routed_stream(
                     destination_host,
                     destination_port,
                     route_decision,
+                    retry_metrics=upstream_metrics,
                 )
+                if len(opened_stream) == 2:
+                    upstream, upstream_owner = opened_stream
+                else:
+                    upstream, upstream_owner, route_decision = opened_stream
+                upstream_setup_ms = int((time.monotonic() - upstream_setup_started) * 1000)
                 observe_https_connect = getattr(self.server.runtime, "observe_https_connect", None)
                 if observe_https_connect is not None:
                     observe_https_connect(destination_host, destination_port, route_decision)
@@ -3110,6 +3461,8 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     proxy_label=self.server.proxy_label,
                 )
                 stats = tunnel_bidirectional(self.request, upstream)
+                duration_ms = int((time.monotonic() - request_started) * 1000)
+                relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
                     "tunnel closed "
                     f"client_to_upstream_bytes={stats['left_to_right_bytes']} "
@@ -3130,6 +3483,12 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     route_label=route_decision["route_label"],
                     matched_rule=route_decision["matched_rule"],
                     profile_id=route_decision.get("profile_id"),
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
+                    upstream_retry_count=upstream_metrics.get("upstream_retry_count"),
+                    upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms"),
+                    **self._proxy_record_kwargs(route_decision),
                 )
                 if route_decision.get("auto_proxy_probe"):
                     self.server.runtime.record_auto_proxy_success(destination_host, route_decision)
@@ -3174,6 +3533,17 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 route_label=route_decision["route_label"] if "route_decision" in locals() else "direct",
                 matched_rule=route_decision["matched_rule"] if "route_decision" in locals() else None,
                 profile_id=route_decision.get("profile_id") if "route_decision" in locals() else DEFAULT_ROUTING_PROFILE_ID,
+                duration_ms=int((time.monotonic() - request_started) * 1000),
+                upstream_setup_ms=(
+                    upstream_setup_ms
+                    if "upstream_setup_ms" in locals() and upstream_setup_ms is not None
+                    else int((time.monotonic() - upstream_setup_started) * 1000)
+                    if "upstream_setup_started" in locals()
+                    else None
+                ),
+                upstream_retry_count=upstream_metrics.get("upstream_retry_count") if "upstream_metrics" in locals() else None,
+                upstream_retry_delay_ms=upstream_metrics.get("upstream_retry_delay_ms") if "upstream_metrics" in locals() else None,
+                **(self._proxy_record_kwargs(route_decision) if "route_decision" in locals() else {}),
             )
             self._send_reply(0x01)
         finally:
@@ -3182,20 +3552,51 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 client=getattr(self, "_dashboard_client_id", client_ip),
             )
 
-    def _open_routed_stream(self, destination_host: str, destination_port: int, route_decision):
-        def open_once(_attempt):
-            return self._open_routed_stream_once(destination_host, destination_port, route_decision)
+    def _open_routed_stream(
+        self,
+        destination_host: str,
+        destination_port: int,
+        route_decision,
+        *,
+        retry_metrics: dict | None = None,
+    ):
+        route_attempts = [route_decision]
+        if route_decision.get("action") == "proxy":
+            route_attempts = [
+                self._route_with_selected_proxy(route_decision, proxy, failover_count=index)
+                for index, proxy in enumerate(self._available_proxy_candidates(route_decision))
+            ]
+            if not route_attempts:
+                raise OSError("no configured upstream proxy is available for this client or proxy quota")
 
-        return retry_upstream_operation(
-            open_once,
-            retry_policy=self.server.router_config.upstream_retry_settings(),
-            on_retry=lambda attempt, attempts, delay, exc: self._debug(
-                "retrying SOCKS5 upstream stream setup "
-                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
-                f"target={destination_host}:{destination_port} route={route_decision['route_label']} error={exc}",
-                level="WARNING",
-            ),
-        )
+        last_error = None
+        for attempt_index, selected_route in enumerate(route_attempts):
+            try:
+                def open_once(_attempt):
+                    return self._open_routed_stream_once(destination_host, destination_port, selected_route)
+
+                upstream, upstream_owner = retry_upstream_operation(
+                    open_once,
+                    retry_policy=self.server.router_config.upstream_retry_settings(),
+                    retry_metrics=retry_metrics,
+                    on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                        "retrying upstream stream setup "
+                        f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                        f"target={destination_host}:{destination_port} route={selected_route['route_label']} error={exc}",
+                        level="WARNING",
+                    ),
+                )
+                return upstream, upstream_owner, selected_route
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= len(route_attempts) - 1 or not is_retryable_upstream_error(exc):
+                    raise
+                self._debug(
+                    "failing over to next upstream proxy "
+                    f"target={destination_host}:{destination_port} failed_route={selected_route['route_label']} error={exc}",
+                    level="WARNING",
+                )
+        raise last_error or OSError("upstream proxy selection failed")
 
     def _open_routed_stream_once(self, destination_host: str, destination_port: int, route_decision):
         if route_decision["action"] == "proxy":
@@ -3367,6 +3768,7 @@ def build_client_portal_snapshot(server, client: str, *, range_key: str, client_
         "client": client_id,
         "client_ip": client_ip,
         "can_suggest_rules": client_id.startswith("user:"),
+        "can_change_password": client_id.startswith("user:"),
         "portal_url": server.runtime.self_endpoints.client_portal_url(),
         "ca_install_url": server.runtime.self_endpoints.client_portal_ca_install_url(),
         "ca_certificate_url": server.runtime.self_endpoints.client_portal_ca_certificate_url(),
@@ -3887,6 +4289,7 @@ def render_client_portal_html(snapshot) -> str:
     period_totals = list(history.get("period_totals") or [])
     rule_suggestions = list(snapshot.get("rule_suggestions") or [])
     can_suggest_rules = bool(snapshot.get("can_suggest_rules"))
+    can_change_password = bool(snapshot.get("can_change_password"))
 
     if quota.get("exempt"):
         quota_status_text = "Exempt from quota"
@@ -4026,6 +4429,37 @@ def render_client_portal_html(snapshot) -> str:
         )
     if not suggestion_rows:
         suggestion_rows.append('<tr><td colspan="9" class="empty">No rule suggestions submitted from this device yet.</td></tr>')
+
+    account_panel_html = ""
+    if can_change_password:
+        account_panel_html = """
+    <section class="content-grid">
+      <article>
+        <div class="portal-card">
+          <div class="panel-head">
+            <h2>Account security</h2>
+            <span class="muted">Password rotation</span>
+          </div>
+          <form id="password-change-form">
+            <div class="suggestion-grid">
+              <label>Current password
+                <input name="current_password" type="password" autocomplete="current-password" required>
+              </label>
+              <label>New password
+                <input name="new_password" type="password" autocomplete="new-password" required>
+              </label>
+              <label>Confirm new password
+                <input name="confirm_password" type="password" autocomplete="new-password" required>
+              </label>
+            </div>
+            <button class="suggestion-submit" type="submit">Change password</button>
+            <div class="suggestion-notice" id="password-change-notice"></div>
+            <p class="note">After saving, update this device's proxy credentials before opening a new proxy connection.</p>
+          </form>
+        </div>
+      </article>
+    </section>
+"""
 
     history_summary = history.get("summary") or {}
     history_range_title = html.escape(str(history.get("range_title") or "Selected range"))
@@ -4325,7 +4759,7 @@ def render_client_portal_html(snapshot) -> str:
         if (!window.confirm(`${actionText} this Rule Suggestions request?`)) {
           return;
         }
-        if (notice) notice.textContent = "Processing rule suggestion...";
+        if (notice) notice.textContent = `${actionText}ing rule suggestion...`;
         try {
           const response = await fetch(`/api/client/rule-suggestions/${encodeURIComponent(normalizedId)}/delete${rangeQuery}`, {
             method: "POST",
@@ -4339,6 +4773,46 @@ def render_client_portal_html(snapshot) -> str:
           if (notice) notice.textContent = `Rule suggestion ${status === "pending" ? "canceled" : "deleted"}.`;
         } catch (error) {
           if (notice) notice.textContent = `Rule suggestion ${actionText.toLowerCase()} failed: ${error.message}`;
+        }
+      }
+
+      async function submitPasswordChange(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const notice = document.getElementById("password-change-notice");
+        const currentPassword = form.elements.namedItem("current_password").value;
+        const newPassword = form.elements.namedItem("new_password").value;
+        const confirmPassword = form.elements.namedItem("confirm_password").value;
+        if (notice) notice.textContent = "";
+        if (!newPassword) {
+          if (notice) notice.textContent = "Enter a new password.";
+          return;
+        }
+        if (newPassword !== confirmPassword) {
+          if (notice) notice.textContent = "New passwords do not match.";
+          return;
+        }
+        if (notice) notice.textContent = "Changing password...";
+        try {
+          const response = await fetch("/api/client/password", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json" },
+            body: JSON.stringify({
+              current_password: currentPassword,
+              new_password: newPassword,
+            }),
+          });
+          const body = await response.json().catch(() => ({ error: "invalid JSON response" }));
+          if (!response.ok) {
+            throw new Error(body.error || `HTTP ${response.status}`);
+          }
+          form.reset();
+          if (notice) {
+            notice.textContent = "Password changed. Update this device's proxy credentials before opening a new proxy connection.";
+          }
+          updatePortal(body.snapshot);
+        } catch (error) {
+          if (notice) notice.textContent = `Password change failed: ${error.message}`;
         }
       }
 
@@ -4357,6 +4831,11 @@ def render_client_portal_html(snapshot) -> str:
         if (!button) return;
         deleteRuleSuggestion(button.dataset.suggestionId, button.dataset.suggestionStatus || "pending");
       });
+
+      const passwordChangeForm = document.getElementById("password-change-form");
+      if (passwordChangeForm) {
+        passwordChangeForm.addEventListener("submit", submitPasswordChange);
+      }
 
       function setLiveStatusText(value) {
         if (liveStatus) liveStatus.textContent = value;
@@ -4972,6 +5451,8 @@ def render_client_portal_html(snapshot) -> str:
         <a class="install-button secondary" href="{ca_check_url}">Check trust</a>
       </div>
     </section>
+
+    {account_panel_html}
 
     {suggestion_panel_html}
 

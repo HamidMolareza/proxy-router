@@ -7,13 +7,14 @@ It is designed for cases where a phone or another device on the same network sho
 ## Highlights
 
 - Mixed HTTP + SOCKS5 listener on one port for simple device setup
-- React dashboard for overview, history, HTTPS analysis, routing, users, quotas, and failures
+- React dashboard for overview, history, HTTPS analysis, proxies, routing, users, quotas, and failures
 - Shared and per-network routing profiles
-- Automatic direct-failure probing before temporary auto-proxy rules
+- Ordered HTTP/SOCKS5 upstream proxy fallback with public, authenticated-only, or private per-client access
+- Automatic direct-failure probing before assigning failing domains to a working upstream proxy
 - Optional HTTPS request sniffing for allowlisted HTTP CONNECT hosts with an installable local CA and JSONL analyzer logs
 - Optional HTTP/SOCKS proxy authentication for stable per-device identities
 - Per-user or per-IP temporary/permanent silent blocks from the admin dashboard
-- Per-client traffic quotas, default quotas, and temporary or permanent exemptions
+- Per-client traffic quotas, per-proxy quotas, proxy-per-user quotas, default quotas, and temporary or permanent exemptions
 - Docker-first deployment with persistent state under `./data`
 - Small Python backend with a separate React + Vite frontend
 
@@ -103,6 +104,8 @@ Persisted backend files:
 - `./data/https-traffic.log`
 - `./data/error.log`
 
+`usage.log` records transfer totals plus optional performance fields such as `duration_ms`, `upstream_setup_ms`, `relay_ms`, `throughput_bps`, upstream retry counts, and selected upstream proxy metadata such as `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`. Older records without these fields still load normally; they count toward traffic totals but not duration, throughput, or per-upstream samples.
+
 On startup, the backend rebuilds dashboard totals, recent requests, recent failures, HTTPS traffic analysis, quota history, and auto-proxy state from these persisted files.
 
 To reset stored state completely:
@@ -130,6 +133,7 @@ Build files:
 Upstream proxy note:
 
 - In the Compose deployment, the backend uses host networking, so a host-side upstream proxy can use `127.0.0.1`.
+- `router-config.json` supports `proxies`, an ordered list of upstream HTTP/SOCKS5 proxies. Existing single-`upstream` configs are normalized into one `upstream-default` proxy for compatibility.
 
 HTTPS interception note:
 
@@ -145,19 +149,22 @@ HTTPS interception note:
 - Saved routing profiles add network-specific rules on top of `Shared`.
 - Profile-specific rules win over shared rules.
 - Auto-proxy state is tracked per effective profile.
+- `action: proxy` rules can optionally pin a `proxy_id`; otherwise the router tries allowed proxies by priority.
+- Auto-proxy rules created after direct failures keep the working proxy id, so later requests for the same domain reuse that proxy unless the rule is changed.
 
 Typical setup:
 
 - `Company VPN` profile: mark selected domains as `Direct`
-- `Home` profile: leave them unmanaged so repeated direct failures can trigger temporary auto-proxy routing
+- `Home` profile: leave them unmanaged so repeated direct failures can trigger auto-proxy assignment to the first working allowed proxy
 
 ## Dashboard
 
-The dashboard includes seven main areas:
+The dashboard includes eight main areas:
 
 - `Overview`: current activity, totals, recent traffic, active clients
-- `History`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, and top destinations filtered by range, proxy type, and client
-- `Routing`: upstream settings, rules, routing profiles, auto-proxy controls
+- `History`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, and top destinations filtered by range, proxy type, client, and upstream proxy
+- `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
+- `Routing`: rules, routing profiles, and auto-proxy controls
 - `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
 - `Users`: configured proxy-auth users plus observed client identities/IPs, with silent block/unblock controls
 - `Quotas`: optional proxy authentication, default client quota, per-client quota rules, exemptions
@@ -171,6 +178,7 @@ Client self-service portal:
 - The same page is also available directly on the proxy listener root, for example `http://LAN_IP:8900/`
 - Devices can open `http://proxy.router/ca` for Android, Linux, Windows, macOS, and iOS install instructions, and `http://proxy.router/ca.crt` to download the public CA directly
 - Devices can open `https://proxy.router/ca-check` after installation to confirm CA trust and clear temporary adaptive bypasses
+- Authenticated devices can change their own proxy auth password from the portal after entering the current password
 - Authenticated devices can suggest routing rules for the currently active profile; conflicting suggestions show the conflicts and require explicit confirmation before they enter the admin queue
 - Authenticated devices can cancel/delete individual Rule Suggestions requests they submitted
 - Authenticated devices can clear their own Rule Suggestions history; admins can clear the full Rule Suggestions table from the dashboard
@@ -183,17 +191,19 @@ Current dashboard behaviors:
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
+- Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
-- Upstream proxy settings run an automatic connectivity check after sync, and the Routing tab shows the latest reachability result plus the last real proxied success or failure
+- Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
+- The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
 - Unmanaged direct HTTPS domains are learned in the background. The router probes direct TLS and upstream TLS without requiring a device CA; if direct fails and upstream succeeds, the existing temporary auto-proxy rule flow is activated.
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
-- Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried once through the upstream proxy when auto-proxy is available; a temporary proxy rule is added only if that retry succeeds
+- Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried through allowed upstream proxies when auto-proxy is available; a proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The `Users` tab can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
-- Transient upstream connection/setup failures use the Routing tab's configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
+- Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
 - The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
 - Approving a suggestion keeps the same rule validation as manual edits, so still-conflicting suggestions must be resolved before approval succeeds.
@@ -201,6 +211,27 @@ Current dashboard behaviors:
 - `Clear rules` clears only the currently edited scope
 - `Export rules` downloads routing-only JSON for shared rules plus saved profiles
 - `Ignore` on an automatic rule converts it into a permanent manual `Direct` rule
+
+## Performance Observability
+
+Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time.
+
+Use these fields when investigating slow traffic:
+
+- `duration_ms`: total request or tunnel lifetime seen by proxy-router
+- `upstream_setup_ms`: time spent connecting to the destination or upstream proxy and receiving the upstream response head when applicable
+- `relay_ms`: time after upstream setup, usually body or tunnel relay time
+- `throughput_bps`: completed bytes per second for records with a duration sample
+- `upstream_retry_count` and `upstream_retry_delay_ms`: retry attempts and configured backoff delay before a request succeeded or failed
+- `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`: selected upstream proxy and how many priority candidates were skipped before success
+
+Diagnosis tips:
+
+- Compare `direct` and `proxy:*` route rows in the dashboard. If only proxied rows are slow, inspect the upstream proxy/VPN and retry settings first.
+- High `upstream_setup_ms` with low relay time usually points to DNS/connect/TLS/upstream latency.
+- Long `relay_ms` or low `throughput_bps` points to transfer speed, client Wi-Fi, upstream bandwidth, or a long-lived tunnel.
+- HTTPS interception can add TLS and body-preview work for matched hosts; raw CONNECT/SOCKS5 avoids that inspection path.
+- `python3 ./proxy-router usage-analyze /tmp/proxy-router-usage.log` prints timing samples from the same JSONL data for offline review.
 
 ## Quotas
 
@@ -276,7 +307,7 @@ docs/                      supporting project documentation
 - Binding to `0.0.0.0` exposes the listener to any reachable device unless you restrict clients.
 - On shared networks, use `--allow-client` whenever possible.
 - Optional proxy authentication is an identity feature, not a replacement for network restrictions. Keep anonymous access enabled only on networks where unauthenticated devices are expected; loopback clients on the proxy host are always exempt for local workflows.
-- Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; do not commit runtime config or data files.
+- Client auth passwords are stored as salted PBKDF2 hashes in `router-config.json`; authenticated users can rotate only their own password from the client portal, and runtime config or data files should not be committed.
 - HTTPS interception decrypts traffic for matched hosts only after the client trusts the local CA; apps with certificate pinning or no user-CA trust get host-scoped temporary bypasses after TLS trust failures, while failed CA trust checks or repeated domain failures can temporarily bypass MITM for the whole client.
 - HTTPS discovery uses TLS handshakes only, not decrypted request bodies, to compare direct connectivity with upstream connectivity for unmanaged HTTPS domains.
 - Intercepted HTTPS analyzer records include redacted headers and bounded text body previews. Sensitive headers and token-like text fields are redacted, common compressed bodies are decoded for preview when possible, binary bodies are omitted, and previews are truncated, but the log can still contain private application data.

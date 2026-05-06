@@ -82,6 +82,7 @@ class UsageHistoryCache:
         range_key: str,
         proxy_type: str | None = None,
         client: str | None = None,
+        upstream_proxy_id: str | None = None,
         timezone_name: str | None = None,
         timezone_offset_minutes=None,
     ):
@@ -96,6 +97,7 @@ class UsageHistoryCache:
             range_key=range_key,
             proxy_type=proxy_type,
             client=client,
+            upstream_proxy_id=upstream_proxy_id,
             timezone_name=timezone_name,
             timezone_offset_minutes=timezone_offset_minutes,
         )
@@ -308,6 +310,7 @@ class HttpsTrafficCache:
             "status_code": record.get("status_code"),
             "reason": record.get("reason"),
             "duration_ms": record.get("duration_ms"),
+            "throughput_bps": record.get("throughput_bps"),
             "request_body_bytes": request.get("body_bytes", 0),
             "response_body_bytes": response.get("body_bytes", 0),
             "total_bytes": record.get("total_bytes", 0),

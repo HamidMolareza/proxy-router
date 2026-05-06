@@ -149,6 +149,7 @@ DEFAULT_ROUTE_ACTIONS = {"direct", "proxy"}
 RULE_ROUTE_ACTIONS = {"direct", "proxy", "block"}
 RULE_MATCH_TYPES = {"exact", "suffix", "contains"}
 UPSTREAM_PROXY_TYPES = {"http", "socks5"}
+UPSTREAM_PROXY_ACCESS_MODES = {"public", "authenticated", "private"}
 HTTPS_INTERCEPTION_MODES = {"allowlist", "all"}
 HTTPS_INTERCEPTION_DEFAULT_PORTS = {443}
 SENSITIVE_QUERY_PARAMETER_NAMES = {
@@ -183,6 +184,28 @@ CLIENT_TRAFFIC_MAX_WINDOW = max(
 )
 CLIENT_TRAFFIC_ROUTE_LABEL = "reject:client-traffic-limit"
 CLIENT_BLOCK_ROUTE_LABEL = "reject:client-access-block"
+UPSTREAM_PROXY_ROUTE_LABEL = "reject:upstream-proxy-unavailable"
+UPSTREAM_PROXY_LIMIT_ROUTE_LABEL = "reject:upstream-proxy-limit"
+PROXY_TRAFFIC_WINDOW_CONFIG = {
+    "1h": {
+        "window": timedelta(hours=1),
+        "label": "past hour",
+        "config_field": "max_past_hour_mb",
+    },
+    "3h": {
+        "window": timedelta(hours=3),
+        "label": "past 3 hours",
+        "config_field": "max_past_3h_mb",
+    },
+    "7d": {
+        "window": timedelta(days=7),
+        "label": "past week",
+        "config_field": "max_past_week_mb",
+    },
+}
+PROXY_TRAFFIC_MAX_WINDOW = max(
+    item["window"] for item in PROXY_TRAFFIC_WINDOW_CONFIG.values()
+)
 CLIENT_TRAFFIC_EXEMPTION_DURATION_PATTERN = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 COMMON_SECOND_LEVEL_DOMAIN_LABELS = {
     "ac",

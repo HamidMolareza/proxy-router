@@ -189,6 +189,10 @@ def build_dashboard_snapshot(server):
         server.runtime,
         server.router_config,
     )
+    snapshot["proxy_quota_status"] = server.runtime.traffic_quota_manager.proxy_snapshot(
+        full_router_config_snapshot.get("proxies", []),
+        [row.get("client") for row in snapshot.get("totals_by_client", [])],
+    )
     snapshot["known_clients"] = build_known_client_rows(snapshot, full_router_config_snapshot)
     snapshot["client_block_status"] = build_client_block_status_map(
         snapshot["known_clients"],
@@ -344,12 +348,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
             proxy_type = normalize_history_filter(first_query_value(query, "proxy_type"))
             client = normalize_history_filter(first_query_value(query, "client"))
+            upstream_proxy_id = normalize_history_filter(first_query_value(query, "upstream_proxy_id"))
             timezone_name = first_query_value(query, "timezone")
             timezone_offset_minutes = first_query_value(query, "timezone_offset_minutes")
             payload = self.server.history_cache.build_history_payload(
                 range_key=range_key,
                 proxy_type=proxy_type,
                 client=client,
+                upstream_proxy_id=upstream_proxy_id,
                 timezone_name=timezone_name,
                 timezone_offset_minutes=timezone_offset_minutes,
             )

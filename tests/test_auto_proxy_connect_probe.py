@@ -210,6 +210,94 @@ class AutoProxyConnectProbeTests(unittest.TestCase):
         self.assertIn("usage", calls)
         self.assertNotIn("auto-success", calls)
 
+    def test_raw_direct_connect_failure_retries_auto_proxy_probe(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        calls = []
+        route = {
+            "host": "rr1---sn-nv47zne7.googlevideo.com",
+            "action": "direct",
+            "matched_rule": None,
+            "upstream": {"enabled": True, "type": "socks5", "host": "127.0.0.1", "port": 8901},
+            "profile_id": DEFAULT_ROUTING_PROFILE_ID,
+            "profile_name": "Shared",
+            "route_label": "direct",
+        }
+        probe_route = dict(route)
+        probe_route["action"] = "proxy"
+        probe_route["route_label"] = "proxy:auto-probe:socks5://127.0.0.1:8901"
+        probe_route["auto_proxy_probe"] = True
+
+        class FakeSocket:
+            def getsockname(self):
+                return ("127.0.0.1", 40000)
+
+            def getpeername(self):
+                return ("127.0.0.1", 8901)
+
+            def close(self):
+                calls.append("upstream-close")
+
+        def open_routed_stream(_host, _port, selected_route, **_kwargs):
+            calls.append(f"open:{selected_route['route_label']}")
+            if selected_route["route_label"] == "direct":
+                raise ConnectionRefusedError("direct refused")
+            return FakeSocket(), None
+
+        handler.path = "rr1---sn-nv47zne7.googlevideo.com:443"
+        handler.requestline = "CONNECT rr1---sn-nv47zne7.googlevideo.com:443 HTTP/1.1"
+        handler.headers = {}
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.connection = object()
+        handler.server = SimpleNamespace(
+            proxy_label="mixed",
+            router_config=SimpleNamespace(
+                https_interception_settings=lambda: {
+                    "enabled": False,
+                    "mode": "allowlist",
+                    "host_patterns": [],
+                    "bypass_patterns": [],
+                }
+            ),
+            runtime=SimpleNamespace(
+                https_interception_adaptive_bypass=lambda *_args: None,
+                observe_https_connect=lambda *_args: calls.append("observe"),
+                build_auto_proxy_direct_failure_probe_route=lambda *_args: probe_route,
+                record_usage=lambda **kwargs: calls.append(f"usage:{kwargs['route_label']}"),
+                record_auto_proxy_success=lambda _host, selected_route: calls.append(
+                    f"auto-success:{selected_route['route_label']}"
+                ),
+            ),
+        )
+        handler._check_client_allowed = lambda: True
+        handler._is_client_portal_https_trust_check_target = lambda *_args: False
+        handler._is_client_portal_connect_target = lambda *_args: False
+        handler._authenticate_http_client = lambda: True
+        handler._drop_blocked_client = lambda **_kwargs: False
+        handler._check_client_traffic_limit = lambda **_kwargs: True
+        handler._resolve_route = lambda *_args, **_kwargs: route
+        handler._open_routed_stream = open_routed_stream
+        handler.send_response = lambda *_args, **_kwargs: calls.append("response")
+        handler.end_headers = lambda *_args, **_kwargs: calls.append("headers")
+        handler._debug = lambda *_args, **_kwargs: None
+        handler._log_http_event = lambda *_args, **_kwargs: None
+        handler._send_gateway_error = lambda *_args, **_kwargs: calls.append("gateway-error")
+
+        original_tunnel = proxy_server.tunnel_bidirectional
+        proxy_server.tunnel_bidirectional = lambda *_args, **_kwargs: {
+            "left_to_right_bytes": 128,
+            "right_to_left_bytes": 256,
+        }
+        try:
+            handler.do_CONNECT()
+        finally:
+            proxy_server.tunnel_bidirectional = original_tunnel
+
+        self.assertIn("open:direct", calls)
+        self.assertIn("open:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertIn("usage:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertIn("auto-success:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertNotIn("gateway-error", calls)
+
 
 if __name__ == "__main__":
     unittest.main()

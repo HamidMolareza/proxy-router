@@ -459,7 +459,153 @@ def empty_usage_summary():
         "uploaded_bytes": 0,
         "downloaded_bytes": 0,
         "total_bytes": 0,
+        "duration_sample_count": 0,
+        "duration_sample_bytes": 0,
+        "duration_ms_total": 0,
+        "duration_ms_avg": None,
+        "duration_ms_max": None,
+        "upstream_setup_sample_count": 0,
+        "upstream_setup_ms_total": 0,
+        "upstream_setup_ms_avg": None,
+        "upstream_setup_ms_max": None,
+        "relay_sample_count": 0,
+        "relay_ms_total": 0,
+        "relay_ms_avg": None,
+        "relay_ms_max": None,
+        "throughput_bps": None,
     }
+
+
+def optional_nonnegative_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def calculate_throughput_bps(total_bytes: int, duration_ms: int | None) -> int | None:
+    normalized_duration = optional_nonnegative_int(duration_ms)
+    if normalized_duration is None or normalized_duration <= 0:
+        return None
+    return int(max(0, int(total_bytes or 0)) * 1000 / normalized_duration)
+
+
+def apply_usage_performance_fields(
+    event,
+    *,
+    total_bytes: int,
+    duration_ms=None,
+    upstream_setup_ms=None,
+    relay_ms=None,
+    upstream_retry_count=None,
+    upstream_retry_delay_ms=None,
+):
+    normalized_duration = optional_nonnegative_int(duration_ms)
+    if normalized_duration is not None:
+        event["duration_ms"] = normalized_duration
+        throughput_bps = calculate_throughput_bps(total_bytes, normalized_duration)
+        if throughput_bps is not None:
+            event["throughput_bps"] = throughput_bps
+    normalized_upstream_setup = optional_nonnegative_int(upstream_setup_ms)
+    if normalized_upstream_setup is not None:
+        event["upstream_setup_ms"] = normalized_upstream_setup
+    normalized_relay = optional_nonnegative_int(relay_ms)
+    if normalized_relay is not None:
+        event["relay_ms"] = normalized_relay
+    normalized_retry_count = optional_nonnegative_int(upstream_retry_count)
+    if normalized_retry_count is not None:
+        event["upstream_retry_count"] = normalized_retry_count
+    normalized_retry_delay = optional_nonnegative_int(upstream_retry_delay_ms)
+    if normalized_retry_delay is not None:
+        event["upstream_retry_delay_ms"] = normalized_retry_delay
+
+
+def apply_failure_performance_fields(
+    event,
+    *,
+    duration_ms=None,
+    upstream_setup_ms=None,
+    upstream_retry_count=None,
+    upstream_retry_delay_ms=None,
+):
+    normalized_duration = optional_nonnegative_int(duration_ms)
+    if normalized_duration is not None:
+        event["duration_ms"] = normalized_duration
+    normalized_upstream_setup = optional_nonnegative_int(upstream_setup_ms)
+    if normalized_upstream_setup is not None:
+        event["upstream_setup_ms"] = normalized_upstream_setup
+    normalized_retry_count = optional_nonnegative_int(upstream_retry_count)
+    if normalized_retry_count is not None:
+        event["upstream_retry_count"] = normalized_retry_count
+    normalized_retry_delay = optional_nonnegative_int(upstream_retry_delay_ms)
+    if normalized_retry_delay is not None:
+        event["upstream_retry_delay_ms"] = normalized_retry_delay
+
+
+def _add_timing_sample(summary, prefix: str, value: int | None):
+    sample = optional_nonnegative_int(value)
+    if sample is None:
+        return
+    count_key = f"{prefix}_sample_count"
+    total_key = f"{prefix}_ms_total"
+    avg_key = f"{prefix}_ms_avg"
+    max_key = f"{prefix}_ms_max"
+    summary[count_key] = int(summary.get(count_key, 0)) + 1
+    summary[total_key] = int(summary.get(total_key, 0)) + sample
+    summary[avg_key] = int(summary[total_key] / summary[count_key])
+    current_max = summary.get(max_key)
+    summary[max_key] = sample if current_max is None else max(int(current_max), sample)
+
+
+def add_performance_to_summary(
+    summary,
+    *,
+    total_bytes: int,
+    duration_ms=None,
+    upstream_setup_ms=None,
+    relay_ms=None,
+):
+    normalized_duration = optional_nonnegative_int(duration_ms)
+    if normalized_duration is not None:
+        _add_timing_sample(summary, "duration", normalized_duration)
+        summary["duration_sample_bytes"] = int(summary.get("duration_sample_bytes", 0)) + max(0, int(total_bytes or 0))
+        duration_total = int(summary.get("duration_ms_total", 0))
+        if duration_total > 0:
+            summary["throughput_bps"] = int(summary["duration_sample_bytes"] * 1000 / duration_total)
+    _add_timing_sample(summary, "upstream_setup", upstream_setup_ms)
+    _add_timing_sample(summary, "relay", relay_ms)
+
+
+def merge_usage_summary(target, source):
+    target["count"] += int(source.get("count", 0))
+    target["uploaded_bytes"] += int(source.get("uploaded_bytes", 0))
+    target["downloaded_bytes"] += int(source.get("downloaded_bytes", 0))
+    target["total_bytes"] += int(source.get("total_bytes", 0))
+    target["duration_sample_count"] += int(source.get("duration_sample_count", 0))
+    target["duration_sample_bytes"] += int(source.get("duration_sample_bytes", 0))
+    target["duration_ms_total"] += int(source.get("duration_ms_total", 0))
+    if target["duration_sample_count"]:
+        target["duration_ms_avg"] = int(target["duration_ms_total"] / target["duration_sample_count"])
+    if target["duration_ms_total"] > 0:
+        target["throughput_bps"] = int(target["duration_sample_bytes"] * 1000 / target["duration_ms_total"])
+
+    for prefix in ("duration", "upstream_setup", "relay"):
+        max_key = f"{prefix}_ms_max"
+        source_max = source.get(max_key)
+        if source_max is not None:
+            target[max_key] = int(source_max) if target.get(max_key) is None else max(int(target[max_key]), int(source_max))
+        if prefix == "duration":
+            continue
+        count_key = f"{prefix}_sample_count"
+        total_key = f"{prefix}_ms_total"
+        avg_key = f"{prefix}_ms_avg"
+        target[count_key] += int(source.get(count_key, 0))
+        target[total_key] += int(source.get(total_key, 0))
+        if target[count_key]:
+            target[avg_key] = int(target[total_key] / target[count_key])
 
 
 def route_bucket_from_label(route_label: str | None) -> str:
@@ -478,19 +624,23 @@ def summarize_route_totals(records):
     for record in records:
         bucket = route_bucket_from_label(record.get("route_label"))
         summary = totals.setdefault(bucket, empty_usage_summary())
-        summary["count"] += 1
-        summary["uploaded_bytes"] += int(record.get("uploaded_bytes", 0))
-        summary["downloaded_bytes"] += int(record.get("downloaded_bytes", 0))
-        summary["total_bytes"] += int(record.get("total_bytes", 0))
+        uploaded_bytes = int(record.get("uploaded_bytes", 0))
+        downloaded_bytes = int(record.get("downloaded_bytes", 0))
+        add_usage_to_summary(
+            summary,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=int(record.get("total_bytes", uploaded_bytes + downloaded_bytes)),
+            duration_ms=record.get("duration_ms"),
+            upstream_setup_ms=record.get("upstream_setup_ms"),
+            relay_ms=record.get("relay_ms"),
+        )
     return totals
 
 
 def empty_client_usage_summary():
     return {
-        "count": 0,
-        "uploaded_bytes": 0,
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
+        **empty_usage_summary(),
         "proxy_types": set(),
         "last_seen_at": None,
     }
@@ -730,6 +880,169 @@ def traffic_limit_mb_to_bytes(limit_mb):
     return int(limit_mb) * BYTES_IN_MB
 
 
+def default_proxy_traffic_limit() -> dict:
+    return {
+        "enabled": False,
+        "max_past_hour_mb": None,
+        "max_past_3h_mb": None,
+        "max_past_week_mb": None,
+        "note": "",
+    }
+
+
+def normalize_upstream_proxy_id(value) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", normalized)
+    normalized = normalized.strip(".-")
+    return normalized[:80]
+
+
+def normalize_proxy_access_mode(value) -> str:
+    normalized = str(value or "public").strip().lower()
+    return normalized if normalized in UPSTREAM_PROXY_ACCESS_MODES else "public"
+
+
+def validate_proxy_traffic_limit_definition(*, enabled: bool, limit: dict, field_prefix: str):
+    if not enabled:
+        return
+    if all(limit.get(field["config_field"]) is None for field in PROXY_TRAFFIC_WINDOW_CONFIG.values()):
+        raise ValueError(
+            f"{field_prefix} must set at least one of max_past_hour_mb, "
+            "max_past_3h_mb, or max_past_week_mb when enabled"
+        )
+
+
+def normalize_proxy_traffic_limit(payload, *, field_prefix: str) -> dict:
+    default_limit = default_proxy_traffic_limit()
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"{field_prefix} must be an object")
+    normalized = {
+        "enabled": bool(payload.get("enabled", default_limit["enabled"])),
+        "max_past_hour_mb": normalize_traffic_limit_mb(
+            payload.get("max_past_hour_mb", default_limit["max_past_hour_mb"]),
+            field_name=f"{field_prefix} max_past_hour_mb",
+        ),
+        "max_past_3h_mb": normalize_traffic_limit_mb(
+            payload.get("max_past_3h_mb", default_limit["max_past_3h_mb"]),
+            field_name=f"{field_prefix} max_past_3h_mb",
+        ),
+        "max_past_week_mb": normalize_traffic_limit_mb(
+            payload.get("max_past_week_mb", default_limit["max_past_week_mb"]),
+            field_name=f"{field_prefix} max_past_week_mb",
+        ),
+        "note": str(payload.get("note", default_limit["note"])).strip(),
+    }
+    validate_proxy_traffic_limit_definition(
+        enabled=normalized["enabled"],
+        limit=normalized,
+        field_prefix=field_prefix,
+    )
+    return normalized
+
+
+def upstream_proxy_label(proxy) -> str:
+    if not isinstance(proxy, dict):
+        return ""
+    return f"{proxy.get('type', 'http')}://{proxy.get('host', '')}:{proxy.get('port', '')}"
+
+
+def proxy_allows_client(proxy, client_id: str | None) -> bool:
+    mode = normalize_proxy_access_mode((proxy or {}).get("access_mode"))
+    if mode == "public":
+        return True
+    normalized_client = str(client_id or "").strip()
+    if mode == "authenticated":
+        return normalized_client.startswith("user:")
+    for target in (proxy or {}).get("allowed_clients") or []:
+        if client_ip_matches_limit_target(normalized_client, target):
+            return True
+    return False
+
+
+def normalize_upstream_proxy_entry(proxy_payload, *, index: int) -> dict | None:
+    if not isinstance(proxy_payload, dict):
+        raise ValueError(f"router proxies entry #{index} must be an object")
+
+    proxy_type = str(proxy_payload.get("type", "http")).strip().lower()
+    if proxy_type not in UPSTREAM_PROXY_TYPES:
+        raise ValueError(f"router proxies entry #{index} type must be one of: {', '.join(sorted(UPSTREAM_PROXY_TYPES))}")
+
+    host = str(proxy_payload.get("host", "")).strip()
+    port_raw = proxy_payload.get("port", HTTPS_DEFAULT_PORT)
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"router proxies entry #{index} port must be an integer") from exc
+    ensure_valid_port(port, f"router proxies entry #{index} port")
+
+    proxy_id = normalize_upstream_proxy_id(proxy_payload.get("id"))
+    if not proxy_id:
+        proxy_id = normalize_upstream_proxy_id(proxy_payload.get("name")) or f"proxy-{index}"
+
+    enabled = bool(proxy_payload.get("enabled", True))
+    if enabled and not host:
+        raise ValueError(f"router proxies entry #{index} host is required when enabled")
+
+    allowed_clients_payload = proxy_payload.get("allowed_clients") or []
+    if not isinstance(allowed_clients_payload, list):
+        raise ValueError(f"router proxies entry #{index} allowed_clients must be an array")
+    allowed_clients = []
+    for target in allowed_clients_payload:
+        normalized_target = normalize_client_limit_target(str(target))
+        if normalized_target and normalized_target not in allowed_clients:
+            allowed_clients.append(normalized_target)
+
+    access_mode = normalize_proxy_access_mode(proxy_payload.get("access_mode"))
+    if access_mode == "private" and enabled and not allowed_clients:
+        raise ValueError(f"router proxies entry #{index} private proxies require at least one allowed client")
+
+    priority = normalize_positive_int(
+        proxy_payload.get("priority", index),
+        field_name=f"router proxies entry #{index} priority",
+        minimum=1,
+        maximum=100000,
+    )
+    return {
+        "id": proxy_id,
+        "name": str(proxy_payload.get("name") or proxy_id).strip() or proxy_id,
+        "enabled": enabled,
+        "priority": priority,
+        "type": proxy_type,
+        "host": host,
+        "port": port,
+        "access_mode": access_mode,
+        "allowed_clients": allowed_clients,
+        "traffic_limit": normalize_proxy_traffic_limit(
+            proxy_payload.get("traffic_limit"),
+            field_prefix=f"router proxies entry #{index} traffic_limit",
+        ),
+        "per_client_traffic_limit": normalize_proxy_traffic_limit(
+            proxy_payload.get("per_client_traffic_limit"),
+            field_prefix=f"router proxies entry #{index} per_client_traffic_limit",
+        ),
+        "note": str(proxy_payload.get("note", "")).strip(),
+    }
+
+
+def legacy_upstream_proxy_entry(upstream_payload, *, default_config) -> dict | None:
+    if not bool(upstream_payload.get("enabled", default_config["upstream"]["enabled"])):
+        return None
+    payload = {
+        "id": "upstream-default",
+        "name": "Default upstream",
+        "enabled": True,
+        "priority": 1,
+        "type": upstream_payload.get("type", default_config["upstream"]["type"]),
+        "host": upstream_payload.get("host", default_config["upstream"]["host"]),
+        "port": upstream_payload.get("port", default_config["upstream"]["port"]),
+        "access_mode": "public",
+        "allowed_clients": [],
+    }
+    return normalize_upstream_proxy_entry(payload, index=1)
+
+
 def normalize_positive_int(value, *, field_name: str, minimum: int = 1, maximum: int | None = None) -> int:
     text = str(value).strip()
     try:
@@ -940,6 +1253,7 @@ def default_router_config():
             "host": "127.0.0.1",
             "port": HTTPS_DEFAULT_PORT,
         },
+        "proxies": [],
         "rules": list(routing_defaults["rules"]),
         "routing_profiles": [],
     }
@@ -1025,18 +1339,20 @@ def normalize_routing_target_payload(payload, *, field_prefix: str, default_conf
         if expires_at is not None and expires_at <= now:
             continue
 
-        normalized_rules.append(
-            {
-                "pattern": pattern,
-                "match": match_type,
-                "action": action,
-                "enabled": bool(rule_payload.get("enabled", True)),
-                "note": note,
-                "source": source,
-                "duration": duration,
-                "expires_at": expires_at.isoformat() if expires_at is not None else None,
-            }
-        )
+        normalized_rule = {
+            "pattern": pattern,
+            "match": match_type,
+            "action": action,
+            "enabled": bool(rule_payload.get("enabled", True)),
+            "note": note,
+            "source": source,
+            "duration": duration,
+            "expires_at": expires_at.isoformat() if expires_at is not None else None,
+        }
+        proxy_id = normalize_upstream_proxy_id(rule_payload.get("proxy_id"))
+        if action == "proxy" and proxy_id:
+            normalized_rule["proxy_id"] = proxy_id
+        normalized_rules.append(normalized_rule)
 
     normalized_rules = prioritize_router_rules(normalized_rules)
 
@@ -1068,6 +1384,12 @@ def normalize_router_config(payload):
         upstream_payload = {}
     if not isinstance(upstream_payload, dict):
         raise ValueError("router upstream must be an object")
+
+    proxies_payload = payload.get("proxies")
+    if proxies_payload is None:
+        proxies_payload = []
+    if not isinstance(proxies_payload, list):
+        raise ValueError("router proxies must be an array")
 
     auto_proxy_failures_payload = payload.get("auto_proxy_failures") or {}
     if auto_proxy_failures_payload is None:
@@ -1156,6 +1478,32 @@ def normalize_router_config(payload):
     upstream_enabled = bool(upstream_payload.get("enabled", default_config["upstream"]["enabled"]))
     if upstream_enabled and not upstream_host:
         raise ValueError("router upstream host is required when the upstream proxy is enabled")
+
+    normalized_proxies = []
+    seen_proxy_ids = set()
+    if proxies_payload:
+        for index, proxy_payload in enumerate(proxies_payload, start=1):
+            proxy = normalize_upstream_proxy_entry(proxy_payload, index=index)
+            if proxy is None:
+                continue
+            if proxy["id"] in seen_proxy_ids:
+                raise ValueError(f"router proxies entry #{index} uses duplicate id '{proxy['id']}'")
+            seen_proxy_ids.add(proxy["id"])
+            normalized_proxies.append(proxy)
+    else:
+        legacy_proxy = legacy_upstream_proxy_entry(upstream_payload, default_config=default_config)
+        if legacy_proxy is not None:
+            normalized_proxies.append(legacy_proxy)
+            seen_proxy_ids.add(legacy_proxy["id"])
+
+    normalized_proxies.sort(key=lambda item: (int(item.get("priority", 1)), item.get("id", "")))
+    enabled_proxies = [proxy for proxy in normalized_proxies if proxy.get("enabled", True)]
+    first_enabled_proxy = enabled_proxies[0] if enabled_proxies else None
+    if first_enabled_proxy is not None:
+        upstream_enabled = True
+        upstream_type = first_enabled_proxy["type"]
+        upstream_host = first_enabled_proxy["host"]
+        upstream_port = first_enabled_proxy["port"]
 
     upstream_retry_attempts = normalize_positive_int(
         upstream_retry_payload.get(
@@ -1376,11 +1724,18 @@ def normalize_router_config(payload):
             enabled_profile_signatures[signature_key] = normalized_profile["name"]
         normalized_routing_profiles.append(normalized_profile)
 
-    if not upstream_enabled:
+    if not enabled_proxies:
         routing_targets = [normalized_routing_defaults] + normalized_routing_profiles
         for target in routing_targets:
             if target["default_action"] == "proxy" or any(rule["action"] == "proxy" for rule in target["rules"]):
-                raise ValueError("router upstream must be enabled before any rule or default action can use proxy")
+                raise ValueError("router must have at least one enabled proxy before any rule or default action can use proxy")
+
+    known_proxy_ids = {proxy["id"] for proxy in normalized_proxies}
+    for target in [normalized_routing_defaults] + normalized_routing_profiles:
+        for rule in target["rules"]:
+            proxy_id = rule.get("proxy_id")
+            if proxy_id and proxy_id not in known_proxy_ids:
+                raise ValueError(f"router rule references unknown proxy_id '{proxy_id}'")
 
     return {
         "default_action": normalized_routing_defaults["default_action"],
@@ -1448,6 +1803,7 @@ def normalize_router_config(payload):
             "host": upstream_host,
             "port": upstream_port,
         },
+        "proxies": normalized_proxies,
         "rules": normalized_routing_defaults["rules"],
         "routing_profiles": normalized_routing_profiles,
     }
@@ -2188,17 +2544,19 @@ def split_host_port(value: str, default_port: int):
 
 
 def summarize_usage_records(records):
-    summary = {
-        "count": 0,
-        "uploaded_bytes": 0,
-        "downloaded_bytes": 0,
-        "total_bytes": 0,
-    }
+    summary = empty_usage_summary()
     for record in records:
-        summary["count"] += 1
-        summary["uploaded_bytes"] += int(record.get("uploaded_bytes", 0))
-        summary["downloaded_bytes"] += int(record.get("downloaded_bytes", 0))
-        summary["total_bytes"] += int(record.get("total_bytes", 0))
+        uploaded_bytes = int(record.get("uploaded_bytes", 0))
+        downloaded_bytes = int(record.get("downloaded_bytes", 0))
+        add_usage_to_summary(
+            summary,
+            uploaded_bytes=uploaded_bytes,
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=int(record.get("total_bytes", uploaded_bytes + downloaded_bytes)),
+            duration_ms=record.get("duration_ms"),
+            upstream_setup_ms=record.get("upstream_setup_ms"),
+            relay_ms=record.get("relay_ms"),
+        )
     return summary
 
 
@@ -2208,6 +2566,21 @@ def print_usage_summary(label: str, summary):
     print(f"  Upload:   {format_mb(summary['uploaded_bytes'])} ({summary['uploaded_bytes']} bytes)")
     print(f"  Download: {format_mb(summary['downloaded_bytes'])} ({summary['downloaded_bytes']} bytes)")
     print(f"  Total:    {format_mb(summary['total_bytes'])} ({summary['total_bytes']} bytes)")
+    duration_samples = int(summary.get("duration_sample_count", 0))
+    if duration_samples:
+        print(
+            f"  Duration: avg {summary.get('duration_ms_avg')} ms, "
+            f"max {summary.get('duration_ms_max')} ms ({duration_samples} samples)"
+        )
+        throughput_bps = summary.get("throughput_bps")
+        if throughput_bps is not None:
+            print(f"  Throughput: {format_mb(int(throughput_bps))}/s ({int(throughput_bps)} B/s)")
+    upstream_samples = int(summary.get("upstream_setup_sample_count", 0))
+    if upstream_samples:
+        print(
+            f"  Upstream setup: avg {summary.get('upstream_setup_ms_avg')} ms, "
+            f"max {summary.get('upstream_setup_ms_max')} ms ({upstream_samples} samples)"
+        )
 
 
 def load_jsonl_records(
@@ -2425,11 +2798,27 @@ def bucket_datetime(value: datetime, bucket_seconds: int, history_timezone=None)
     return midnight + timedelta(seconds=bucket_offset)
 
 
-def add_usage_to_summary(summary, *, uploaded_bytes: int, downloaded_bytes: int, total_bytes: int):
+def add_usage_to_summary(
+    summary,
+    *,
+    uploaded_bytes: int,
+    downloaded_bytes: int,
+    total_bytes: int,
+    duration_ms=None,
+    upstream_setup_ms=None,
+    relay_ms=None,
+):
     summary["count"] += 1
     summary["uploaded_bytes"] += uploaded_bytes
     summary["downloaded_bytes"] += downloaded_bytes
     summary["total_bytes"] += total_bytes
+    add_performance_to_summary(
+        summary,
+        total_bytes=total_bytes,
+        duration_ms=duration_ms,
+        upstream_setup_ms=upstream_setup_ms,
+        relay_ms=relay_ms,
+    )
 
 
 def build_history_period_totals(now: datetime):
@@ -2477,6 +2866,7 @@ def summarize_history_records(
     range_key: str,
     proxy_type: str | None = None,
     client: str | None = None,
+    upstream_proxy_id: str | None = None,
     timezone_name: str | None = None,
     timezone_offset_minutes=None,
     now: datetime | None = None,
@@ -2498,17 +2888,23 @@ def summarize_history_records(
     client_period_totals = {}
     available_proxy_types = set()
     available_clients = set()
+    available_upstream_proxies = set()
     selected_timestamps = []
 
     for record in records:
         record_proxy_type = str(record.get("proxy_type", "unknown") or "unknown")
         record_client = str(record.get("client", "unknown") or "unknown")
+        record_upstream_proxy_id = str(record.get("upstream_proxy_id") or "").strip()
         available_proxy_types.add(record_proxy_type)
         available_clients.add(record_client)
+        if record_upstream_proxy_id:
+            available_upstream_proxies.add(record_upstream_proxy_id)
 
         if proxy_type is not None and record_proxy_type != proxy_type:
             continue
         if client is not None and record_client != client:
+            continue
+        if upstream_proxy_id is not None and record_upstream_proxy_id != upstream_proxy_id:
             continue
 
         timestamp = parse_usage_timestamp(record.get("timestamp"))
@@ -2521,6 +2917,9 @@ def summarize_history_records(
         uploaded_bytes = int(record.get("uploaded_bytes", 0))
         downloaded_bytes = int(record.get("downloaded_bytes", 0))
         total_bytes = int(record.get("total_bytes", uploaded_bytes + downloaded_bytes))
+        duration_ms = record.get("duration_ms")
+        upstream_setup_ms = record.get("upstream_setup_ms")
+        relay_ms = record.get("relay_ms")
 
         client_period_summary = client_period_totals.setdefault(
             record_client,
@@ -2546,6 +2945,9 @@ def summarize_history_records(
             uploaded_bytes=uploaded_bytes,
             downloaded_bytes=downloaded_bytes,
             total_bytes=total_bytes,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
         )
 
         for period_key, period_start in period_starts.items():
@@ -2555,12 +2957,18 @@ def summarize_history_records(
                     uploaded_bytes=uploaded_bytes,
                     downloaded_bytes=downloaded_bytes,
                     total_bytes=total_bytes,
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
                 )
                 add_usage_to_summary(
                     client_period_summary["period_totals"][period_key],
                     uploaded_bytes=uploaded_bytes,
                     downloaded_bytes=downloaded_bytes,
                     total_bytes=total_bytes,
+                    duration_ms=duration_ms,
+                    upstream_setup_ms=upstream_setup_ms,
+                    relay_ms=relay_ms,
                 )
 
         if cutoff is not None and timestamp < cutoff:
@@ -2571,6 +2979,9 @@ def summarize_history_records(
             uploaded_bytes=uploaded_bytes,
             downloaded_bytes=downloaded_bytes,
             total_bytes=total_bytes,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
         )
         selected_timestamps.append(timestamp)
 
@@ -2592,6 +3003,9 @@ def summarize_history_records(
             uploaded_bytes=uploaded_bytes,
             downloaded_bytes=downloaded_bytes,
             total_bytes=total_bytes,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
         )
 
         destination = record.get("destination", "unknown")
@@ -2610,6 +3024,9 @@ def summarize_history_records(
             uploaded_bytes=uploaded_bytes,
             downloaded_bytes=downloaded_bytes,
             total_bytes=total_bytes,
+            duration_ms=duration_ms,
+            upstream_setup_ms=upstream_setup_ms,
+            relay_ms=relay_ms,
         )
 
     series = []
@@ -2662,6 +3079,7 @@ def summarize_history_records(
         "range_title": config["title"],
         "proxy_type": proxy_type or "all",
         "client": client or "all",
+        "upstream_proxy_id": upstream_proxy_id or "all",
         "timezone": str(timezone_name or getattr(history_timezone, "key", "") or history_timezone.tzname(now) or ""),
         "summary": summary,
         "series": series,
@@ -2671,6 +3089,7 @@ def summarize_history_records(
         "invalid_lines": invalid_lines,
         "available_proxy_types": sorted(available_proxy_types),
         "available_clients": sorted(available_clients),
+        "available_upstream_proxies": sorted(available_upstream_proxies),
         "has_log_data": bool(records),
         "matched_records": summary["count"],
         "time_range": {

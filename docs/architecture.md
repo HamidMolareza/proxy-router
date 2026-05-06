@@ -47,7 +47,7 @@ Purpose:
 - Render the dashboard UI
 - Poll backend APIs
 - Edit router config
-- Display history, HTTPS traffic analysis, routing, quotas, and failure review
+- Display history, upstream proxies, HTTPS traffic analysis, routing, quotas, and failure review
 
 ## Request Flow
 
@@ -58,9 +58,10 @@ Purpose:
 3. The backend evaluates quota state for that identity.
 4. Routing rules are resolved from the active config and profile context.
 5. HTTP CONNECT requests are either tunneled unchanged or, when HTTPS interception is enabled and matched, terminated with a generated host certificate.
-6. The request is sent direct, proxied upstream, or blocked.
-7. Usage, failure, and intercepted HTTPS analyzer events are written to persisted log files.
-8. Runtime dashboard state is updated in memory.
+6. For proxied traffic, the backend selects an allowed upstream proxy by priority, client access policy, and proxy quota state, with failover to the next candidate before returning an error.
+7. The request is sent direct, proxied upstream, or blocked.
+8. Usage, failure, and intercepted HTTPS analyzer events are written to persisted log files.
+9. Runtime dashboard state is updated in memory.
 
 ### Dashboard traffic
 
@@ -76,19 +77,19 @@ Compose mounts `./data` to `/data`.
 
 Persisted files:
 
-- `router-config.json`: routing, upstream, optional proxy auth, quota, exemption, and profile configuration
+- `router-config.json`: routing, ordered upstream proxy definitions, optional proxy auth, quota, exemption, and profile configuration
 - `router-config-auto-proxy-state.json`: auto-proxy activation state
 - `router-config-https-interception-state.json`: adaptive HTTPS trust and fallback state
 - `router-config-https-discovery-state.json`: unmanaged HTTPS domain discovery and probe state
 - `https-interception/`: generated local CA and per-host certificates
-- `usage.log`: JSONL transfer summaries
+- `usage.log`: JSONL transfer summaries, including optional timing, throughput, selected upstream proxy, and failover fields for completed records
 - `failures.log`: JSONL failed-request events
 - `https-traffic.log`: JSONL intercepted HTTPS request/response analyzer records
 - `error.log`: exception details and tracebacks
 
 On backend startup:
 
-- the quota manager reloads usage history from `usage.log`
+- the quota manager reloads client and upstream proxy usage windows from `usage.log`
 - the dashboard runtime rebuilds totals and recent entries from `usage.log` and `failures.log`
 - the HTTPS traffic cache reads `https-traffic.log` incrementally for dashboard and analyzer API queries
 - the auto-proxy manager reloads its persisted state file
@@ -96,6 +97,24 @@ On backend startup:
 - HTTPS discovery reloads recently probed unmanaged domains to avoid repeated direct/proxy probes
 
 This means the dashboard and routing-related state survive container restarts as long as `./data` is preserved.
+
+## Performance Model
+
+The traffic path records observability at request or tunnel boundaries instead of logging each relayed chunk.
+
+- `duration_ms` is total lifetime for a completed HTTP request, CONNECT tunnel, SOCKS5 tunnel, or WebSocket tunnel.
+- `upstream_setup_ms` is the time to open the direct/upstream route and, for normal HTTP/WebSocket requests, receive the upstream response head.
+- `relay_ms` is the remaining lifetime after upstream setup and usually represents body or tunnel relay.
+- `throughput_bps` is derived from bytes and `duration_ms`; summaries compute it only from records that have timing samples so older logs do not distort rates.
+- `upstream_retry_count` and `upstream_retry_delay_ms` show retry attempts and configured backoff time before success or failure.
+- `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count` identify the selected upstream proxy and how many higher-priority candidates were skipped before success.
+
+Expected overhead:
+
+- raw CONNECT and SOCKS5 stay as socket relay paths and only record aggregate timing at completion
+- normal HTTP may buffer request bodies when required by existing forwarding behavior
+- HTTPS interception adds TLS termination and bounded body-preview capture only for matched hosts
+- upstream retries can intentionally add latency before a final success or failure
 
 ## Docker Layout
 
@@ -126,7 +145,7 @@ The backend executable remains:
 Important routes:
 
 - `GET /api/dashboard`
-- `GET /api/history` with optional `range`, `proxy_type`, `client`, `timezone`, and `timezone_offset_minutes` query parameters
+- `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
 - `GET /api/router-config`
 - `POST /api/router-config`
 - `GET /api/https-interception/status`
@@ -162,7 +181,10 @@ Common defaults:
 - The root executable is a thin shim; most backend behavior lives in `proxy_router/`.
 - Runtime state is centralized in `AppRuntime` instead of spreading service globals across the codebase.
 - Optional proxy authentication supports HTTP Basic `Proxy-Authorization` and SOCKS5 username/password. Anonymous access can remain enabled, and authenticated traffic is logged, limited, and exempted as `user:<username>` while retaining the source IP metadata.
+- Upstream proxies are configured in ordered `proxies[]` entries. Access modes are `public`, `authenticated`, and `private`; private proxies match explicit client identities/IPs/CIDRs, and proxy rules can pin a `proxy_id`. Legacy single-`upstream` config is normalized into one proxy entry for compatibility.
+- Automatic direct-failure and HTTPS-discovery proxy assignments persist the selected working proxy id so later requests for that domain reuse the same upstream unless the rule is edited or removed.
 - HTTPS interception uses adaptive fallback: successful TLS handshakes mark a client as CA-trusted, while TLS trust failures temporarily bypass MITM for that client or host and use raw CONNECT.
 - Intercepted HTTPS analyzer records are append-only JSONL with a stable request id, route metadata, redacted headers, byte totals, and bounded decoded text body previews so a UI or external AI agent can inspect captured traffic without scraping the dashboard.
 - HTTPS discovery watches unmanaged direct HTTPS `CONNECT` traffic and probes direct TLS versus upstream TLS in the background. If direct TLS fails and upstream TLS succeeds, it activates the existing temporary auto-proxy rule flow. Raw tunnel completion alone is not treated as proof that the website worked.
 - SOCKS5 remains a raw tunnel path for apps that reject user-installed CAs or use certificate pinning.
+- Slowdown investigations should start from `usage.log`, `/api/dashboard`, or `/api/history` timing fields before changing relay behavior. Compare route labels, upstream setup time, retries, and throughput for direct versus proxied traffic.

@@ -104,7 +104,14 @@ class AutoProxyFailureManager:
 
         self._wake_event.set()
 
-    def record_success(self, host: str | None, *, route_label: str | None = None, profile_id: str | None = None):
+    def record_success(
+        self,
+        host: str | None,
+        *,
+        route_label: str | None = None,
+        profile_id: str | None = None,
+        proxy_id: str | None = None,
+    ):
         pattern = summarize_domain(host) or normalize_host(host or "")
         if not pattern or is_ip_address_text(pattern):
             return
@@ -127,6 +134,7 @@ class AutoProxyFailureManager:
                     normalize_host(host or pattern),
                     state,
                     now,
+                    proxy_id=proxy_id,
                 )
                 state["last_success_at"] = now.isoformat()
                 state["probe_pending"] = False
@@ -200,6 +208,42 @@ class AutoProxyFailureManager:
                 pattern,
                 self._default_state(),
             )
+            state["probe_pending"] = False
+            state["probe_in_flight"] = True
+            self._save_state_locked()
+
+        probe_decision = dict(route_decision)
+        probe_decision["action"] = "proxy"
+        probe_decision["route_label"] = build_auto_proxy_probe_route_label(upstream)
+        probe_decision["matched_rule"] = None
+        probe_decision["profile_id"] = resolved_profile_id
+        probe_decision["auto_proxy_probe"] = True
+        probe_decision["auto_proxy_pattern"] = pattern
+        return probe_decision
+
+    def direct_failure_probe_route(self, host: str | None, route_decision):
+        pattern = summarize_domain(host) or normalize_host(host or "")
+        if not pattern or is_ip_address_text(pattern):
+            return None
+        if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        upstream = route_decision.get("upstream")
+        if upstream is None:
+            return None
+
+        profile_id = str(route_decision.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID)
+        evaluation = self.router_config.auto_proxy_evaluation(host, profile_id=profile_id)
+        if not evaluation["eligible"]:
+            return None
+        resolved_profile_id = evaluation.get("profile_id") or profile_id
+
+        with self._lock:
+            state = self._profile_domains_locked(resolved_profile_id, create=True).setdefault(
+                pattern,
+                self._default_state(),
+            )
+            state["failure_count"] = max(1, int(state.get("failure_count", 0)))
+            state["last_failure_at"] = datetime.now().astimezone().isoformat()
             state["probe_pending"] = False
             state["probe_in_flight"] = True
             self._save_state_locked()
@@ -401,6 +445,7 @@ class AutoProxyFailureManager:
         host: str | None,
         state,
         now: datetime,
+        proxy_id: str | None = None,
     ):
         self._complete_activation_if_due_locked(state, now)
         stage_index = auto_proxy_stage_index_for_activation_count(int(state.get("activation_count", 0)))
@@ -420,6 +465,7 @@ class AutoProxyFailureManager:
             "stage_index": stage_index,
             "duration_seconds": int(duration.total_seconds()),
             "expires_at": expires_at,
+            "proxy_id": normalize_upstream_proxy_id(proxy_id),
         }
 
     def _reconcile_state(self):
@@ -475,6 +521,7 @@ class AutoProxyFailureManager:
                 stage_index=entry["stage_index"],
                 expires_at=entry["expires_at"],
                 profile_id=entry["profile_id"],
+                proxy_id=entry.get("proxy_id"),
             )
         except Exception as exc:
             debug_exception(
@@ -520,6 +567,7 @@ class AutoProxyFailureManager:
                 stage_index=activation["stage_index"],
                 expires_at=activation["expires_at"],
                 profile_id=activation["profile_id"],
+                proxy_id=activation.get("proxy_id"),
             )
         except Exception as exc:
             debug_exception(
@@ -922,6 +970,7 @@ class HttpsDiscoveryManager:
             plan["host"],
             route_label=build_auto_proxy_probe_route_label(plan["upstream"]),
             profile_id=plan["profile_id"],
+            proxy_id=plan["upstream"].get("id"),
         )
 
     def _record_manual_review(self, plan, direct_result, proxy_result):
@@ -1358,17 +1407,24 @@ class TrafficQuotaManager:
     def __init__(self):
         self._lock = threading.Lock()
         self._records_by_client = {}
+        self._records_by_proxy = {}
+        self._records_by_proxy_client = {}
 
     def clear(self):
         with self._lock:
             self._records_by_client = {}
+            self._records_by_proxy = {}
+            self._records_by_proxy_client = {}
 
     def load_from_log(self, log_file: Path | None):
         if log_file is None:
             return
 
         cutoff = datetime.now().astimezone() - CLIENT_TRAFFIC_MAX_WINDOW
+        proxy_cutoff = datetime.now().astimezone() - PROXY_TRAFFIC_MAX_WINDOW
         loaded_records = {}
+        loaded_proxy_records = {}
+        loaded_proxy_client_records = {}
 
         try:
             with log_file.open("r", encoding="utf-8") as stream:
@@ -1386,7 +1442,7 @@ class TrafficQuotaManager:
                         continue
 
                     timestamp = parse_usage_timestamp(record.get("timestamp"))
-                    if timestamp is None or timestamp < cutoff:
+                    if timestamp is None or timestamp < proxy_cutoff:
                         continue
 
                     total_bytes = int(
@@ -1395,19 +1451,37 @@ class TrafficQuotaManager:
                             int(record.get("uploaded_bytes", 0)) + int(record.get("downloaded_bytes", 0)),
                         )
                     )
-                    loaded_records.setdefault(client, deque()).append(
-                        {
+                    if timestamp >= cutoff:
+                        loaded_records.setdefault(client, deque()).append(
+                            {
+                                "timestamp": timestamp,
+                                "total_bytes": total_bytes,
+                            }
+                        )
+                    proxy_id = str(record.get("upstream_proxy_id") or "").strip()
+                    if proxy_id and timestamp >= proxy_cutoff:
+                        proxy_record = {
                             "timestamp": timestamp,
                             "total_bytes": total_bytes,
                         }
-                    )
+                        loaded_proxy_records.setdefault(proxy_id, deque()).append(proxy_record)
+                        loaded_proxy_client_records.setdefault((proxy_id, client), deque()).append(proxy_record)
         except FileNotFoundError:
             return
 
         with self._lock:
             self._records_by_client = loaded_records
+            self._records_by_proxy = loaded_proxy_records
+            self._records_by_proxy_client = loaded_proxy_client_records
 
-    def record_usage(self, *, client: str, total_bytes: int, timestamp: str | datetime | None = None):
+    def record_usage(
+        self,
+        *,
+        client: str,
+        total_bytes: int,
+        timestamp: str | datetime | None = None,
+        upstream_proxy_id: str | None = None,
+    ):
         if not client:
             return
 
@@ -1427,6 +1501,18 @@ class TrafficQuotaManager:
                 }
             )
             self._prune_locked(client, now=event_time)
+            proxy_id = str(upstream_proxy_id or "").strip()
+            if proxy_id:
+                proxy_record = {
+                    "timestamp": event_time,
+                    "total_bytes": int(total_bytes),
+                }
+                proxy_records = self._records_by_proxy.setdefault(proxy_id, deque())
+                proxy_records.append(proxy_record)
+                proxy_client_records = self._records_by_proxy_client.setdefault((proxy_id, client), deque())
+                proxy_client_records.append(proxy_record)
+                self._prune_proxy_locked(proxy_id, now=event_time)
+                self._prune_proxy_client_locked(proxy_id, client, now=event_time)
 
     def usage_for_client(self, client: str, now: datetime | None = None):
         current_time = now or datetime.now().astimezone()
@@ -1516,6 +1602,100 @@ class TrafficQuotaManager:
             snapshot[client] = self.evaluate_client(client, router_config)
         return snapshot
 
+    def usage_for_proxy(self, proxy_id: str, client: str | None = None, now: datetime | None = None):
+        current_time = now or datetime.now().astimezone()
+        normalized_proxy_id = str(proxy_id or "").strip()
+        with self._lock:
+            if client is None:
+                self._prune_proxy_locked(normalized_proxy_id, now=current_time)
+                records = list(self._records_by_proxy.get(normalized_proxy_id, ()))
+            else:
+                self._prune_proxy_client_locked(normalized_proxy_id, client, now=current_time)
+                records = list(self._records_by_proxy_client.get((normalized_proxy_id, client), ()))
+
+        usage = {}
+        for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items():
+            cutoff = current_time - window_config["window"]
+            total_bytes = sum(
+                record["total_bytes"] for record in records if record["timestamp"] >= cutoff
+            )
+            usage[window_key] = {
+                "window_seconds": int(window_config["window"].total_seconds()),
+                "total_bytes": total_bytes,
+            }
+        return usage
+
+    def evaluate_proxy(self, proxy, *, client: str | None = None):
+        proxy_id = str((proxy or {}).get("id") or "").strip()
+        usage = self.usage_for_proxy(proxy_id)
+        client_usage = self.usage_for_proxy(proxy_id, client) if client else {}
+        evaluation = {
+            "proxy_id": proxy_id,
+            "client": client,
+            "usage": usage,
+            "client_usage": client_usage,
+            "allowed": True,
+            "exceeded_windows": [],
+            "client_exceeded_windows": [],
+        }
+        self._apply_proxy_limit_evaluation(
+            evaluation,
+            proxy.get("traffic_limit") or {},
+            usage,
+            exceeded_key="exceeded_windows",
+            client=None,
+        )
+        if client:
+            self._apply_proxy_limit_evaluation(
+                evaluation,
+                proxy.get("per_client_traffic_limit") or {},
+                client_usage,
+                exceeded_key="client_exceeded_windows",
+                client=client,
+            )
+        return evaluation
+
+    def proxy_snapshot(self, proxies, clients):
+        snapshot = {}
+        normalized_clients = [str(client or "").strip() for client in clients if str(client or "").strip()]
+        for proxy in proxies or []:
+            proxy_id = str((proxy or {}).get("id") or "").strip()
+            if not proxy_id:
+                continue
+            proxy_payload = self.evaluate_proxy(proxy)
+            proxy_payload["clients"] = {
+                client: self.evaluate_proxy(proxy, client=client)
+                for client in normalized_clients
+            }
+            snapshot[proxy_id] = proxy_payload
+        return snapshot
+
+    def proxy_allowed(self, proxy, *, client: str | None = None):
+        return self.evaluate_proxy(proxy, client=client).get("allowed", True)
+
+    def _apply_proxy_limit_evaluation(self, evaluation, limit, usage, *, exceeded_key: str, client: str | None):
+        if not limit.get("enabled", False):
+            return
+        for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items():
+            limit_mb = limit.get(window_config["config_field"])
+            limit_bytes = traffic_limit_mb_to_bytes(limit_mb)
+            if limit_bytes is None:
+                continue
+            total_bytes = int((usage.get(window_key) or {}).get("total_bytes", 0))
+            if total_bytes < limit_bytes:
+                continue
+            evaluation["allowed"] = False
+            evaluation[exceeded_key].append(
+                {
+                    "key": window_key,
+                    "label": window_config["label"],
+                    "used_bytes": total_bytes,
+                    "limit_bytes": limit_bytes,
+                    "limit_mb": limit_mb,
+                    "client": client,
+                }
+            )
+
     def _prune_locked(self, client: str, *, now: datetime):
         cutoff = now - CLIENT_TRAFFIC_MAX_WINDOW
         records = self._records_by_client.get(client)
@@ -1527,6 +1707,26 @@ class TrafficQuotaManager:
 
         if not records:
             self._records_by_client.pop(client, None)
+
+    def _prune_proxy_locked(self, proxy_id: str, *, now: datetime):
+        cutoff = now - PROXY_TRAFFIC_MAX_WINDOW
+        records = self._records_by_proxy.get(proxy_id)
+        if not records:
+            return
+        while records and records[0]["timestamp"] < cutoff:
+            records.popleft()
+        if not records:
+            self._records_by_proxy.pop(proxy_id, None)
+
+    def _prune_proxy_client_locked(self, proxy_id: str, client: str, *, now: datetime):
+        cutoff = now - PROXY_TRAFFIC_MAX_WINDOW
+        records = self._records_by_proxy_client.get((proxy_id, client))
+        if not records:
+            return
+        while records and records[0]["timestamp"] < cutoff:
+            records.popleft()
+        if not records:
+            self._records_by_proxy_client.pop((proxy_id, client), None)
 
     def _estimate_unblock_at(self, *, records, now: datetime, window: timedelta, limit_bytes: int):
         cutoff = now - window
