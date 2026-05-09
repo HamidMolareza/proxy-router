@@ -902,6 +902,16 @@ def normalize_proxy_access_mode(value) -> str:
     return normalized if normalized in UPSTREAM_PROXY_ACCESS_MODES else "public"
 
 
+def is_loopback_client_target(value) -> bool:
+    normalized = str(value or "").strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
 def validate_proxy_traffic_limit_definition(*, enabled: bool, limit: dict, field_prefix: str):
     if not enabled:
         return
@@ -959,6 +969,8 @@ def proxy_allows_client(proxy, client_id: str | None = None, *, client_ip: str |
     for candidate in (normalized_client, str(client_ip or "").strip()):
         if candidate and candidate not in client_candidates:
             client_candidates.append(candidate)
+    if mode == "private" and any(is_loopback_client_target(candidate) for candidate in client_candidates):
+        return True
     for target in (proxy or {}).get("allowed_clients") or []:
         for candidate in client_candidates:
             if client_ip_matches_limit_target(candidate, target):
@@ -1000,8 +1012,6 @@ def normalize_upstream_proxy_entry(proxy_payload, *, index: int) -> dict | None:
             allowed_clients.append(normalized_target)
 
     access_mode = normalize_proxy_access_mode(proxy_payload.get("access_mode"))
-    if access_mode == "private" and enabled and not allowed_clients:
-        raise ValueError(f"router proxies entry #{index} private proxies require at least one allowed client")
 
     priority = normalize_positive_int(
         proxy_payload.get("priority", index),

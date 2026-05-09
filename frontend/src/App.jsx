@@ -2298,7 +2298,7 @@ function App() {
   const [currentRulesPage, setCurrentRulesPage] = useState(1)
   const [currentRuleSuggestionsPage, setCurrentRuleSuggestionsPage] = useState(1)
   const [currentRulesSearchTerm, setCurrentRulesSearchTerm] = useState('')
-  const [rulesSort, setRulesSort] = useState({ key: 'order', direction: 'desc' })
+  const [rulesSort, setRulesSort] = useState({ key: 'order', direction: 'asc' })
   const [ruleSuggestionsSearchTerm, setRuleSuggestionsSearchTerm] = useState('')
   const [ruleSuggestionsStatusFilter, setRuleSuggestionsStatusFilter] = useState('all')
   const [currentEditorProfileId, setCurrentEditorProfileId] = useState(DEFAULT_ROUTING_PROFILE_ID)
@@ -3330,6 +3330,7 @@ function App() {
         },
       ),
     )
+    setRulesSort({ key: 'order', direction: 'asc' })
     setLocalRouterConfig(nextConfig, {
       activateTab: 'routing',
       resetRulesPage: true,
@@ -4420,8 +4421,24 @@ function App() {
                   </button>
                 </div>
               </div>
-              <div className={tableWrapClass}>
-                <table className="min-w-[100rem]">
+              <div className={cx(tableWrapClass, '[&_td]:align-middle [&_input]:text-sm [&_select]:text-sm')}>
+                <table className="min-w-[128rem] table-fixed">
+                  <colgroup>
+                    <col className="w-[5.5rem]" />
+                    <col className="w-[7rem]" />
+                    <col className="w-[13rem]" />
+                    <col className="w-[13rem]" />
+                    <col className="w-[9rem]" />
+                    <col className="w-[16rem]" />
+                    <col className="w-[8rem]" />
+                    <col className="w-[11rem]" />
+                    <col className="w-[20rem]" />
+                    <col className="w-[17rem]" />
+                    <col className="w-[17rem]" />
+                    <col className="w-[14rem]" />
+                    <col className="w-[12rem]" />
+                    <col className="w-[8rem]" />
+                  </colgroup>
                   <thead>
                     <tr>
                       <th>Enabled</th>
@@ -4519,7 +4536,16 @@ function App() {
                               <input
                                 type="text"
                                 value={proxy.allowed_clients.join(', ')}
-                                placeholder="user:phone, 192.168.1.50"
+                                placeholder={
+                                  proxy.access_mode === 'private'
+                                    ? 'remote clients only; localhost is automatic'
+                                    : 'user:phone, 192.168.1.50'
+                                }
+                                title={
+                                  proxy.access_mode === 'private'
+                                    ? 'Private proxies always allow local loopback clients. Add remote users or IPs only when needed.'
+                                    : 'Optional users or source IPs for private proxy access.'
+                                }
                                 onChange={(event) =>
                                   updateUpstreamProxyField(
                                     index,
@@ -4552,7 +4578,7 @@ function App() {
                                       ['3h', 'max_past_3h_mb'],
                                       ['7d', 'max_past_week_mb'],
                                     ].map(([label, field]) => (
-                                      <label className={fieldClass} key={`${limitKey}-${field}`}>
+                                      <label className={cx(fieldClass, 'min-w-0 text-xs')} key={`${limitKey}-${field}`}>
                                         <span>{label}</span>
                                         <input
                                           type="number"

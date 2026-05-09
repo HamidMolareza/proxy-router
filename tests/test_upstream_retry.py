@@ -1,15 +1,28 @@
+import errno
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from proxy_router.config import RouterConfigManager
-from proxy_router.proxy_server import retry_upstream_operation
+from proxy_router.proxy_server import retry_upstream_operation, should_retry_stream_setup_error
 from proxy_router.runtime import AppRuntime
 from proxy_router.util import normalize_router_config, proxy_allows_client
 
 
 class UpstreamRetryConfigTests(unittest.TestCase):
+    def test_direct_local_network_unreachable_is_not_retried(self):
+        route = {"action": "direct", "route_label": "direct"}
+        exc = OSError(errno.ENETUNREACH, "Network is unreachable")
+
+        self.assertFalse(should_retry_stream_setup_error(exc, route))
+
+    def test_proxy_network_unreachable_can_retry(self):
+        route = {"action": "proxy", "route_label": "proxy:socks5://127.0.0.1:8901"}
+        exc = OSError(errno.ENETUNREACH, "Network is unreachable")
+
+        self.assertTrue(should_retry_stream_setup_error(exc, route))
+
     def test_normalize_router_config_preserves_upstream_retry_policy(self):
         config = normalize_router_config(
             {
@@ -158,7 +171,7 @@ class UpstreamRetryConfigTests(unittest.TestCase):
         self.assertFalse(proxy_allows_client(config["proxies"][1], "192.168.1.50"))
         self.assertEqual(config["proxies"][0]["traffic_limit"]["max_past_week_mb"], 5000)
 
-    def test_private_proxy_allowed_clients_can_match_source_ip_for_authenticated_client(self):
+    def test_private_proxy_allows_loopback_without_allowed_clients(self):
         config = normalize_router_config(
             {
                 "proxies": [
@@ -169,7 +182,6 @@ class UpstreamRetryConfigTests(unittest.TestCase):
                         "host": "127.0.0.1",
                         "port": 9050,
                         "access_mode": "private",
-                        "allowed_clients": ["127.0.0.1"],
                     },
                 ],
                 "default_action": "proxy",
@@ -177,8 +189,11 @@ class UpstreamRetryConfigTests(unittest.TestCase):
         )
 
         proxy = config["proxies"][0]
+        self.assertEqual(proxy["allowed_clients"], [])
         self.assertTrue(proxy_allows_client(proxy, "127.0.0.1"))
+        self.assertTrue(proxy_allows_client(proxy, "localhost"))
         self.assertTrue(proxy_allows_client(proxy, "user:local-tool", client_ip="127.0.0.1"))
+        self.assertTrue(proxy_allows_client(proxy, "user:local-tool", client_ip="::1"))
         self.assertFalse(proxy_allows_client(proxy, "user:local-tool", client_ip="192.168.1.50"))
 
     def test_route_decision_filters_private_proxies_by_client_ip(self):
@@ -195,7 +210,6 @@ class UpstreamRetryConfigTests(unittest.TestCase):
                                 "host": "127.0.0.1",
                                 "port": 8080,
                                 "access_mode": "private",
-                                "allowed_clients": ["127.0.0.1"],
                             },
                         ],
                         "default_action": "proxy",

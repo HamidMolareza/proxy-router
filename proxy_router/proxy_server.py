@@ -61,6 +61,9 @@ def resolve_client_portal_user_identity(server, client: str | None, client_ip: s
 
 
 def is_retryable_upstream_error(exc: Exception) -> bool:
+    if isinstance(exc, UpstreamRequestSetupError):
+        return is_retryable_upstream_error(exc.original)
+
     if isinstance(exc, (TimeoutError, socket.timeout, socket.gaierror, ConnectionError, http.client.HTTPException)):
         return True
 
@@ -80,10 +83,32 @@ def is_retryable_upstream_error(exc: Exception) -> bool:
     return False
 
 
+def is_local_network_unreachable_error(exc: Exception) -> bool:
+    return isinstance(exc, OSError) and exc.errno in {errno.ENETDOWN, errno.ENETUNREACH}
+
+
+def should_retry_stream_setup_error(exc: Exception, route_decision) -> bool:
+    if (route_decision or {}).get("action") == "direct" and is_local_network_unreachable_error(exc):
+        return False
+    return is_retryable_upstream_error(exc)
+
+
 def can_retry_http_request(method: str, body) -> bool:
     if str(method or "").upper() in RETRYABLE_HTTP_METHODS:
         return True
     return body in {None, b""}
+
+
+class UpstreamRequestSetupError(Exception):
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+
+
+def should_retry_http_forward_error(method: str, body, exc: Exception) -> bool:
+    if isinstance(exc, UpstreamRequestSetupError):
+        return is_retryable_upstream_error(exc)
+    return can_retry_http_request(method, body) and is_retryable_upstream_error(exc)
 
 
 def is_loopback_client_ip(value) -> bool:
@@ -2152,20 +2177,44 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self._safe_send_error_response(response_code, message)
 
     def _open_routed_stream(self, host: str, port: int, route_decision, *, retry_metrics: dict | None = None):
-        def open_once(_attempt):
-            return self._open_routed_stream_once(host, port, route_decision)
+        route_attempts = [route_decision]
+        if route_decision.get("action") == "proxy":
+            route_attempts = [
+                self._route_with_selected_proxy(route_decision, proxy, failover_count=index)
+                for index, proxy in enumerate(self._available_proxy_candidates(route_decision))
+            ]
+            if not route_attempts:
+                raise OSError("no configured upstream proxy is available for this client or proxy quota")
 
-        return retry_upstream_operation(
-            open_once,
-            retry_policy=self.server.router_config.upstream_retry_settings(),
-            retry_metrics=retry_metrics,
-            on_retry=lambda attempt, attempts, delay, exc: self._debug(
-                "retrying upstream stream setup "
-                f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
-                f"target={host}:{port} route={route_decision['route_label']} error={exc}",
-                level="WARNING",
-            ),
-        )
+        last_error = None
+        for attempt_index, selected_route in enumerate(route_attempts):
+            try:
+                def open_once(_attempt):
+                    return self._open_routed_stream_once(host, port, selected_route)
+
+                upstream, upstream_owner = retry_upstream_operation(
+                    open_once,
+                    retry_policy=self.server.router_config.upstream_retry_settings(),
+                    retry_metrics=retry_metrics,
+                    should_retry=lambda exc: should_retry_stream_setup_error(exc, selected_route),
+                    on_retry=lambda attempt, attempts, delay, exc: self._debug(
+                        "retrying upstream stream setup "
+                        f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "
+                        f"target={host}:{port} route={selected_route['route_label']} error={exc}",
+                        level="WARNING",
+                    ),
+                )
+                return upstream, upstream_owner, selected_route
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= len(route_attempts) - 1 or not is_retryable_upstream_error(exc):
+                    raise
+                self._debug(
+                    "failing over to next upstream proxy "
+                    f"target={host}:{port} failed_route={selected_route['route_label']} error={exc}",
+                    level="WARNING",
+                )
+        raise last_error or OSError("upstream proxy selection failed")
 
     def _open_routed_stream_once(self, host: str, port: int, route_decision):
         connect_host = route_decision.get("connect_host", host)
@@ -2279,12 +2328,17 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             current_owner = None
             current_stream = None
             try:
-                raw_stream, current_owner = self._open_routed_stream(
+                opened_stream = self._open_routed_stream(
                     host,
                     port,
                     current_route_decision,
                     retry_metrics=upstream_metrics,
                 )
+                if len(opened_stream) == 2:
+                    raw_stream, current_owner = opened_stream
+                    selected_route = current_route_decision
+                else:
+                    raw_stream, current_owner, selected_route = opened_stream
                 current_stream = raw_stream
                 if scheme == "https":
                     current_stream = ssl.create_default_context().wrap_socket(raw_stream, server_hostname=host)
@@ -2292,16 +2346,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
                 self._debug(
                     "forwarding WebSocket upgrade "
-                    f"target={host}:{port} route={current_route_decision['route_label']} bytes={len(request_head)}"
+                    f"target={host}:{port} route={selected_route['route_label']} bytes={len(request_head)}"
                 )
                 current_stream.sendall(request_head)
                 head, remaining, code, reason_text, headers = read_http_response_head(current_stream)
                 self.server.runtime.record_upstream_route_success(
-                    current_route_decision,
+                    selected_route,
                     destination=f"{host}:{port}",
                     proxy_label=self.server.proxy_label,
                 )
-                return current_stream, current_owner, head, remaining, code, reason_text, headers
+                return current_stream, current_owner, selected_route, head, remaining, code, reason_text, headers
             except Exception:
                 for upstream_resource in (current_stream, current_owner):
                     if upstream_resource is None:
@@ -2317,6 +2371,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             (
                 upstream,
                 upstream_owner,
+                route_decision,
                 response_head,
                 leftover,
                 status_code,
@@ -2341,6 +2396,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 (
                     upstream,
                     upstream_owner,
+                    route_decision,
                     response_head,
                     leftover,
                     status_code,
@@ -2456,7 +2512,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         route_decision,
         retry_metrics: dict | None = None,
     ):
-        should_retry = lambda exc: can_retry_http_request(self.command, body) and is_retryable_upstream_error(exc)
+        should_retry = lambda exc: should_retry_http_forward_error(self.command, body, exc)
         route_attempts = [route_decision]
         if route_decision.get("action") == "proxy":
             route_attempts = [
@@ -2507,53 +2563,59 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         connect_host = route_decision.get("connect_host", host)
         connect_port = route_decision.get("connect_port", port)
         connection = None
-        if route_decision["action"] == "proxy":
-            upstream = route_decision["upstream"]
-            if upstream is None:
-                raise OSError("router selected proxy, but no upstream proxy is configured")
+        try:
+            if route_decision["action"] == "proxy":
+                upstream = route_decision["upstream"]
+                if upstream is None:
+                    raise OSError("router selected proxy, but no upstream proxy is configured")
 
-            if upstream["type"] == "http":
-                if scheme == "https":
-                    connection = http.client.HTTPSConnection(
+                if upstream["type"] == "http":
+                    if scheme == "https":
+                        connection = http.client.HTTPSConnection(
+                            upstream["host"],
+                            upstream["port"],
+                            context=ssl.create_default_context(),
+                            **connection_kwargs,
+                        )
+                        connection.set_tunnel(host, port)
+                        request_target = target_path
+                    else:
+                        connection = http.client.HTTPConnection(upstream["host"], upstream["port"], **connection_kwargs)
+                        authority = host if port == 80 else f"{host}:{port}"
+                        request_target = f"{scheme}://{authority}{target_path}"
+                else:
+                    upstream_socket = create_socks5_proxy_connection(
                         upstream["host"],
                         upstream["port"],
-                        context=ssl.create_default_context(),
-                        **connection_kwargs,
+                        host,
+                        port,
+                        self.server.timeout_seconds,
                     )
-                    connection.set_tunnel(host, port)
-                    request_target = target_path
-                else:
-                    connection = http.client.HTTPConnection(upstream["host"], upstream["port"], **connection_kwargs)
-                    authority = host if port == 80 else f"{host}:{port}"
-                    request_target = f"{scheme}://{authority}{target_path}"
+                    if scheme == "https":
+                        connection = PreconnectedHTTPSConnection(
+                            host,
+                            port=port,
+                            preconnected_socket=upstream_socket,
+                            timeout=self.server.timeout_seconds,
+                            context=ssl.create_default_context(),
+                        )
+                    else:
+                        connection = PreconnectedHTTPConnection(
+                            host,
+                            port=port,
+                            preconnected_socket=upstream_socket,
+                            timeout=self.server.timeout_seconds,
+                        )
+                connection.connect()
             else:
-                upstream_socket = create_socks5_proxy_connection(
-                    upstream["host"],
-                    upstream["port"],
-                    host,
-                    port,
-                    self.server.timeout_seconds,
-                )
+                connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
                 if scheme == "https":
-                    connection = PreconnectedHTTPSConnection(
-                        host,
-                        port=port,
-                        preconnected_socket=upstream_socket,
-                        timeout=self.server.timeout_seconds,
-                        context=ssl.create_default_context(),
-                    )
-                else:
-                    connection = PreconnectedHTTPConnection(
-                        host,
-                        port=port,
-                        preconnected_socket=upstream_socket,
-                        timeout=self.server.timeout_seconds,
-                    )
-        else:
-            connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-            if scheme == "https":
-                connection_kwargs["context"] = ssl.create_default_context()
-            connection = connection_class(connect_host, connect_port, **connection_kwargs)
+                    connection_kwargs["context"] = ssl.create_default_context()
+                connection = connection_class(connect_host, connect_port, **connection_kwargs)
+        except Exception as exc:
+            if connection is not None:
+                connection.close()
+            raise UpstreamRequestSetupError(exc) from exc
 
         upstream_started = time.monotonic()
         self._debug(
@@ -2873,6 +2935,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             )
 
     def _describe_upstream_error(self, exc: Exception) -> str:
+        if isinstance(exc, UpstreamRequestSetupError):
+            exc = exc.original
+
         if isinstance(exc, TimeoutError):
             return "Upstream connection timed out."
 
@@ -3599,6 +3664,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     open_once,
                     retry_policy=self.server.router_config.upstream_retry_settings(),
                     retry_metrics=retry_metrics,
+                    should_retry=lambda exc: should_retry_stream_setup_error(exc, selected_route),
                     on_retry=lambda attempt, attempts, delay, exc: self._debug(
                         "retrying upstream stream setup "
                         f"attempt={attempt + 1}/{attempts} delay={delay:.2f}s "

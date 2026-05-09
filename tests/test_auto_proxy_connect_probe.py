@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from proxy_router.constants import DEFAULT_ROUTING_PROFILE_ID
 import proxy_router.proxy_server as proxy_server
@@ -297,6 +298,261 @@ class AutoProxyConnectProbeTests(unittest.TestCase):
         self.assertIn("usage:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
         self.assertIn("auto-success:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
         self.assertNotIn("gateway-error", calls)
+
+    def test_raw_proxy_connect_failover_tries_next_candidate(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        calls = []
+        first_proxy = {
+            "id": "first",
+            "enabled": True,
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": 8901,
+            "access_mode": "public",
+        }
+        second_proxy = {
+            "id": "second",
+            "enabled": True,
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": 8902,
+            "access_mode": "public",
+        }
+        route = {
+            "host": "example.com",
+            "action": "proxy",
+            "matched_rule": None,
+            "upstream": first_proxy,
+            "upstream_candidates": [first_proxy, second_proxy],
+            "profile_id": DEFAULT_ROUTING_PROFILE_ID,
+            "profile_name": "Shared",
+            "route_label": "proxy:socks5://127.0.0.1:8901",
+        }
+
+        class FakeSocket:
+            pass
+
+        def open_once(_host, _port, selected_route):
+            proxy_id = selected_route["upstream"]["id"]
+            calls.append(proxy_id)
+            if proxy_id == "first":
+                raise ConnectionRefusedError("first proxy refused")
+            return FakeSocket(), None
+
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.server = SimpleNamespace(
+            router_config=SimpleNamespace(
+                upstream_retry_settings=lambda: {
+                    "enabled": False,
+                    "attempts": 1,
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 1,
+                }
+            ),
+            runtime=SimpleNamespace(
+                traffic_quota_manager=SimpleNamespace(proxy_allowed=lambda *_args, **_kwargs: True),
+            ),
+        )
+        handler._client_id = lambda: "192.168.1.23"
+        handler._debug = lambda *_args, **_kwargs: None
+        handler._open_routed_stream_once = open_once
+
+        upstream, upstream_owner, selected_route = handler._open_routed_stream("example.com", 443, route)
+
+        self.assertIsInstance(upstream, FakeSocket)
+        self.assertIsNone(upstream_owner)
+        self.assertEqual(selected_route["upstream"]["id"], "second")
+        self.assertEqual(selected_route["proxy_failover_count"], 1)
+        self.assertEqual(calls, ["first", "second"])
+
+    def test_http_post_setup_failure_can_failover_to_next_candidate(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        calls = []
+        first_proxy = {
+            "id": "first",
+            "enabled": True,
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": 8901,
+            "access_mode": "public",
+        }
+        second_proxy = {
+            "id": "second",
+            "enabled": True,
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": 8902,
+            "access_mode": "public",
+        }
+        route = {
+            "host": "example.com",
+            "action": "proxy",
+            "matched_rule": None,
+            "upstream": first_proxy,
+            "upstream_candidates": [first_proxy, second_proxy],
+            "profile_id": DEFAULT_ROUTING_PROFILE_ID,
+            "profile_name": "Shared",
+            "route_label": "proxy:socks5://127.0.0.1:8901",
+        }
+
+        class FakeResponse:
+            status = 200
+
+        class FakeConnection:
+            pass
+
+        def perform_once(_scheme, _host, _port, _target_path, _body, _headers, *, route_decision):
+            proxy_id = route_decision["upstream"]["id"]
+            calls.append(proxy_id)
+            if proxy_id == "first":
+                raise proxy_server.UpstreamRequestSetupError(ConnectionRefusedError("first proxy refused"))
+            return FakeConnection(), FakeResponse()
+
+        handler.command = "POST"
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.server = SimpleNamespace(
+            router_config=SimpleNamespace(
+                upstream_retry_settings=lambda: {
+                    "enabled": False,
+                    "attempts": 1,
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 1,
+                }
+            ),
+            runtime=SimpleNamespace(
+                traffic_quota_manager=SimpleNamespace(proxy_allowed=lambda *_args, **_kwargs: True),
+            ),
+        )
+        handler._client_id = lambda: "192.168.1.23"
+        handler._debug = lambda *_args, **_kwargs: None
+        handler._perform_upstream_request_once = perform_once
+
+        connection, response, selected_route = handler._perform_upstream_request(
+            "https",
+            "example.com",
+            443,
+            "/submit",
+            b'{"payload": true}',
+            {},
+            route_decision=route,
+        )
+
+        self.assertIsInstance(connection, FakeConnection)
+        self.assertIsInstance(response, FakeResponse)
+        self.assertEqual(selected_route["upstream"]["id"], "second")
+        self.assertEqual(selected_route["proxy_failover_count"], 1)
+        self.assertEqual(calls, ["first", "second"])
+
+    def test_https_post_http_proxy_connect_failure_can_failover_to_next_candidate(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        calls = []
+        first_proxy = {
+            "id": "first",
+            "enabled": True,
+            "type": "http",
+            "host": "127.0.0.1",
+            "port": 8901,
+            "access_mode": "public",
+        }
+        second_proxy = {
+            "id": "second",
+            "enabled": True,
+            "type": "http",
+            "host": "127.0.0.1",
+            "port": 8902,
+            "access_mode": "public",
+        }
+        route = {
+            "host": "example.com",
+            "action": "proxy",
+            "matched_rule": None,
+            "upstream": first_proxy,
+            "upstream_candidates": [first_proxy, second_proxy],
+            "profile_id": DEFAULT_ROUTING_PROFILE_ID,
+            "profile_name": "Shared",
+            "route_label": "proxy:http://127.0.0.1:8901",
+        }
+
+        class FakeResponse:
+            status = 200
+            reason = "OK"
+            headers = {}
+
+        class FakeHttpsConnection:
+            def __init__(self, host, port, **_kwargs):
+                self.host = host
+                self.port = port
+                self.closed = False
+
+            def set_tunnel(self, host, port):
+                calls.append(f"tunnel:{self.port}:{host}:{port}")
+
+            def connect(self):
+                calls.append(f"connect:{self.port}")
+                if self.port == 8901:
+                    raise ConnectionRefusedError("first proxy refused")
+
+            def request(self, method, target, body=None, headers=None):
+                calls.append(f"request:{self.port}:{method}:{target}:{body!r}")
+
+            def getresponse(self):
+                calls.append(f"response:{self.port}")
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+                calls.append(f"close:{self.port}")
+
+        handler.command = "POST"
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.server = SimpleNamespace(
+            proxy_label="http",
+            timeout_seconds=1,
+            router_config=SimpleNamespace(
+                upstream_retry_settings=lambda: {
+                    "enabled": False,
+                    "attempts": 1,
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 1,
+                }
+            ),
+            runtime=SimpleNamespace(
+                traffic_quota_manager=SimpleNamespace(proxy_allowed=lambda *_args, **_kwargs: True),
+                record_upstream_route_success=lambda *_args, **_kwargs: calls.append("route-success"),
+            ),
+        )
+        handler._client_id = lambda: "192.168.1.23"
+        handler._debug = lambda *_args, **_kwargs: None
+
+        with patch("proxy_router.proxy_server.http.client.HTTPSConnection", FakeHttpsConnection):
+            connection, response, selected_route = handler._perform_upstream_request(
+                "https",
+                "example.com",
+                443,
+                "/submit",
+                b'{"payload": true}',
+                {},
+                route_decision=route,
+            )
+
+        self.assertIsInstance(connection, FakeHttpsConnection)
+        self.assertIsInstance(response, FakeResponse)
+        self.assertEqual(selected_route["upstream"]["id"], "second")
+        self.assertEqual(selected_route["proxy_failover_count"], 1)
+        self.assertEqual(
+            calls,
+            [
+                "tunnel:8901:example.com:443",
+                "connect:8901",
+                "close:8901",
+                "tunnel:8902:example.com:443",
+                "connect:8902",
+                "request:8902:POST:/submit:b'{\"payload\": true}'",
+                "response:8902",
+                "route-success",
+            ],
+        )
+
 
 
 if __name__ == "__main__":
