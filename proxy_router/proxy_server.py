@@ -3162,14 +3162,14 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             self._set_client_identity(self._anonymous_client_identity())
             return True
 
-        if SOCKS_AUTH_USERNAME_PASSWORD in methods_set:
-            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_USERNAME_PASSWORD]))
-            return self._authenticate_username_password()
-
         if settings.get("allow_anonymous", True) and SOCKS_AUTH_NO_AUTH in methods_set:
             self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH]))
             self._set_client_identity(self._anonymous_client_identity())
             return True
+
+        if SOCKS_AUTH_USERNAME_PASSWORD in methods_set:
+            self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_USERNAME_PASSWORD]))
+            return self._authenticate_username_password()
 
         self.request.sendall(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
         return False
@@ -3522,12 +3522,34 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             upstream_setup_ms = None
             try:
                 upstream_setup_started = time.monotonic()
-                opened_stream = self._open_routed_stream(
-                    destination_host,
-                    destination_port,
-                    route_decision,
-                    retry_metrics=upstream_metrics,
-                )
+                try:
+                    opened_stream = self._open_routed_stream(
+                        destination_host,
+                        destination_port,
+                        route_decision,
+                        retry_metrics=upstream_metrics,
+                    )
+                except Exception as exc:
+                    probe_route = self._build_auto_proxy_direct_failure_probe_route(
+                        destination_host,
+                        route_decision,
+                        exc,
+                    )
+                    if probe_route is None:
+                        raise
+                    self._debug(
+                        "retrying failed direct SOCKS5 CONNECT through auto-proxy probe "
+                        f"target={destination_host}:{destination_port} "
+                        f"route={probe_route['route_label']} direct_error={exc}",
+                        level="WARNING",
+                    )
+                    route_decision = probe_route
+                    opened_stream = self._open_routed_stream(
+                        destination_host,
+                        destination_port,
+                        route_decision,
+                        retry_metrics=upstream_metrics,
+                    )
                 if len(opened_stream) == 2:
                     upstream, upstream_owner = opened_stream
                 else:
@@ -3636,6 +3658,22 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 client_ip,
                 client=getattr(self, "_dashboard_client_id", client_ip),
             )
+
+    def _build_auto_proxy_direct_failure_probe_route(self, host: str, route_decision, exc: Exception):
+        if route_decision is None:
+            return None
+        if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        if route_decision.get("auto_proxy_probe"):
+            return None
+        if route_decision.get("upstream") is None:
+            return None
+        if not is_retryable_upstream_error(exc):
+            return None
+        builder = getattr(self.server.runtime, "build_auto_proxy_direct_failure_probe_route", None)
+        if builder is None:
+            return None
+        return builder(host, route_decision)
 
     def _open_routed_stream(
         self,

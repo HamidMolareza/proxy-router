@@ -274,6 +274,31 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(raw_body.decode("utf-8"))
 
+    def _bearer_token(self):
+        header = str(self.headers.get("Authorization") or "").strip()
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return ""
+        return token.strip()
+
+    def _require_admin_api_token(self) -> bool:
+        if not self.server.router_config.admin_api_requires_auth():
+            return True
+        if self.server.router_config.verify_admin_api_token(
+            self._bearer_token(),
+            client_ip=self.client_address[0] if self.client_address else None,
+        ):
+            return True
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("WWW-Authenticate", 'Bearer realm="proxy-router-admin"')
+        body = b'{"error": "admin API token is required"}'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def _is_websocket_upgrade(self) -> bool:
         upgrade = str(self.headers.get("Upgrade") or "").strip().lower()
         connection = str(self.headers.get("Connection") or "").strip().lower()
@@ -362,8 +387,56 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if route_path in {"/api/history/requests", "/api/history/requests.json"}:
+            query = parse_qs(parsed.query)
+
+            def parse_optional_int(key):
+                value = first_query_value(query, key)
+                try:
+                    return int(value) if value not in {None, ""} else None
+                except ValueError:
+                    return None
+
+            payload = self.server.history_cache.query_records(
+                client=normalize_history_filter(first_query_value(query, "client")),
+                client_ip=normalize_history_filter(first_query_value(query, "client_ip")),
+                proxy_type=normalize_history_filter(first_query_value(query, "proxy_type")),
+                upstream_proxy_id=normalize_history_filter(first_query_value(query, "upstream_proxy_id")),
+                route_label=normalize_history_filter(first_query_value(query, "route_label")),
+                host=first_query_value(query, "host"),
+                method=normalize_history_filter(first_query_value(query, "method")),
+                status_code=first_query_value(query, "status_code"),
+                search=first_query_value(query, "search"),
+                sort=first_query_value(query, "sort"),
+                direction=first_query_value(query, "direction"),
+                page=parse_optional_int("page"),
+                page_size=parse_optional_int("page_size"),
+                max_results=parse_optional_int("max_results"),
+            )
+            self._send_json(payload)
+            return
+
         if route_path in {"/api/router-config", "/api/router-config.json"}:
-            self._send_json(self.server.router_config.snapshot())
+            self._send_json(self.server.router_config.public_snapshot())
+            return
+
+        if route_path in {"/api/admin-api/status", "/api/admin-api/status.json"}:
+            self._send_json(self.server.router_config.admin_api_status())
+            return
+
+        if route_path in {"/api/routing/decide", "/api/routing/decide.json"}:
+            query = parse_qs(parsed.query)
+            host = first_query_value(query, "host")
+            if not host:
+                self._send_json({"error": "host is required"}, status=400)
+                return
+            self._send_json(
+                self.server.router_config.decide(
+                    host,
+                    client_id=first_query_value(query, "client_id"),
+                    client_ip=first_query_value(query, "client_ip"),
+                )
+            )
             return
 
         if route_path in {"/api/rule-suggestions", "/api/rule-suggestions.json"}:
@@ -440,7 +513,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 "endpoints": [
                     "/api/dashboard",
                     "/api/history",
+                    "/api/history/requests",
                     "/api/router-config",
+                    "/api/router-config/preview",
+                    "/api/admin-api/status",
+                    "/api/admin-api/tokens",
+                    "/api/routing/decide",
                     "/api/rule-suggestions",
                     "/api/rule-suggestions/clear",
                     "/api/https-interception/status",
@@ -460,6 +538,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         route_path = parsed.path
 
         if route_path in {"/api/traffic-data/clear", "/api/traffic-data/clear.json"}:
+            if not self._require_admin_api_token():
+                return
             try:
                 self.server.runtime.clear_traffic_data()
                 self.server.history_cache.clear()
@@ -481,6 +561,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route_path in {"/api/rule-suggestions/clear", "/api/rule-suggestions/clear.json"}:
+            if not self._require_admin_api_token():
+                return
             manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
             if manager is None:
                 self._send_json({"error": "rule suggestions are unavailable"}, status=503)
@@ -523,9 +605,51 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if route_path in {"/api/router-config/preview", "/api/router-config/preview.json"}:
+            try:
+                payload = self._read_json_body()
+                result = self.server.router_config.preview_update(payload)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc), "issues": []}, status=400)
+                return
+            except json.JSONDecodeError as exc:
+                self._send_json({"ok": False, "error": f"invalid JSON body: {exc.msg}", "issues": []}, status=400)
+                return
+            self._send_json(result, status=200 if result.get("ok") else 409)
+            return
+
+        if route_path in {"/api/admin-api/tokens", "/api/admin-api/tokens.json"}:
+            if self.server.router_config.admin_api_requires_auth() and not self._require_admin_api_token():
+                return
+            try:
+                payload = self._read_json_body() if self.headers.get("Content-Length") else {}
+                self._send_json(
+                    self.server.router_config.create_admin_api_token((payload or {}).get("name")),
+                    status=201,
+                )
+            except (ValueError, json.JSONDecodeError) as exc:
+                message = f"invalid JSON body: {exc.msg}" if isinstance(exc, json.JSONDecodeError) else str(exc)
+                self._send_json({"error": message}, status=400)
+            return
+
+        if route_path.startswith("/api/admin-api/tokens/") and route_path.endswith("/delete"):
+            if not self._require_admin_api_token():
+                return
+            parts = [part for part in route_path.split("/") if part]
+            if len(parts) != 5 or parts[:3] != ["api", "admin-api", "tokens"]:
+                self.send_error(404, "Not Found")
+                return
+            try:
+                self._send_json({"ok": True, "status": self.server.router_config.delete_admin_api_token(parts[3])})
+            except KeyError:
+                self._send_json({"error": "admin API token not found"}, status=404)
+            return
+
         if route_path.startswith("/api/rule-suggestions/") and (
             route_path.endswith("/approve") or route_path.endswith("/reject")
         ):
+            if not self._require_admin_api_token():
+                return
             manager = getattr(self.server.runtime, "rule_suggestion_manager", None)
             if manager is None:
                 self._send_json({"error": "rule suggestions are unavailable"}, status=503)
@@ -589,6 +713,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if route_path not in {"/api/router-config", "/api/router-config.json"}:
             self.send_error(404, "Not Found")
+            return
+
+        if not self._require_admin_api_token():
             return
 
         try:

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from proxy_router.constants import DEFAULT_ROUTING_PROFILE_ID
 import proxy_router.proxy_server as proxy_server
-from proxy_router.proxy_server import ProxyRequestHandler
+from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler
 
 
 class RouteConfig:
@@ -553,6 +553,118 @@ class AutoProxyConnectProbeTests(unittest.TestCase):
             ],
         )
 
+    def test_socks5_direct_connect_failure_retries_auto_proxy_probe(self):
+        handler = Socks5RequestHandler.__new__(Socks5RequestHandler)
+        calls = []
+        route = {
+            "host": "example.com",
+            "action": "direct",
+            "matched_rule": None,
+            "upstream": {"enabled": True, "type": "socks5", "host": "127.0.0.1", "port": 8901},
+            "profile_id": DEFAULT_ROUTING_PROFILE_ID,
+            "profile_name": "Shared",
+            "route_label": "direct",
+        }
+        probe_route = dict(route)
+        probe_route["action"] = "proxy"
+        probe_route["route_label"] = "proxy:auto-probe:socks5://127.0.0.1:8901"
+        probe_route["auto_proxy_probe"] = True
+
+        class FakeClientSocket:
+            def __init__(self):
+                self.input = bytearray(
+                    b"\x05\x01\x00"
+                    b"\x05\x01\x00\x03\x0bexample.com\x01\xbb"
+                )
+                self.output = bytearray()
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recv(self, size):
+                chunk = self.input[:size]
+                del self.input[:size]
+                return bytes(chunk)
+
+            def sendall(self, data):
+                self.output.extend(data)
+
+        class FakeUpstream:
+            def getsockname(self):
+                return ("127.0.0.1", 40000)
+
+            def close(self):
+                calls.append("upstream-close")
+
+        def open_routed_stream(_host, _port, selected_route, **_kwargs):
+            calls.append(f"open:{selected_route['route_label']}")
+            if selected_route["route_label"] == "direct":
+                raise ConnectionRefusedError("direct refused")
+            return FakeUpstream(), None, selected_route
+
+        fake_client = FakeClientSocket()
+        handler.request = fake_client
+        handler.client_address = ("192.168.1.38", 50000)
+        handler.server = SimpleNamespace(
+            proxy_label="socks5",
+            debug=False,
+            timeout_seconds=1,
+            allowed_networks=[],
+            client_tracker=SimpleNamespace(
+                connected=lambda *_args, **_kwargs: calls.append("client-connected"),
+                disconnected=lambda *_args, **_kwargs: calls.append("client-disconnected"),
+                reidentified=lambda *_args, **_kwargs: None,
+            ),
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {"enabled": False},
+                find_client_block=lambda *_args, **_kwargs: None,
+                decide=lambda *_args, **_kwargs: route,
+                upstream_retry_settings=lambda: {
+                    "enabled": False,
+                    "attempts": 1,
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 1,
+                },
+            ),
+            runtime=SimpleNamespace(
+                self_endpoints=SimpleNamespace(
+                    is_client_portal_host=lambda *_args, **_kwargs: False,
+                    resolve_target_kind=lambda *_args, **_kwargs: None,
+                ),
+                traffic_quota_manager=SimpleNamespace(
+                    evaluate_client=lambda *_args, **_kwargs: {"allowed": True},
+                    proxy_allowed=lambda *_args, **_kwargs: True,
+                ),
+                apply_auto_proxy_probe_route=lambda _host, selected_route: selected_route,
+                build_auto_proxy_direct_failure_probe_route=lambda *_args: probe_route,
+                observe_https_connect=lambda *_args, **_kwargs: calls.append("observe"),
+                record_upstream_route_success=lambda *_args, **_kwargs: calls.append("route-success"),
+                record_usage=lambda **kwargs: calls.append(f"usage:{kwargs['route_label']}"),
+                record_auto_proxy_success=lambda _host, selected_route: calls.append(
+                    f"auto-success:{selected_route['route_label']}"
+                ),
+            ),
+        )
+        handler._open_routed_stream = open_routed_stream
+        handler._debug = lambda *_args, **_kwargs: None
+        handler._log = lambda *_args, **_kwargs: None
+
+        original_tunnel = proxy_server.tunnel_bidirectional
+        proxy_server.tunnel_bidirectional = lambda *_args, **_kwargs: {
+            "left_to_right_bytes": 128,
+            "right_to_left_bytes": 256,
+        }
+        try:
+            handler.handle()
+        finally:
+            proxy_server.tunnel_bidirectional = original_tunnel
+
+        self.assertIn("open:direct", calls)
+        self.assertIn("open:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertIn("usage:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertIn("auto-success:proxy:auto-probe:socks5://127.0.0.1:8901", calls)
+        self.assertIn("client-disconnected", calls)
+        self.assertEqual(fake_client.output[:2], b"\x05\x00")
 
 
 if __name__ == "__main__":

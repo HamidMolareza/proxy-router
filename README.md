@@ -104,7 +104,7 @@ Persisted backend files:
 - `./data/https-traffic.log`
 - `./data/error.log`
 
-`usage.log` records transfer totals plus optional performance fields such as `duration_ms`, `upstream_setup_ms`, `relay_ms`, `throughput_bps`, upstream retry counts, and selected upstream proxy metadata such as `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`. Older records without these fields still load normally; they count toward traffic totals but not duration, throughput, or per-upstream samples.
+`usage.log` records transfer totals plus optional performance fields such as `duration_ms`, `upstream_setup_ms`, `relay_ms`, `throughput_bps`, upstream retry counts, and selected upstream proxy metadata such as `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`. Older records without these fields still load normally; they count toward traffic totals but not duration, throughput, or per-upstream samples. `GET /api/history/requests` exposes a bounded, filterable request-history view over this log for admin tools and MCP clients.
 
 On startup, the backend rebuilds dashboard totals, recent requests, recent failures, HTTPS traffic analysis, quota history, and auto-proxy state from these persisted files.
 
@@ -186,15 +186,18 @@ Client self-service portal:
 - This portal is separate from the admin dashboard and does not expose direct routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens
 - The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP; `proxy.router` pages open the socket against the direct listener address to avoid browser-specific WebSocket proxy handling
+- The admin dashboard can create Bearer PATs for admin API writes, including MCP-driven routing-rule changes. Newly created tokens are shown once and stored only as hashes in `router-config.json`.
 
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
+- Admin clients can query request-history rows through `/api/history/requests` with client, host, route, upstream proxy, status, search, sort, and paging filters
 - Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
 - Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
+- Proxy definitions live in the `Proxies` tab; the `Routing` tab uses those proxies through default actions, rule `proxy_id` pins, priority, and access policy.
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
@@ -207,6 +210,7 @@ Current dashboard behaviors:
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
 - Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
+- Admin API tokens protect dashboard/API write endpoints after the first token is created. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
 - The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
 - Approving a suggestion keeps the same rule validation as manual edits, so still-conflicting suggestions must be resolved before approval succeeds.
 - `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.
@@ -237,7 +241,7 @@ Diagnosis tips:
 
 ## Quotas
 
-- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
+- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally; SOCKS5 clients that offer both no-auth and username/password are accepted as anonymous. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
 - The `Users` tab merges configured auth users with client identities/IPs seen in recorded traffic or failures, so you can block the exact client from the same list.
 - The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import shutil
 import socket
 import struct
@@ -664,6 +665,48 @@ class RouterConfigManager:
         self.config_file.write_text(json.dumps(normalized_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._config = normalized_config
 
+    def _public_config_locked(self):
+        config = json.loads(json.dumps(self._config))
+        admin_api = config.get("admin_api") or {}
+        public_tokens = []
+        for token in admin_api.get("tokens") or []:
+            public_tokens.append(
+                {
+                    "id": token.get("id"),
+                    "name": token.get("name"),
+                    "enabled": bool(token.get("enabled", True)),
+                    "created_at": token.get("created_at"),
+                    "last_used_at": token.get("last_used_at"),
+                    "last_used_by": token.get("last_used_by"),
+                }
+            )
+        config["admin_api"] = {
+            "enabled": bool(admin_api.get("enabled", False)),
+            "tokens": public_tokens,
+        }
+        return config
+
+    def _payload_has_admin_api_secrets(self, payload) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        admin_api = payload.get("admin_api")
+        if not isinstance(admin_api, dict):
+            return False
+        for token in admin_api.get("tokens") or []:
+            if not isinstance(token, dict):
+                continue
+            if str(token.get("token") or "").strip() or str(token.get("token_hash") or "").strip():
+                return True
+        return False
+
+    def _merge_existing_admin_api_if_needed(self, payload):
+        if not isinstance(payload, dict) or self._payload_has_admin_api_secrets(payload):
+            return payload
+        merged = json.loads(json.dumps(payload))
+        with self._lock:
+            merged["admin_api"] = json.loads(json.dumps(self._config.get("admin_api", default_router_config()["admin_api"])))
+        return merged
+
     def _prune_expired_rules_locked(self) -> bool:
         now = datetime.now().astimezone()
         expired_found = False
@@ -813,6 +856,11 @@ class RouterConfigManager:
             self._prune_expired_rules_locked()
             return json.loads(json.dumps(self._config))
 
+    def public_snapshot(self):
+        with self._lock:
+            self._prune_expired_rules_locked()
+            return self._public_config_locked()
+
     def runtime_snapshot(self):
         network_state = self._network_monitor.snapshot()
         with self._lock:
@@ -902,6 +950,7 @@ class RouterConfigManager:
         return saved
 
     def update(self, payload):
+        payload = self._merge_existing_admin_api_if_needed(payload)
         normalized = normalize_router_config(payload)
         validate_router_rule_issues(normalized)
         with self._lock:
@@ -909,6 +958,110 @@ class RouterConfigManager:
             saved = json.loads(json.dumps(self._config))
         self._notify_change("router-config")
         return saved
+
+    def preview_update(self, payload):
+        payload = self._merge_existing_admin_api_if_needed(payload)
+        normalized = normalize_router_config(payload)
+        issues = find_router_rule_issues(normalized)
+        return {
+            "ok": not bool(issues),
+            "router_config": normalized,
+            "issues": issues,
+        }
+
+    def admin_api_status(self) -> dict:
+        with self._lock:
+            self._prune_expired_rules_locked()
+            config = self._public_config_locked().get("admin_api") or {}
+            active_count = len([token for token in config.get("tokens") or [] if token.get("enabled", True)])
+            return {
+                "enabled": bool(config.get("enabled", False)),
+                "requires_auth": bool(config.get("enabled", False) and active_count),
+                "active_token_count": active_count,
+                "tokens": config.get("tokens") or [],
+            }
+
+    def admin_api_requires_auth(self) -> bool:
+        status = self.admin_api_status()
+        return bool(status.get("requires_auth"))
+
+    def verify_admin_api_token(self, token: str | None, *, client_ip: str | None = None) -> bool:
+        token_text = str(token or "").strip()
+        if not token_text:
+            return False
+        now_text = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self._lock:
+            config = json.loads(json.dumps(self._config))
+            admin_api = config.get("admin_api") or {}
+            if not admin_api.get("enabled", False):
+                return True
+            changed = False
+            for item in admin_api.get("tokens") or []:
+                if not item.get("enabled", True):
+                    continue
+                if verify_client_auth_password(token_text, item.get("token_hash")):
+                    item["last_used_at"] = now_text
+                    item["last_used_by"] = str(client_ip or "").strip() or None
+                    changed = True
+                    break
+            else:
+                return False
+            if changed:
+                normalized = normalize_router_config(config)
+                self._write_config_locked(normalized)
+        if changed:
+            self._notify_change("router-config")
+        return True
+
+    def create_admin_api_token(self, name: str | None = None) -> dict:
+        token_text = secrets.token_urlsafe(32)
+        now_text = datetime.now().astimezone().isoformat(timespec="seconds")
+        token_record = {
+            "id": uuid.uuid4().hex,
+            "name": str(name or "MCP token").strip() or "MCP token",
+            "token": token_text,
+            "enabled": True,
+            "created_at": now_text,
+            "last_used_at": None,
+            "last_used_by": None,
+        }
+        with self._lock:
+            config = json.loads(json.dumps(self._config))
+            admin_api = config.setdefault("admin_api", {"enabled": True, "tokens": []})
+            admin_api["enabled"] = True
+            admin_api.setdefault("tokens", []).append(token_record)
+            normalized = normalize_router_config(config)
+            self._write_config_locked(normalized)
+            public_token = next(
+                item
+                for item in self._public_config_locked()["admin_api"]["tokens"]
+                if item["id"] == token_record["id"]
+            )
+        self._notify_change("router-config")
+        return {
+            "token": token_text,
+            "record": public_token,
+            "status": self.admin_api_status(),
+        }
+
+    def delete_admin_api_token(self, token_id: str) -> dict:
+        normalized_id = str(token_id or "").strip()
+        if not normalized_id:
+            raise KeyError(normalized_id)
+        with self._lock:
+            config = json.loads(json.dumps(self._config))
+            admin_api = config.get("admin_api") or {}
+            before = len(admin_api.get("tokens") or [])
+            admin_api["tokens"] = [
+                token for token in admin_api.get("tokens") or [] if str(token.get("id") or "") != normalized_id
+            ]
+            if len(admin_api["tokens"]) == before:
+                raise KeyError(normalized_id)
+            config["admin_api"] = admin_api
+            normalized = normalize_router_config(config)
+            self._write_config_locked(normalized)
+        self._notify_change("router-config")
+        return self.admin_api_status()
 
     def change_client_auth_password(self, username: str, *, current_password: str, new_password: str) -> dict:
         normalized_username = normalize_client_auth_username(username)

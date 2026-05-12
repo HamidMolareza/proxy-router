@@ -146,8 +146,14 @@ Important routes:
 
 - `GET /api/dashboard`
 - `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
+- `GET /api/history/requests` with optional `client`, `client_ip`, `proxy_type`, `upstream_proxy_id`, `route_label`, `host`, `method`, `status_code`, `search`, `sort`, `direction`, `page`, `page_size`, and `max_results` query parameters
 - `GET /api/router-config`
 - `POST /api/router-config`
+- `POST /api/router-config/preview`
+- `GET /api/admin-api/status`
+- `POST /api/admin-api/tokens`
+- `POST /api/admin-api/tokens/{id}/delete`
+- `GET /api/routing/decide` with `host`, optional `client_id`, and optional `client_ip`
 - `POST /api/proxies/check`
 - `GET /api/https-interception/status`
 - `GET /api/https-interception/ca.crt`
@@ -155,6 +161,12 @@ Important routes:
 - `GET /api/https-traffic/{id}` for one captured request/response record
 - `GET /api/failures`
 - `POST /api/traffic-data/clear`
+
+History API notes:
+
+- `/api/history` returns aggregate summaries and period buckets for dashboard charts.
+- `/api/history/requests` returns summarized request rows from `usage.log`; it filters before sorting, applies `max_results` before paging, and clamps page sizes to keep MCP and dashboard callers bounded.
+- `/api/https-traffic` is separate from request history because it reads intercepted HTTPS analyzer records with request/response metadata from `https-traffic.log`.
 
 ### Device Portal
 

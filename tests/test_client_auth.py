@@ -6,7 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import proxy_router.proxy_server as proxy_server
-from proxy_router.constants import SOCKS_AUTH_NO_ACCEPTABLE, SOCKS_AUTH_NO_AUTH, SOCKS_VERSION
+from proxy_router.constants import (
+    SOCKS_AUTH_NO_ACCEPTABLE,
+    SOCKS_AUTH_NO_AUTH,
+    SOCKS_AUTH_USERNAME_PASSWORD,
+    SOCKS_VERSION,
+)
 from proxy_router.config import RouterConfigManager
 from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler, is_loopback_client_ip
 from proxy_router.util import (
@@ -395,6 +400,34 @@ class ClientAuthTests(unittest.TestCase):
 
         self.assertFalse(handler._negotiate_authentication(bytes([SOCKS_AUTH_NO_AUTH])))
         self.assertEqual(writes, [bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE])])
+
+    def test_remote_socks_client_prefers_no_auth_when_anonymous_allowed(self):
+        writes = []
+        handler = Socks5RequestHandler.__new__(Socks5RequestHandler)
+        handler.client_address = ("192.168.1.23", 50000)
+        handler.request = SimpleNamespace(sendall=lambda data: writes.append(data))
+        handler.server = SimpleNamespace(
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {
+                    "enabled": True,
+                    "allow_anonymous": True,
+                    "credentials": [
+                        {
+                            "enabled": True,
+                            "username": "phone",
+                            "password_hash": hash_client_auth_password("secret"),
+                        }
+                    ],
+                }
+            ),
+            client_tracker=SimpleNamespace(reidentified=lambda *_args, **_kwargs: None),
+        )
+
+        self.assertTrue(
+            handler._negotiate_authentication(bytes([SOCKS_AUTH_NO_AUTH, SOCKS_AUTH_USERNAME_PASSWORD]))
+        )
+        self.assertEqual(writes, [bytes([SOCKS_VERSION, SOCKS_AUTH_NO_AUTH])])
+        self.assertEqual(handler._client_identity()["auth_type"], "anonymous")
 
     def test_client_portal_keeps_inherited_socks_identity(self):
         handler = ProxyRequestHandler.__new__(ProxyRequestHandler)

@@ -1243,6 +1243,10 @@ def default_router_config():
             "realm": DEFAULT_CLIENT_AUTH_REALM,
             "credentials": [],
         },
+        "admin_api": {
+            "enabled": False,
+            "tokens": [],
+        },
         "client_blocks": [],
         "client_traffic_limits": [],
         "client_traffic_exemptions": [],
@@ -1435,6 +1439,12 @@ def normalize_router_config(payload):
     if not isinstance(client_auth_payload, dict):
         raise ValueError("router client_auth must be an object")
 
+    admin_api_payload = payload.get("admin_api") or {}
+    if admin_api_payload is None:
+        admin_api_payload = {}
+    if not isinstance(admin_api_payload, dict):
+        raise ValueError("router admin_api must be an object")
+
     client_traffic_limits_payload = payload.get("client_traffic_limits") or []
     if not isinstance(client_traffic_limits_payload, list):
         raise ValueError("router client_traffic_limits must be an array")
@@ -1591,6 +1601,40 @@ def normalize_router_config(payload):
                 "password_hash": password_hash,
                 "label": str(credential_payload.get("label", "")).strip(),
                 "enabled": bool(credential_payload.get("enabled", True)),
+            }
+        )
+
+    admin_api_tokens_payload = admin_api_payload.get("tokens") or []
+    if not isinstance(admin_api_tokens_payload, list):
+        raise ValueError("router admin_api tokens must be an array")
+
+    normalized_admin_api_tokens = []
+    seen_admin_api_token_ids = set()
+    for index, token_payload in enumerate(admin_api_tokens_payload, start=1):
+        if not isinstance(token_payload, dict):
+            raise ValueError(f"router admin_api token #{index} must be an object")
+        token_id = str(token_payload.get("id") or "").strip() or uuid.uuid4().hex
+        if token_id in seen_admin_api_token_ids:
+            raise ValueError(f"router admin_api token #{index} uses duplicate id '{token_id}'")
+        seen_admin_api_token_ids.add(token_id)
+
+        token_text = token_payload.get("token")
+        if token_text is not None and str(token_text):
+            token_hash = hash_client_auth_password(str(token_text))
+        else:
+            token_hash = normalize_client_auth_password_hash(token_payload.get("token_hash"))
+        if not token_hash:
+            continue
+
+        normalized_admin_api_tokens.append(
+            {
+                "id": token_id,
+                "name": str(token_payload.get("name") or f"Token {index}").strip() or f"Token {index}",
+                "token_hash": token_hash,
+                "enabled": bool(token_payload.get("enabled", True)),
+                "created_at": str(token_payload.get("created_at") or "").strip(),
+                "last_used_at": str(token_payload.get("last_used_at") or "").strip() or None,
+                "last_used_by": str(token_payload.get("last_used_by") or "").strip() or None,
             }
         )
 
@@ -1765,6 +1809,10 @@ def normalize_router_config(payload):
             "realm": str(client_auth_payload.get("realm", default_config["client_auth"]["realm"])).strip()
             or DEFAULT_CLIENT_AUTH_REALM,
             "credentials": normalized_client_auth_credentials,
+        },
+        "admin_api": {
+            "enabled": bool(admin_api_payload.get("enabled", default_config["admin_api"]["enabled"])),
+            "tokens": normalized_admin_api_tokens,
         },
         "client_blocks": normalized_client_blocks,
         "client_traffic_limits": normalized_client_traffic_limits,

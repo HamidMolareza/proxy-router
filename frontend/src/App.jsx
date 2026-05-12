@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
 const ROUTE_TYPES = ['direct', 'proxy', 'self', 'rejected']
@@ -54,6 +54,7 @@ const RULE_SUGGESTIONS_PAGE_SIZE = 10
 const DEFAULT_FAILURE_PAGE_SIZE = 10
 const BYTES_IN_MB = 1_000_000
 const MB_IN_GB = 1024
+const ADMIN_API_TOKEN_STORAGE_KEY = 'proxy-router-admin-api-token'
 
 function cx(...classes) {
   return classes.filter(Boolean).join(' ')
@@ -79,6 +80,7 @@ const panelClass = 'min-w-0 rounded-xl border border-[#d8d1c2] bg-[#fffdf8] p-3 
 const subpanelClass = 'min-w-0 overflow-x-auto rounded-xl border border-[#e8e0d1] bg-gradient-to-b from-white to-[#f6f4ed] p-3 sm:rounded-[14px] sm:p-4'
 const panelHeaderClass = 'flex flex-wrap items-stretch justify-between gap-3 sm:items-center sm:gap-4'
 const noteClass = 'mt-2 text-sm leading-relaxed text-[#6a6f73]'
+const statusPillClass = 'mt-3 rounded-[8px] border px-3 py-2 text-sm'
 const mutedClass = 'text-[#6a6f73]'
 const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[#d9ece8] px-3 py-1.5 font-semibold text-[#116466]'
 const warningPillClass = 'bg-[#f7e4bb] text-[#9b6b00]'
@@ -1389,39 +1391,6 @@ function currentRouterRuntime(snapshot) {
   return snapshot && typeof snapshot === 'object' && snapshot.router_runtime ? snapshot.router_runtime : {}
 }
 
-function currentUpstreamStatus(snapshot) {
-  const runtime = currentRouterRuntime(snapshot)
-  const source = runtime.upstream_status && typeof runtime.upstream_status === 'object' ? runtime.upstream_status : {}
-  const connectivity = source.connectivity && typeof source.connectivity === 'object' ? source.connectivity : {}
-  const normalizeActivity = (activity) =>
-    activity && typeof activity === 'object'
-      ? {
-          timestamp: activity.timestamp ? String(activity.timestamp) : null,
-          destination: String(activity.destination || ''),
-          error: activity.error ? String(activity.error) : '',
-          context: activity.context ? String(activity.context) : '',
-          proxy_label: String(activity.proxy_label || ''),
-        }
-      : null
-
-  return {
-    enabled: Boolean(source.enabled),
-    type: source.type === 'socks5' ? 'socks5' : 'http',
-    host: String(source.host || '127.0.0.1'),
-    port: Number(source.port) || 0,
-    connectivity: {
-      status: String(connectivity.status || (source.enabled ? 'unknown' : 'disabled')),
-      checked_at: connectivity.checked_at ? String(connectivity.checked_at) : null,
-      message: String(
-        connectivity.message || (source.enabled ? 'Waiting for an upstream connectivity check.' : 'Upstream proxy is disabled.'),
-      ),
-      protocol_verified: Boolean(connectivity.protocol_verified),
-    },
-    last_success: normalizeActivity(source.last_success),
-    last_failure: normalizeActivity(source.last_failure),
-  }
-}
-
 function normalizeHttpsInterceptionActivity(activity) {
   return activity && typeof activity === 'object'
     ? {
@@ -1714,39 +1683,6 @@ function buildProxyCheckStatus(result) {
   }
 }
 
-function buildUpstreamTrafficHeadline(upstreamStatus) {
-  if (!upstreamStatus.enabled) {
-    return 'Not in use'
-  }
-  const lastSuccessAt = parseDateText(upstreamStatus.last_success && upstreamStatus.last_success.timestamp)
-  const lastFailureAt = parseDateText(upstreamStatus.last_failure && upstreamStatus.last_failure.timestamp)
-  if (lastSuccessAt && (!lastFailureAt || lastSuccessAt.getTime() >= lastFailureAt.getTime())) {
-    return 'Working'
-  }
-  if (lastFailureAt) {
-    return 'Failing'
-  }
-  return 'Waiting for first proxied request'
-}
-
-function buildUpstreamTrafficNotes(upstreamStatus) {
-  const notes = []
-  if (upstreamStatus.last_success && upstreamStatus.last_success.timestamp) {
-    notes.push(
-      `Last success: ${formatStatusDateTime(upstreamStatus.last_success.timestamp)} -> ${upstreamStatus.last_success.destination}`,
-    )
-  }
-  if (upstreamStatus.last_failure && upstreamStatus.last_failure.timestamp) {
-    notes.push(
-      `Last failure: ${formatStatusDateTime(upstreamStatus.last_failure.timestamp)} -> ${upstreamStatus.last_failure.destination} · ${upstreamStatus.last_failure.error}`,
-    )
-  }
-  if (!notes.length) {
-    notes.push('No proxied request has used the current upstream yet.')
-  }
-  return notes
-}
-
 function buildHttpsInterceptionHeadline(status, config) {
   if (!config.https_interception.enabled) {
     return 'Disabled'
@@ -2001,11 +1937,8 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
   const activeProfile = runtime.active_profile || {}
   const activeProfileConfig = (config.routing_profiles || []).find((profile) => profile.id === activeProfile.id)
   const editorTargetLabel = getEditorTargetLabel(config, profileId)
-  const upstreamStatus = currentUpstreamStatus(snapshot)
   const httpsStatus = currentHttpsInterceptionStatus(snapshot)
-  const upstreamLabel = config.upstream.enabled
-    ? `${config.upstream.type}://${config.upstream.host || '?'}:${config.upstream.port || '?'}`
-    : 'Disabled'
+  const enabledProxies = (config.proxies || []).filter((proxy) => proxy.enabled).length
   const upstreamRetry = config.upstream_retry || DEFAULT_UPSTREAM_RETRY
   const upstreamRetryLabel = upstreamRetry.enabled
     ? `${upstreamRetry.attempts} attempts · ${upstreamRetry.initial_delay_seconds}s first delay · ${upstreamRetry.max_delay_seconds}s cap`
@@ -2037,9 +1970,8 @@ function buildRouterSummaryItems(config, profileId, snapshot) {
     ['Rules', String(visibleRuleEntries.length)],
     ['Enabled', String(enabledRules)],
     ['Default', currentTarget.default_action],
-    ['Upstream', upstreamLabel],
+    ['Proxies', `${enabledProxies}/${(config.proxies || []).length}`],
     ['Proxy retry', upstreamRetryLabel],
-    ['Upstream check', buildUpstreamConnectivityLabel(upstreamStatus)],
     ['HTTPS sniffing', httpsInterceptionLabel],
     ['Auto proxy', autoProxyStatus],
     ['Proxy auth', clientAuthLabel],
@@ -2316,6 +2248,17 @@ function App() {
   const [isSavingRouter, setIsSavingRouter] = useState(false)
   const [routerSaveError, setRouterSaveError] = useState('')
   const [routerEditVersion, setRouterEditVersion] = useState(0)
+  const [adminApiStatus, setAdminApiStatus] = useState({ enabled: false, requires_auth: false, tokens: [] })
+  const [adminApiToken, setAdminApiToken] = useState(() => {
+    try {
+      return window.localStorage.getItem(ADMIN_API_TOKEN_STORAGE_KEY) || ''
+    } catch {
+      return ''
+    }
+  })
+  const [adminApiTokenName, setAdminApiTokenName] = useState('Codex MCP')
+  const [newAdminApiToken, setNewAdminApiToken] = useState('')
+  const [adminApiMessage, setAdminApiMessage] = useState(null)
   const [httpsHostPatternsText, setHttpsHostPatternsText] = useState('')
   const [httpsBypassPatternsText, setHttpsBypassPatternsText] = useState('')
   const routerEditVersionRef = useRef(0)
@@ -2337,6 +2280,10 @@ function App() {
   const autoSelectedRulesTargetRef = useRef(false)
   const httpsHostPatternsFocusedRef = useRef(false)
   const httpsBypassPatternsFocusedRef = useRef(false)
+  const adminApiHeaders = useCallback(() => {
+    const token = String(adminApiToken || '').trim()
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }, [adminApiToken])
 
   const safeEditorProfileId =
     currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
@@ -2410,7 +2357,6 @@ function App() {
   const overviewCards = buildOverviewCards(dashboardSnapshot)
   const usageChartPoints = buildUsageChartPoints(dashboardSnapshot)
   const profileRuntimeItems = buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot)
-  const upstreamStatus = currentUpstreamStatus(dashboardSnapshot)
   const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
   const routerSummaryItems = buildRouterSummaryItems(
     currentRouterConfig,
@@ -2975,6 +2921,11 @@ function App() {
     }
 
     loadInitialRouterConfig()
+    loadAdminApiStatus().catch((error) => {
+      if (!cancelled) {
+        setAdminApiMessage({ text: `Admin API status load failed: ${error.message}`, warning: true })
+      }
+    })
 
     return () => {
       cancelled = true
@@ -3244,6 +3195,7 @@ function App() {
       fetch('/api/router-config', {
         method: 'POST',
         headers: {
+          ...adminApiHeaders(),
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
@@ -3287,7 +3239,7 @@ function App() {
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [routerDirty, routerEditVersion, routerPersistableFingerprint, routerBlockingRuleIssues.length])
+  }, [adminApiHeaders, routerDirty, routerEditVersion, routerPersistableFingerprint, routerBlockingRuleIssues.length])
 
   function setLocalRouterConfig(nextConfig, options = {}) {
     setCurrentRouterConfig(normalizeRouterConfig(nextConfig))
@@ -3311,6 +3263,95 @@ function App() {
       setRouterStatusOverride(null)
     }
     setRuleConflictCheckStatus(null)
+  }
+
+  function updateAdminApiToken(value) {
+    const token = String(value || '')
+    setAdminApiToken(token)
+    try {
+      if (token.trim()) {
+        window.localStorage.setItem(ADMIN_API_TOKEN_STORAGE_KEY, token.trim())
+      } else {
+        window.localStorage.removeItem(ADMIN_API_TOKEN_STORAGE_KEY)
+      }
+    } catch {
+      // Ignore localStorage failures; the token still works for the current page session.
+    }
+  }
+
+  async function loadAdminApiStatus() {
+    const response = await fetch('/api/admin-api/status', {
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+    const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+    if (!response.ok) {
+      throw new Error(payload.error || `admin API status HTTP ${response.status}`)
+    }
+    setAdminApiStatus(payload)
+    return payload
+  }
+
+  async function createAdminApiToken() {
+    setAdminApiMessage(null)
+    try {
+      const response = await fetch('/api/admin-api/tokens', {
+        method: 'POST',
+        headers: {
+          ...adminApiHeaders(),
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ name: adminApiTokenName }),
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `admin API token create HTTP ${response.status}`)
+      }
+      if (payload.token) {
+        setNewAdminApiToken(payload.token)
+        updateAdminApiToken(payload.token)
+      }
+      if (payload.status) {
+        setAdminApiStatus(payload.status)
+      } else {
+        await loadAdminApiStatus()
+      }
+      setAdminApiMessage({ text: 'Admin API token created. The token is shown once.', warning: false })
+    } catch (error) {
+      setAdminApiMessage({ text: `Admin API token create failed: ${error.message}`, warning: true })
+    }
+  }
+
+  async function deleteAdminApiToken(tokenId) {
+    const normalizedId = String(tokenId || '').trim()
+    if (!normalizedId) {
+      return
+    }
+    setAdminApiMessage(null)
+    try {
+      const response = await fetch(`/api/admin-api/tokens/${encodeURIComponent(normalizedId)}/delete`, {
+        method: 'POST',
+        headers: {
+          ...adminApiHeaders(),
+          Accept: 'application/json',
+        },
+      })
+      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
+      if (!response.ok) {
+        throw new Error(payload.error || `admin API token delete HTTP ${response.status}`)
+      }
+      if (payload.status) {
+        setAdminApiStatus(payload.status)
+      } else {
+        await loadAdminApiStatus()
+      }
+      setAdminApiMessage({ text: 'Admin API token deleted.', warning: false })
+    } catch (error) {
+      setAdminApiMessage({ text: `Admin API token delete failed: ${error.message}`, warning: true })
+    }
   }
 
   function addRule(rule = null) {
@@ -3714,36 +3755,6 @@ function App() {
     })
   }
 
-  async function triggerUpstreamCheck() {
-    try {
-      const response = await fetch('/api/upstream/check', {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-        },
-      })
-      const payload = await response.json().catch(() => ({ error: 'invalid JSON response' }))
-      if (!response.ok) {
-        throw new Error(payload.error || `upstream check HTTP ${response.status}`)
-      }
-      if (payload.status) {
-        setDashboardSnapshot((existingSnapshot) => ({
-          ...existingSnapshot,
-          router_runtime: {
-            ...currentRouterRuntime(existingSnapshot),
-            upstream_status: payload.status,
-          },
-        }))
-      }
-      setRouterStatusOverride(null)
-    } catch (error) {
-      setRouterStatusOverride({
-        text: `Could not start an upstream connectivity check: ${error.message}`,
-        warning: true,
-      })
-    }
-  }
-
   async function triggerAllProxyChecks() {
     setIsCheckingProxies(true)
     try {
@@ -3791,6 +3802,7 @@ function App() {
       const response = await fetch(`/api/rule-suggestions/${encodeURIComponent(normalizedId)}/${action}`, {
         method: 'POST',
         headers: {
+          ...adminApiHeaders(),
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
@@ -3839,6 +3851,7 @@ function App() {
       const response = await fetch('/api/rule-suggestions/clear', {
         method: 'POST',
         headers: {
+          ...adminApiHeaders(),
           Accept: 'application/json',
         },
       })
@@ -3897,6 +3910,7 @@ function App() {
       const response = await fetch('/api/traffic-data/clear', {
         method: 'POST',
         headers: {
+          ...adminApiHeaders(),
           Accept: 'application/json',
         },
       })
@@ -4708,7 +4722,7 @@ function App() {
               <div className={panelHeaderClass}>
                 <div>
                   <h2>Routing</h2>
-                  <div className={noteClass}>Profiles, upstream proxy, auto-proxy policy, and host rules.</div>
+                  <div className={noteClass}>Profiles, proxy-based routing, auto-proxy policy, and host rules.</div>
                 </div>
               </div>
 
@@ -4827,74 +4841,11 @@ function App() {
 
                 <section className={cx(subpanelClass, 'order-3 col-span-full')}>
                   <h3>Global routing</h3>
-                  <div className={noteClass}>Upstream proxy, routing status, auto-proxy policy, and ignored failure domains.</div>
-                  <h3 className="mt-4">Upstream proxy</h3>
-                  <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
-                    <input
-                      className={cx(routerHasLocalChanges && dirtyInputClass)}
-                      type="checkbox"
-                      checked={currentRouterConfig.upstream.enabled}
-                      onChange={(event) => {
-                        const nextConfig = cloneJson(currentRouterConfig)
-                        nextConfig.upstream.enabled = event.target.checked
-                        setLocalRouterConfig(nextConfig)
-                      }}
-                    />
-                    <span>Enable upstream proxy</span>
-                  </label>
-                  <div className={fieldGridClass}>
-                    <label className={fieldClass}>
-                      <span>Proxy type</span>
-                      <select
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        value={currentRouterConfig.upstream.type}
-                        onChange={(event) => {
-                          const nextConfig = cloneJson(currentRouterConfig)
-                          nextConfig.upstream.type = event.target.value === 'socks5' ? 'socks5' : 'http'
-                          setLocalRouterConfig(nextConfig)
-                        }}
-                      >
-                        <option value="http">HTTP proxy</option>
-                        <option value="socks5">SOCKS5 proxy</option>
-                      </select>
-                    </label>
-                    <label className={fieldClass}>
-                      <span>Host</span>
-                      <input
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        type="text"
-                        value={currentRouterConfig.upstream.host}
-                        placeholder="127.0.0.1"
-                        onChange={(event) => {
-                          const nextConfig = cloneJson(currentRouterConfig)
-                          nextConfig.upstream.host = event.target.value.trim()
-                          setLocalRouterConfig(nextConfig)
-                        }}
-                      />
-                    </label>
-                    <label className={fieldClass}>
-                      <span>Port</span>
-                      <input
-                        className={cx(routerHasLocalChanges && dirtyInputClass)}
-                        type="number"
-                        min="1"
-                        max="65535"
-                        value={currentRouterConfig.upstream.port}
-                        placeholder="8900"
-                        onChange={(event) => {
-                          const nextConfig = cloneJson(currentRouterConfig)
-                          nextConfig.upstream.port = event.target.value.trim()
-                          setLocalRouterConfig(nextConfig)
-                        }}
-                      />
-                    </label>
-                  </div>
                   <div className={noteClass}>
-                    In the Docker Compose deployment, proxy-router uses host networking so a host-side upstream proxy
-                    can use
-                    <strong> 127.0.0.1</strong>.
+                    Routing uses the ordered proxy list from the Proxies tab, rule proxy pins, client access policy,
+                    and proxy priority.
                   </div>
-                  <h3 className="mt-4">Upstream failure retry</h3>
+                  <h3 className="mt-4">Proxy failure retry</h3>
                   <label className="mt-3 flex items-start gap-2 font-semibold leading-snug text-[#1f2a30] [&_input]:mt-1">
                     <input
                       className={cx(routerHasLocalChanges && dirtyInputClass)}
@@ -4956,45 +4907,9 @@ function App() {
                     </label>
                   </div>
                   <div className={noteClass}>
-                    Applies to upstream proxy setup, CONNECT tunnels, SOCKS5 tunnels, and safe or empty-body HTTP
+                    Applies to proxy setup, CONNECT tunnels, SOCKS5 tunnels, and safe or empty-body HTTP
                     requests before an error is returned to the client. Delay doubles after each failed attempt until
                     it reaches the cap.
-                  </div>
-                  <div className={buttonRowClass}>
-                    <button
-                      type="button"
-                      onClick={triggerUpstreamCheck}
-                      disabled={upstreamStatus.enabled && upstreamStatus.connectivity.status === 'checking'}
-                    >
-                      {upstreamStatus.enabled && upstreamStatus.connectivity.status === 'checking'
-                        ? 'Checking upstream…'
-                        : 'Check upstream now'}
-                    </button>
-                  </div>
-                  <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
-                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
-                      <div className="text-xs text-[#6a6f73]">Connectivity</div>
-                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">
-                        <span className={buildUpstreamConnectivityPillClass(upstreamStatus)}>
-                          {buildUpstreamConnectivityLabel(upstreamStatus)}
-                        </span>
-                      </div>
-                      <div className={noteClass}>
-                        {upstreamStatus.connectivity.message}
-                        {upstreamStatus.connectivity.checked_at
-                          ? ` Checked at ${formatStatusDateTime(upstreamStatus.connectivity.checked_at)}.`
-                          : ''}
-                      </div>
-                    </div>
-                    <div className="min-w-0 rounded-xl border border-[#e8e0d1] bg-white p-3">
-                      <div className="text-xs text-[#6a6f73]">Real traffic</div>
-                      <div className="mt-1 [overflow-wrap:anywhere] font-bold">{buildUpstreamTrafficHeadline(upstreamStatus)}</div>
-                      {buildUpstreamTrafficNotes(upstreamStatus).map((note) => (
-                        <div className={noteClass} key={note}>
-                          {note}
-                        </div>
-                      ))}
-                    </div>
                   </div>
 
                   <div className="mt-3 grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(140px,1fr))] sm:gap-3">
@@ -5018,7 +4933,7 @@ function App() {
                         setLocalRouterConfig(nextConfig)
                       }}
                     />
-                    <span>Probe failing domains with the upstream proxy before enabling auto proxy</span>
+                    <span>Probe failing domains with allowed proxies before enabling auto proxy</span>
                   </label>
                   <div className={noteClass}>
                     Policy: 2 direct failures trigger one proxy probe. If the probe succeeds, the domain is auto-routed
@@ -6327,6 +6242,104 @@ function App() {
                       <tr>
                         <td colSpan="6" className="pt-2 text-[#6a6f73]">
                           No proxy auth credentials yet.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className={cx(panelHeaderClass, 'mt-5')}>
+                <div>
+                  <h3>Admin API tokens</h3>
+                  <div className={noteClass}>
+                    Bearer tokens protect admin writes from MCP clients and other local API callers.
+                  </div>
+                </div>
+                <button type="button" onClick={() => loadAdminApiStatus()}>
+                  Refresh
+                </button>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                <label className={fieldClass}>
+                  <span>Current token</span>
+                  <input
+                    type="password"
+                    value={adminApiToken}
+                    placeholder="Paste admin API token"
+                    autoComplete="off"
+                    onChange={(event) => updateAdminApiToken(event.target.value)}
+                  />
+                </label>
+                <label className={fieldClass}>
+                  <span>New token name</span>
+                  <input
+                    type="text"
+                    value={adminApiTokenName}
+                    placeholder="Codex MCP"
+                    onChange={(event) => setAdminApiTokenName(event.target.value)}
+                  />
+                </label>
+                <div className="flex items-end">
+                  <button type="button" onClick={() => createAdminApiToken()}>
+                    Create token
+                  </button>
+                </div>
+              </div>
+              <div className={noteClass}>
+                {adminApiStatus.requires_auth
+                  ? `Admin API protection is enabled with ${adminApiStatus.active_token_count || 0} active token(s).`
+                  : 'Create the first token to enable admin API protection for write endpoints.'}
+              </div>
+              {adminApiMessage ? (
+                <div className={cx(statusPillClass, adminApiMessage.warning ? 'border-[#eab308] bg-[#fef9c3] text-[#854d0e]' : 'border-[#99d9ba] bg-[#ecfdf5] text-[#115e59]')}>
+                  {adminApiMessage.text}
+                </div>
+              ) : null}
+              {newAdminApiToken ? (
+                <div className={cx(subpanelClass, 'mt-3')}>
+                  <div className={panelHeaderClass}>
+                    <div className={ruleMetaClass}>
+                      <strong>New token</strong>
+                      <small>Copy this now. It will not be shown again after refresh.</small>
+                    </div>
+                    <button type="button" onClick={() => copyTextToClipboard('Admin API token', newAdminApiToken)}>
+                      Copy token
+                    </button>
+                  </div>
+                  <input className="mt-3 font-mono" readOnly type="text" value={newAdminApiToken} />
+                </div>
+              ) : null}
+              <div className={tableWrapClass}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Enabled</th>
+                      <th>Created</th>
+                      <th>Last used</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Array.isArray(adminApiStatus.tokens) && adminApiStatus.tokens.length ? (
+                      adminApiStatus.tokens.map((token) => (
+                        <tr key={token.id}>
+                          <td>{token.name || token.id}</td>
+                          <td>{token.enabled ? 'Yes' : 'No'}</td>
+                          <td>{token.created_at ? formatStatusDateTime(token.created_at) : 'n/a'}</td>
+                          <td>{token.last_used_at ? formatStatusDateTime(token.last_used_at) : 'Never'}</td>
+                          <td className={ruleActionsClass}>
+                            <button type="button" onClick={() => deleteAdminApiToken(token.id)}>
+                              Delete
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan="5" className="pt-2 text-[#6a6f73]">
+                          No admin API tokens yet.
                         </td>
                       </tr>
                     )}
