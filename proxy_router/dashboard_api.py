@@ -159,6 +159,9 @@ def build_client_block_status_map(client_rows, router_config):
 def build_router_runtime_dashboard_snapshot(server):
     router_runtime_snapshot = server.router_config.runtime_snapshot()
     router_runtime_snapshot["upstream_status"] = server.runtime.upstream_status.snapshot()
+    proxy_status = getattr(server.runtime, "proxy_status", None)
+    if proxy_status is not None:
+        router_runtime_snapshot["proxy_status"] = proxy_status.snapshot()
     router_runtime_snapshot["https_interception_status"] = server.runtime.https_interception_status(
         server.router_config.https_interception_settings()
     )

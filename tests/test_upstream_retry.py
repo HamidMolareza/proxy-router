@@ -370,7 +370,69 @@ class UpstreamRetryConfigTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in payload["results"]], ["enabled-proxy", "disabled-proxy"])
         self.assertEqual(payload["results"][0]["status"], "reachable")
         self.assertEqual(payload["results"][1]["status"], "disabled")
+        status = runtime.proxy_status.snapshot()
+        self.assertEqual(status["connected_count"], 1)
+        self.assertEqual(status["enabled_count"], 1)
+        self.assertEqual(status["results"][0]["status"], "reachable")
         probe.assert_called_once()
+
+    def test_proxy_status_updates_from_repeated_failures_and_success(self):
+        runtime = AppRuntime()
+        config = normalize_router_config(
+            {
+                "proxies": [
+                    {
+                        "id": "main",
+                        "enabled": True,
+                        "type": "http",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                    }
+                ],
+            }
+        )
+        runtime.refresh_upstream_status(config)
+        route_decision = {
+            "action": "proxy",
+            "upstream": config["proxies"][0],
+        }
+
+        for index in range(2):
+            runtime.record_upstream_route_failure(
+                route_decision,
+                destination=f"api.example.com:{443 + index}",
+                error="connection refused",
+                context="CONNECT",
+                proxy_label="mixed",
+            )
+
+        first_snapshot = runtime.proxy_status.snapshot()
+        self.assertEqual(first_snapshot["results"][0]["status"], "unknown")
+        self.assertEqual(first_snapshot["results"][0]["consecutive_failures"], 2)
+
+        runtime.record_upstream_route_failure(
+            route_decision,
+            destination="api.example.com:445",
+            error="connection refused",
+            context="CONNECT",
+            proxy_label="mixed",
+        )
+
+        failed_snapshot = runtime.proxy_status.snapshot()
+        self.assertEqual(failed_snapshot["connected_count"], 0)
+        self.assertEqual(failed_snapshot["results"][0]["status"], "error")
+        self.assertEqual(failed_snapshot["results"][0]["consecutive_failures"], 3)
+
+        runtime.record_upstream_route_success(
+            route_decision,
+            destination="api.example.com:443",
+            proxy_label="mixed",
+        )
+
+        recovered_snapshot = runtime.proxy_status.snapshot()
+        self.assertEqual(recovered_snapshot["connected_count"], 1)
+        self.assertEqual(recovered_snapshot["results"][0]["status"], "reachable")
+        self.assertEqual(recovered_snapshot["results"][0]["consecutive_failures"], 0)
 
 
 if __name__ == "__main__":

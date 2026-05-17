@@ -199,6 +199,7 @@ Current dashboard behaviors:
 - Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
+- A proxy connection status strip above the dashboard tabs summarizes whether at least one enabled upstream proxy is reachable. It updates from real proxied traffic successes, repeated proxied traffic failures, and the same check-all probe used by the `Proxies` tab.
 - Proxy definitions live in the `Proxies` tab; the `Routing` tab uses those proxies through default actions, rule `proxy_id` pins, priority, and access policy.
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.

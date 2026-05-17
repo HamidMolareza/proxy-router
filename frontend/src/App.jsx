@@ -85,6 +85,7 @@ const statusPillClass = 'mt-3 rounded-[8px] border px-3 py-2 text-sm'
 const mutedClass = 'text-[#6a6f73]'
 const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[#d9ece8] px-3 py-1.5 font-semibold text-[#116466]'
 const warningPillClass = 'bg-[#f7e4bb] text-[#9b6b00]'
+const errorPillClass = 'bg-[#fde2dd] text-[#a33a2c]'
 const mutedPillClass = 'bg-[#ece7dc] text-[#6a6f73]'
 const gridClass = 'grid grid-cols-12 gap-4'
 const cardGridClass = 'col-span-full grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(150px,1fr))] sm:gap-3'
@@ -256,6 +257,12 @@ function emptyDashboardSnapshot() {
         using_fallback: true,
       },
       upstream_status: emptyUpstreamStatus(),
+      proxy_status: {
+        failure_threshold: 3,
+        connected_count: 0,
+        enabled_count: 0,
+        results: [],
+      },
       https_interception_status: emptyHttpsInterceptionStatus(),
     },
   }
@@ -286,6 +293,16 @@ function mergeDashboardSnapshot(existingSnapshot, patch) {
     mergedRuntime.upstream_status = {
       ...(base.router_runtime?.upstream_status || {}),
       ...(patch.router_runtime?.upstream_status || {}),
+    }
+  }
+  if (base.router_runtime?.proxy_status || patch.router_runtime?.proxy_status) {
+    mergedRuntime.proxy_status = {
+      ...(base.router_runtime?.proxy_status || {}),
+      ...(patch.router_runtime?.proxy_status || {}),
+      results:
+        patch.router_runtime?.proxy_status?.results ||
+        base.router_runtime?.proxy_status?.results ||
+        [],
     }
   }
   if (base.router_runtime?.https_interception_status || patch.router_runtime?.https_interception_status) {
@@ -1756,6 +1773,128 @@ function buildProxyCheckStatus(result) {
   }
 }
 
+function proxyCheckResultMatchesProxy(result, proxy) {
+  if (!result || !proxy) {
+    return false
+  }
+  return (
+    String(result.id || '').trim() === String(proxy.id || '').trim() &&
+    String(result.type || 'http').trim().toLowerCase() === String(proxy.type || 'http').trim().toLowerCase() &&
+    String(result.host || '').trim().toLowerCase() === String(proxy.host || '').trim().toLowerCase() &&
+    Number(result.port || 0) === Number(proxy.port || 0)
+  )
+}
+
+function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxyCheckError) {
+  const proxies = Array.isArray(config.proxies) ? config.proxies : []
+  const resultMap = proxyCheckResults && typeof proxyCheckResults === 'object' ? proxyCheckResults : {}
+  const enabledProxies = proxies.filter((proxy) => proxy && proxy.enabled !== false)
+  const configuredProxies = enabledProxies.filter(
+    (proxy) => String(proxy.host || '').trim() && Number(proxy.port || 0) > 0,
+  )
+  const checkedResults = configuredProxies
+    .map((proxy) => resultMap[proxy.id])
+    .filter((result, index) => proxyCheckResultMatchesProxy(result, configuredProxies[index]))
+  const reachableResults = checkedResults.filter((result) => String(result.status || '') === 'reachable')
+  const failedResults = checkedResults.filter((result) => String(result.status || '') === 'error')
+  const uncheckedCount = configuredProxies.length - checkedResults.length
+  const invalidCount = enabledProxies.length - configuredProxies.length
+  const latestCheckedAt = checkedResults
+    .map((result) => parseDateText(result.checked_at))
+    .filter(Boolean)
+    .sort((left, right) => right.getTime() - left.getTime())[0]
+
+  if (!proxies.length) {
+    return {
+      label: 'No proxies configured',
+      message: 'Add an upstream proxy before routed traffic can use one.',
+      pillClassName: cx(pillClass, mutedPillClass),
+      dotClassName: 'bg-[#8b8173]',
+    }
+  }
+
+  if (!enabledProxies.length) {
+    return {
+      label: 'No proxies enabled',
+      message: `${proxies.length} upstream proxy definition${proxies.length === 1 ? '' : 's'} configured, all disabled.`,
+      pillClassName: cx(pillClass, warningPillClass),
+      dotClassName: 'bg-[#9b6b00]',
+    }
+  }
+
+  if (isChecking) {
+    return {
+      label: 'Checking proxy connections',
+      message: `Testing ${configuredProxies.length} enabled upstream prox${configuredProxies.length === 1 ? 'y' : 'ies'}.`,
+      pillClassName: cx(pillClass, warningPillClass),
+      dotClassName: 'bg-[#9b6b00]',
+    }
+  }
+
+  const messageParts = []
+  if (latestCheckedAt) {
+    messageParts.push(`Latest check: ${formatStatusDateTime(latestCheckedAt)}`)
+  }
+  if (uncheckedCount > 0) {
+    messageParts.push(`${uncheckedCount} enabled prox${uncheckedCount === 1 ? 'y has' : 'ies have'} no current check result`)
+  }
+  if (invalidCount > 0) {
+    messageParts.push(`${invalidCount} enabled prox${invalidCount === 1 ? 'y is' : 'ies are'} missing host or port`)
+  }
+  if (proxyCheckError) {
+    messageParts.push(`Last check failed: ${proxyCheckError}`)
+  }
+
+  if (reachableResults.length > 0) {
+    const reachableNames = reachableResults
+      .map((result) => String(result.name || result.id || '').trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .join(', ')
+    return {
+      label: `${reachableResults.length} of ${enabledProxies.length} connected`,
+      message:
+        messageParts.concat(reachableNames ? [`Reachable: ${reachableNames}`] : []).join(' · ') ||
+        'At least one enabled upstream proxy is reachable.',
+      pillClassName: pillClass,
+      dotClassName: 'bg-[#116466]',
+    }
+  }
+
+  if (checkedResults.length > 0) {
+    return {
+      label: 'No proxy connected',
+      message:
+        messageParts.concat(`${failedResults.length} checked prox${failedResults.length === 1 ? 'y' : 'ies'} failed`).join(' · ') ||
+        'The latest proxy check did not find a reachable enabled upstream proxy.',
+      pillClassName: cx(pillClass, errorPillClass),
+      dotClassName: 'bg-[#a33a2c]',
+    }
+  }
+
+  return {
+    label: 'Proxy status not checked',
+    message:
+      messageParts.join(' · ') ||
+      `Check ${configuredProxies.length} enabled upstream prox${configuredProxies.length === 1 ? 'y' : 'ies'} to confirm connectivity.`,
+    pillClassName: cx(pillClass, proxyCheckError ? warningPillClass : mutedPillClass),
+    dotClassName: proxyCheckError ? 'bg-[#9b6b00]' : 'bg-[#8b8173]',
+  }
+}
+
+function proxyStatusResultsById(snapshot) {
+  const runtime = currentRouterRuntime(snapshot)
+  const status = runtime.proxy_status && typeof runtime.proxy_status === 'object' ? runtime.proxy_status : {}
+  const results = Array.isArray(status.results) ? status.results : []
+  const resultsById = {}
+  for (const result of results) {
+    if (result && result.id) {
+      resultsById[result.id] = result
+    }
+  }
+  return resultsById
+}
+
 function buildHttpsInterceptionHeadline(status, config) {
   if (!config.https_interception.enabled) {
     return 'Disabled'
@@ -2312,6 +2451,7 @@ function App() {
   const [usersSort, setUsersSort] = useState({ key: 'active', direction: 'desc' })
   const [routerStatusOverride, setRouterStatusOverride] = useState(null)
   const [proxyCheckResults, setProxyCheckResults] = useState({})
+  const [proxyCheckError, setProxyCheckError] = useState('')
   const [isCheckingProxies, setIsCheckingProxies] = useState(false)
   const [showAllRuleIssues, setShowAllRuleIssues] = useState(false)
   const [ruleConflictCheckStatus, setRuleConflictCheckStatus] = useState(null)
@@ -2470,6 +2610,15 @@ function App() {
     () => buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot),
     [currentRouterConfig, dashboardSnapshot],
   )
+  const proxyConnectionStatus = useMemo(() => {
+    const runtimeResults = proxyStatusResultsById(dashboardSnapshot)
+    return buildProxyConnectionStatus(
+      currentRouterConfig,
+      { ...runtimeResults, ...proxyCheckResults },
+      isCheckingProxies,
+      proxyCheckError,
+    )
+  }, [currentRouterConfig, dashboardSnapshot, proxyCheckResults, isCheckingProxies, proxyCheckError])
   const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
   const routerSummaryItems = useMemo(
     () =>
@@ -2879,6 +3028,9 @@ function App() {
     } else {
       setRouterStatusOverride(null)
     }
+    if (loadedConfig.proxies.some((proxy) => proxy.enabled !== false)) {
+      triggerAllProxyChecks({ showStatus: false })
+    }
   }
 
   async function refreshHistory(
@@ -3083,6 +3235,9 @@ function App() {
           setLastSavedRouterConfig(cloneJson(loadedConfig))
           setRouterSaveError('')
           setRouterStatusOverride(null)
+          if (loadedConfig.proxies.some((proxy) => proxy.enabled !== false)) {
+            triggerAllProxyChecks({ showStatus: false })
+          }
         }
       } catch (error) {
         if (!cancelled) {
@@ -3977,8 +4132,9 @@ function App() {
     })
   }
 
-  async function triggerAllProxyChecks() {
+  async function triggerAllProxyChecks({ showStatus = true } = {}) {
     setIsCheckingProxies(true)
+    setProxyCheckError('')
     try {
       const response = await fetch('/api/proxies/check', {
         method: 'POST',
@@ -3997,15 +4153,20 @@ function App() {
         }
       }
       setProxyCheckResults(resultsById)
-      setRouterStatusOverride({
-        text: `Checked ${Object.keys(resultsById).length} upstream proxies.`,
-        warning: false,
-      })
+      if (showStatus) {
+        setRouterStatusOverride({
+          text: `Checked ${Object.keys(resultsById).length} upstream proxies.`,
+          warning: false,
+        })
+      }
     } catch (error) {
-      setRouterStatusOverride({
-        text: `Could not check upstream proxies: ${error.message}`,
-        warning: true,
-      })
+      setProxyCheckError(error.message)
+      if (showStatus) {
+        setRouterStatusOverride({
+          text: `Could not check upstream proxies: ${error.message}`,
+          warning: true,
+        })
+      }
     } finally {
       setIsCheckingProxies(false)
     }
@@ -4198,6 +4359,31 @@ function App() {
             </button>
           </div>
         </div>
+      </section>
+
+      <section
+        className={cx(panelClass, 'mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between')}
+        aria-live="polite"
+      >
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span
+              className={cx('inline-block h-3 w-3 shrink-0 rounded-full', proxyConnectionStatus.dotClassName)}
+              aria-hidden="true"
+            />
+            <h2>Proxy connection</h2>
+            <span className={proxyConnectionStatus.pillClassName}>{proxyConnectionStatus.label}</span>
+          </div>
+          <div className={noteClass}>{proxyConnectionStatus.message}</div>
+        </div>
+        <button
+          className="w-full sm:w-auto"
+          type="button"
+          onClick={() => triggerAllProxyChecks()}
+          disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
+        >
+          {isCheckingProxies ? 'Checking proxies…' : 'Check proxies'}
+        </button>
       </section>
 
       <section className="mb-4 grid grid-cols-2 gap-2 min-[361px]:grid-cols-3 sm:flex sm:flex-wrap" aria-label="Dashboard tabs">

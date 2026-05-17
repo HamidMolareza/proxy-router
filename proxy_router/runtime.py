@@ -17,6 +17,8 @@ from .records import build_failure_snapshot_from_records
 from .traffic import AutoProxyFailureManager, HttpsDiscoveryManager, HttpsInterceptionTrustManager, TrafficQuotaManager
 from .util import *
 
+PROXY_CONNECTION_FAILURE_THRESHOLD = 3
+
 class DashboardState:
     def __init__(
         self,
@@ -676,6 +678,222 @@ class UpstreamProxyStatus:
         self._notify()
 
 
+class UpstreamProxyListStatus:
+    def __init__(self, notify_callback, *, failure_threshold: int = PROXY_CONNECTION_FAILURE_THRESHOLD):
+        self._lock = threading.Lock()
+        self._notify_callback = notify_callback
+        self._failure_threshold = int(failure_threshold)
+        self._states = {}
+
+    def _notify(self):
+        self._notify_callback("proxy-status")
+
+    def _fingerprint(self, proxy):
+        return json.dumps(
+            {
+                "id": str((proxy or {}).get("id") or "").strip(),
+                "enabled": bool((proxy or {}).get("enabled", True)),
+                "type": str((proxy or {}).get("type") or "http").strip().lower(),
+                "host": str((proxy or {}).get("host") or "").strip().lower(),
+                "port": int((proxy or {}).get("port") or 0),
+            },
+            sort_keys=True,
+        )
+
+    def _base_state(self, proxy):
+        proxy_id = str((proxy or {}).get("id") or "").strip()
+        return {
+            "id": proxy_id,
+            "name": str((proxy or {}).get("name") or proxy_id).strip() or proxy_id,
+            "enabled": bool((proxy or {}).get("enabled", True)),
+            "priority": int((proxy or {}).get("priority") or 0),
+            "type": str((proxy or {}).get("type") or "http"),
+            "host": str((proxy or {}).get("host") or ""),
+            "port": int((proxy or {}).get("port") or 0),
+            "access_mode": str((proxy or {}).get("access_mode") or "public"),
+            "status": "unknown",
+            "checked_at": None,
+            "message": "Waiting for traffic or a proxy check.",
+            "protocol_verified": False,
+            "consecutive_failures": 0,
+            "last_success": None,
+            "last_failure": None,
+            "fingerprint": self._fingerprint(proxy),
+        }
+
+    def _configured_state(self, proxy, previous=None):
+        state = self._base_state(proxy)
+        if previous and previous.get("fingerprint") == state["fingerprint"]:
+            state.update(
+                {
+                    "status": previous.get("status", state["status"]),
+                    "checked_at": previous.get("checked_at"),
+                    "message": previous.get("message", state["message"]),
+                    "protocol_verified": bool(previous.get("protocol_verified")),
+                    "consecutive_failures": int(previous.get("consecutive_failures") or 0),
+                    "last_success": previous.get("last_success"),
+                    "last_failure": previous.get("last_failure"),
+                }
+            )
+        if not state["enabled"]:
+            state.update(
+                {
+                    "status": "disabled",
+                    "checked_at": state.get("checked_at") or _timestamp_now(),
+                    "message": "Proxy is disabled.",
+                    "protocol_verified": False,
+                    "consecutive_failures": 0,
+                }
+            )
+        elif not state["host"] or state["port"] <= 0:
+            state.update(
+                {
+                    "status": "error",
+                    "checked_at": state.get("checked_at") or _timestamp_now(),
+                    "message": "Proxy host and port must be set before traffic can use it.",
+                    "protocol_verified": False,
+                    "consecutive_failures": self._failure_threshold,
+                }
+            )
+        return state
+
+    def _matches_state_locked(self, proxy):
+        proxy_id = str((proxy or {}).get("id") or "").strip()
+        if not proxy_id:
+            return None
+        state = self._states.get(proxy_id)
+        if state is None or state.get("fingerprint") != self._fingerprint(proxy):
+            return None
+        return state
+
+    def apply_config(self, router_config):
+        proxies = (router_config or {}).get("proxies", [])
+        next_states = {}
+        with self._lock:
+            previous_states = self._states
+            for proxy in proxies:
+                if not isinstance(proxy, dict):
+                    continue
+                proxy_id = str(proxy.get("id") or "").strip()
+                if not proxy_id:
+                    continue
+                next_states[proxy_id] = self._configured_state(proxy, previous_states.get(proxy_id))
+            self._states = next_states
+        self._notify()
+
+    def record_check_results(self, router_config, results):
+        proxies_by_id = {
+            str((proxy or {}).get("id") or "").strip(): proxy
+            for proxy in (router_config or {}).get("proxies", [])
+            if isinstance(proxy, dict) and str(proxy.get("id") or "").strip()
+        }
+        with self._lock:
+            next_states = {}
+            for proxy_id, proxy in proxies_by_id.items():
+                next_states[proxy_id] = self._configured_state(proxy, self._states.get(proxy_id))
+            for result in results or []:
+                proxy_id = str((result or {}).get("id") or "").strip()
+                proxy = proxies_by_id.get(proxy_id)
+                if proxy is None:
+                    continue
+                state = next_states.get(proxy_id) or self._configured_state(proxy)
+                status = str((result or {}).get("status") or "unknown")
+                state.update(
+                    {
+                        "status": status,
+                        "checked_at": (result or {}).get("checked_at") or _timestamp_now(),
+                        "message": str((result or {}).get("message") or ""),
+                        "protocol_verified": bool((result or {}).get("protocol_verified")),
+                    }
+                )
+                if status == "reachable":
+                    state["consecutive_failures"] = 0
+                    state["last_success"] = {
+                        "timestamp": state["checked_at"],
+                        "destination": "proxy check",
+                        "proxy_label": "dashboard",
+                    }
+                elif status == "error":
+                    state["consecutive_failures"] = max(
+                        self._failure_threshold,
+                        int(state.get("consecutive_failures") or 0),
+                    )
+                    state["last_failure"] = {
+                        "timestamp": state["checked_at"],
+                        "destination": "proxy check",
+                        "error": state["message"],
+                        "context": "proxy check",
+                        "proxy_label": "dashboard",
+                    }
+                next_states[proxy_id] = state
+            self._states = next_states
+        self._notify()
+
+    def record_success(self, upstream: dict | None, *, destination: str, proxy_label: str):
+        with self._lock:
+            state = self._matches_state_locked(upstream)
+            if state is None:
+                return
+            timestamp = _timestamp_now()
+            state.update(
+                {
+                    "status": "reachable",
+                    "checked_at": timestamp,
+                    "message": f"Last proxied request connected to {destination}.",
+                    "protocol_verified": True,
+                    "consecutive_failures": 0,
+                    "last_success": {
+                        "timestamp": timestamp,
+                        "destination": str(destination or ""),
+                        "proxy_label": str(proxy_label or ""),
+                    },
+                }
+            )
+        self._notify()
+
+    def record_failure(self, upstream: dict | None, *, destination: str, error: str, context: str, proxy_label: str):
+        with self._lock:
+            state = self._matches_state_locked(upstream)
+            if state is None:
+                return
+            timestamp = _timestamp_now()
+            consecutive_failures = int(state.get("consecutive_failures") or 0) + 1
+            state["consecutive_failures"] = consecutive_failures
+            state["last_failure"] = {
+                "timestamp": timestamp,
+                "destination": str(destination or ""),
+                "error": str(error or ""),
+                "context": str(context or ""),
+                "proxy_label": str(proxy_label or ""),
+            }
+            if consecutive_failures >= self._failure_threshold:
+                state.update(
+                    {
+                        "status": "error",
+                        "checked_at": timestamp,
+                        "message": (
+                            f"{consecutive_failures} consecutive proxied requests failed. "
+                            f"Last error: {error}"
+                        ),
+                        "protocol_verified": False,
+                    }
+                )
+        self._notify()
+
+    def snapshot(self):
+        with self._lock:
+            results = [json.loads(json.dumps(item)) for item in self._states.values()]
+        results.sort(key=lambda item: (int(item.get("priority") or 0), str(item.get("id") or "")))
+        connected_count = sum(1 for item in results if item.get("enabled") and item.get("status") == "reachable")
+        enabled_count = sum(1 for item in results if item.get("enabled"))
+        return {
+            "failure_threshold": self._failure_threshold,
+            "connected_count": connected_count,
+            "enabled_count": enabled_count,
+            "results": results,
+        }
+
+
 class AsyncJsonlWriter:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
@@ -1070,6 +1288,7 @@ class AppRuntime:
         self.rule_suggestion_manager = None
         self.self_endpoints = SelfEndpoints()
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
+        self.proxy_status = UpstreamProxyListStatus(self.notify_dashboard_update)
         self.https_interception = HttpsCertificateManager(
             ca_cert_file=DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH,
             ca_key_file=DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH,
@@ -1312,6 +1531,7 @@ class AppRuntime:
             router_config,
             timeout_seconds=UPSTREAM_STATUS_PROBE_TIMEOUT_SECONDS,
         )
+        self.proxy_status.apply_config(router_config)
 
     def check_upstream_proxies(self, router_config):
         results = []
@@ -1351,6 +1571,7 @@ class AppRuntime:
                     }
                 payload.update(result)
             results.append(payload)
+        self.proxy_status.record_check_results(router_config, results)
         return {
             "checked_at": _timestamp_now(),
             "results": results,
@@ -1360,6 +1581,11 @@ class AppRuntime:
         if route_decision is None or route_decision.get("action") != "proxy":
             return
         self.upstream_status.record_success(
+            route_decision.get("upstream"),
+            destination=destination,
+            proxy_label=proxy_label,
+        )
+        self.proxy_status.record_success(
             route_decision.get("upstream"),
             destination=destination,
             proxy_label=proxy_label,
@@ -1377,6 +1603,13 @@ class AppRuntime:
         if route_decision is None or route_decision.get("action") != "proxy":
             return
         self.upstream_status.record_failure(
+            route_decision.get("upstream"),
+            destination=destination,
+            error=error,
+            context=context,
+            proxy_label=proxy_label,
+        )
+        self.proxy_status.record_failure(
             route_decision.get("upstream"),
             destination=destination,
             error=error,
