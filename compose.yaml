@@ -32,6 +32,10 @@ services:
       - /data/https-interception/certs
     volumes:
       - ./data:/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
     healthcheck:
       test:

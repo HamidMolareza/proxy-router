@@ -125,6 +125,8 @@ On Linux, Compose runs both services with host networking so the backend can obs
 
 The backend dashboard API binds only to `127.0.0.1:18798` on the host and is reverse-proxied by the dashboard container at `/api/*`.
 
+The backend container requests a `nofile` limit of `65536` and also raises its soft open-file limit at startup when the OS allows it. This keeps many concurrent CONNECT, SOCKS5, and HTTPS interception sockets from exhausting the default Docker soft limit.
+
 Build files:
 
 - [Dockerfile](Dockerfile) for the Python proxy/API container

@@ -27,6 +27,52 @@ from .proxy_server import (
 from .runtime import AppRuntime
 from .util import *
 
+DEFAULT_NOFILE_SOFT_LIMIT = 65536
+
+
+def raise_open_file_limit(target_soft_limit: int = DEFAULT_NOFILE_SOFT_LIMIT):
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return None
+
+    if hard_limit == resource.RLIM_INFINITY:
+        requested_soft_limit = max(soft_limit, target_soft_limit)
+    else:
+        requested_soft_limit = min(max(soft_limit, target_soft_limit), hard_limit)
+
+    if requested_soft_limit <= soft_limit:
+        return {
+            "changed": False,
+            "soft": soft_limit,
+            "hard": hard_limit,
+            "target": target_soft_limit,
+        }
+
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (requested_soft_limit, hard_limit))
+    except (OSError, ValueError):
+        return {
+            "changed": False,
+            "soft": soft_limit,
+            "hard": hard_limit,
+            "target": target_soft_limit,
+        }
+
+    return {
+        "changed": True,
+        "soft": requested_soft_limit,
+        "previous_soft": soft_limit,
+        "hard": hard_limit,
+        "target": target_soft_limit,
+    }
+
+
 def build_proxy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).name,
@@ -602,6 +648,15 @@ def main():
     except OSError as exc:
         ERROR_LOGGER.close()
         raise SystemExit(f"Error: could not open debug log file '{debug_log_path}': {exc}") from exc
+
+    nofile_limit = raise_open_file_limit()
+    if nofile_limit is not None:
+        if nofile_limit.get("changed"):
+            print_info(
+                "Open file soft limit raised "
+                f"from {nofile_limit['previous_soft']} to {nofile_limit['soft']}."
+            )
+        debug_log("system", f"open_file_limit={nofile_limit}", level="INFO")
 
     runtime = AppRuntime()
     runtime.configure_https_interception(
