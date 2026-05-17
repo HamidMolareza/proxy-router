@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
 const ROUTE_TYPES = ['direct', 'proxy', 'self', 'rejected']
@@ -38,6 +38,7 @@ const DEFAULT_ROUTING_PROFILE_ID = 'default'
 const DEFAULT_UPSTREAM_RETRY = {
   enabled: true,
   attempts: 4,
+  connect_timeout_seconds: 8,
   initial_delay_seconds: 1,
   max_delay_seconds: 5,
 }
@@ -258,6 +259,72 @@ function emptyDashboardSnapshot() {
       https_interception_status: emptyHttpsInterceptionStatus(),
     },
   }
+}
+
+function mergeDashboardSnapshot(existingSnapshot, patch) {
+  const base = existingSnapshot && typeof existingSnapshot === 'object' ? existingSnapshot : emptyDashboardSnapshot()
+  if (!patch || typeof patch !== 'object') {
+    return base
+  }
+  const mergedRuntime = {
+    ...(base.router_runtime || {}),
+    ...(patch.router_runtime || {}),
+  }
+  if (base.router_runtime?.network || patch.router_runtime?.network) {
+    mergedRuntime.network = {
+      ...(base.router_runtime?.network || {}),
+      ...(patch.router_runtime?.network || {}),
+    }
+  }
+  if (base.router_runtime?.active_profile || patch.router_runtime?.active_profile) {
+    mergedRuntime.active_profile = {
+      ...(base.router_runtime?.active_profile || {}),
+      ...(patch.router_runtime?.active_profile || {}),
+    }
+  }
+  if (base.router_runtime?.upstream_status || patch.router_runtime?.upstream_status) {
+    mergedRuntime.upstream_status = {
+      ...(base.router_runtime?.upstream_status || {}),
+      ...(patch.router_runtime?.upstream_status || {}),
+    }
+  }
+  if (base.router_runtime?.https_interception_status || patch.router_runtime?.https_interception_status) {
+    mergedRuntime.https_interception_status = {
+      ...(base.router_runtime?.https_interception_status || {}),
+      ...(patch.router_runtime?.https_interception_status || {}),
+    }
+  }
+  return {
+    ...base,
+    ...patch,
+    router_runtime: mergedRuntime,
+    failure_summary: {
+      ...(base.failure_summary || {}),
+      ...(patch.failure_summary || {}),
+    },
+  }
+}
+
+function dashboardScopeForTab(tab) {
+  if (tab === 'proxies') {
+    return 'proxies'
+  }
+  if (tab === 'routing') {
+    return 'routing'
+  }
+  if (tab === 'https') {
+    return 'https-status'
+  }
+  if (tab === 'users') {
+    return 'users'
+  }
+  if (tab === 'quotas') {
+    return 'quotas'
+  }
+  if (tab === 'failures') {
+    return 'failures'
+  }
+  return ''
 }
 
 function emptyUpstreamStatus() {
@@ -891,6 +958,12 @@ function normalizeRouterConfig(config) {
     upstream_retry: {
       enabled: upstreamRetry.enabled !== false,
       attempts: normalizeBoundedInteger(upstreamRetry.attempts, DEFAULT_UPSTREAM_RETRY.attempts, 1, 20),
+      connect_timeout_seconds: normalizeBoundedInteger(
+        upstreamRetry.connect_timeout_seconds,
+        DEFAULT_UPSTREAM_RETRY.connect_timeout_seconds,
+        1,
+        120,
+      ),
       initial_delay_seconds: normalizeBoundedInteger(
         upstreamRetry.initial_delay_seconds,
         DEFAULT_UPSTREAM_RETRY.initial_delay_seconds,
@@ -2271,11 +2344,13 @@ function App() {
   const historyUpstreamProxyIdRef = useRef(historyUpstreamProxyId)
   const historyClientRef = useRef(historyClient)
   const httpsTrafficRefreshTimerRef = useRef(null)
+  const dashboardScopeRefreshTimerRef = useRef(null)
   const httpsTrafficFiltersRef = useRef(httpsTrafficFilters)
   const copyStatusTimerRef = useRef(null)
   const routerHasLocalChangesRef = useRef(false)
   const refreshHistoryRef = useRef(null)
   const refreshHttpsTrafficRef = useRef(null)
+  const refreshDashboardScopeRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
   const autoSelectedRulesTargetRef = useRef(false)
   const httpsHostPatternsFocusedRef = useRef(false)
@@ -2285,15 +2360,21 @@ function App() {
     return token ? { Authorization: `Bearer ${token}` } : {}
   }, [adminApiToken])
 
-  const safeEditorProfileId =
-    currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
-    getRoutingTargetById(currentRouterConfig, currentEditorProfileId)
-      ? currentEditorProfileId
-      : DEFAULT_ROUTING_PROFILE_ID
-  const currentEditorTarget = getRoutingTargetById(currentRouterConfig, safeEditorProfileId) || currentRouterConfig
+  const safeEditorProfileId = useMemo(
+    () =>
+      currentEditorProfileId === DEFAULT_ROUTING_PROFILE_ID ||
+      getRoutingTargetById(currentRouterConfig, currentEditorProfileId)
+        ? currentEditorProfileId
+        : DEFAULT_ROUTING_PROFILE_ID,
+    [currentEditorProfileId, currentRouterConfig],
+  )
+  const currentEditorTarget = useMemo(
+    () => getRoutingTargetById(currentRouterConfig, safeEditorProfileId) || currentRouterConfig,
+    [currentRouterConfig, safeEditorProfileId],
+  )
   const currentActiveProfileId = activeProfileId(dashboardSnapshot)
   const currentActiveProfileLabel = getEditorTargetLabel(currentRouterConfig, currentActiveProfileId)
-  const activeProfileAutoRules = (() => {
+  const activeProfileAutoRules = useMemo(() => {
     if (!currentActiveProfileId || currentActiveProfileId === DEFAULT_ROUTING_PROFILE_ID) {
       return []
     }
@@ -2304,19 +2385,38 @@ function App() {
     return activeTarget.rules.filter(
       (rule) => rule && rule.enabled !== false && normalizeRuleSource(rule) === 'auto' && normalizeRulePattern(rule.pattern),
     )
-  })()
+  }, [currentActiveProfileId, currentRouterConfig])
   const editorDiffersFromActiveProfile = safeEditorProfileId !== currentActiveProfileId
-  const currentRuleIssues = findRouterRuleIssues(currentRouterConfig, safeEditorProfileId)
-  const allRuleIssues = findRouterRuleIssues(currentRouterConfig, DEFAULT_ROUTING_PROFILE_ID)
+  const currentRuleIssues = useMemo(
+    () => findRouterRuleIssues(currentRouterConfig, safeEditorProfileId),
+    [currentRouterConfig, safeEditorProfileId],
+  )
+  const allRuleIssues = useMemo(
+    () => findRouterRuleIssues(currentRouterConfig, DEFAULT_ROUTING_PROFILE_ID),
+    [currentRouterConfig],
+  )
   const routerBlockingRuleIssues = allRuleIssues
   const visibleRuleIssues = showAllRuleIssues ? allRuleIssues : currentRuleIssues
-  const ruleIssueRowKeys = new Set(
-    visibleRuleIssues.flatMap((issue) => [ruleRefKey(issue.left), ruleRefKey(issue.right)]),
+  const ruleIssueRowKeys = useMemo(
+    () => new Set(visibleRuleIssues.flatMap((issue) => [ruleRefKey(issue.left), ruleRefKey(issue.right)])),
+    [visibleRuleIssues],
   )
-  const routerPersistableConfig = buildPersistableRouterConfig(currentRouterConfig)
-  const savedRouterPersistableConfig = buildPersistableRouterConfig(lastSavedRouterConfig)
-  const routerPersistableFingerprint = routerConfigFingerprint(routerPersistableConfig)
-  const lastSavedRouterFingerprint = routerConfigFingerprint(savedRouterPersistableConfig)
+  const routerPersistableConfig = useMemo(
+    () => buildPersistableRouterConfig(currentRouterConfig),
+    [currentRouterConfig],
+  )
+  const savedRouterPersistableConfig = useMemo(
+    () => buildPersistableRouterConfig(lastSavedRouterConfig),
+    [lastSavedRouterConfig],
+  )
+  const routerPersistableFingerprint = useMemo(
+    () => routerConfigFingerprint(routerPersistableConfig),
+    [routerPersistableConfig],
+  )
+  const lastSavedRouterFingerprint = useMemo(
+    () => routerConfigFingerprint(savedRouterPersistableConfig),
+    [savedRouterPersistableConfig],
+  )
   const routerDirty = routerPersistableFingerprint !== lastSavedRouterFingerprint
   const routerDraftCount = countRouterDraftItems(currentRouterConfig)
   const routerHasLocalChanges = routerDirty || routerDraftCount > 0
@@ -2335,95 +2435,125 @@ function App() {
       }),
       warning: Boolean(routerSaveError),
     }
-  const rulesEntries = getEditorVisibleRuleEntries(currentRouterConfig, safeEditorProfileId)
-  const orderedRules = rulesEntries
-    .map((entry, visibleIndex) => ({
-      ...entry,
-      visible_index: visibleIndex,
-    }))
-    .filter((entry) => ruleMatchesSearch({ ...entry.rule, scope: entry.scope_label }, currentRulesSearchTerm))
-    .sort((left, right) => compareRuleEntries(left, right, rulesSort))
+  const rulesEntries = useMemo(
+    () => getEditorVisibleRuleEntries(currentRouterConfig, safeEditorProfileId),
+    [currentRouterConfig, safeEditorProfileId],
+  )
+  const orderedRules = useMemo(
+    () =>
+      rulesEntries
+        .map((entry, visibleIndex) => ({
+          ...entry,
+          visible_index: visibleIndex,
+        }))
+        .filter((entry) => ruleMatchesSearch({ ...entry.rule, scope: entry.scope_label }, currentRulesSearchTerm))
+        .sort((left, right) => compareRuleEntries(left, right, rulesSort)),
+    [currentRulesSearchTerm, rulesEntries, rulesSort],
+  )
   const totalRulePages = Math.max(1, Math.ceil(orderedRules.length / RULES_PAGE_SIZE))
   const rulesPage = clamp(currentRulesPage, 1, totalRulePages)
   const pagedRules = orderedRules.slice((rulesPage - 1) * RULES_PAGE_SIZE, rulesPage * RULES_PAGE_SIZE)
-  const failureView = buildFailureView(dashboardSnapshot, currentRouterConfig, safeEditorProfileId)
+  const failureView = useMemo(
+    () => buildFailureView(dashboardSnapshot, currentRouterConfig, safeEditorProfileId),
+    [currentRouterConfig, dashboardSnapshot, safeEditorProfileId],
+  )
   const totalFailurePages = Math.max(1, Math.ceil(failureView.groups.length / failureView.pageSize))
   const failurePage = clamp(currentFailurePage, 1, totalFailurePages)
   const failurePageItems = failureView.groups.slice(
     (failurePage - 1) * failureView.pageSize,
     failurePage * failureView.pageSize,
   )
-  const historyCards = buildHistoryCards(historyData)
-  const overviewCards = buildOverviewCards(dashboardSnapshot)
-  const usageChartPoints = buildUsageChartPoints(dashboardSnapshot)
-  const profileRuntimeItems = buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot)
-  const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
-  const routerSummaryItems = buildRouterSummaryItems(
-    currentRouterConfig,
-    safeEditorProfileId,
-    dashboardSnapshot,
+  const historyCards = useMemo(() => buildHistoryCards(historyData), [historyData])
+  const overviewCards = useMemo(() => buildOverviewCards(dashboardSnapshot), [dashboardSnapshot])
+  const usageChartPoints = useMemo(() => buildUsageChartPoints(dashboardSnapshot), [dashboardSnapshot])
+  const profileRuntimeItems = useMemo(
+    () => buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot),
+    [currentRouterConfig, dashboardSnapshot],
   )
-  const knownClients = Array.isArray(dashboardSnapshot.known_clients) ? dashboardSnapshot.known_clients : []
-  const ruleSuggestions = Array.isArray(dashboardSnapshot.rule_suggestions) ? dashboardSnapshot.rule_suggestions : []
-  const pendingRuleSuggestions = ruleSuggestions.filter((item) => item && item.status === 'pending')
+  const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
+  const routerSummaryItems = useMemo(
+    () =>
+      buildRouterSummaryItems(
+        currentRouterConfig,
+        safeEditorProfileId,
+        dashboardSnapshot,
+      ),
+    [currentRouterConfig, dashboardSnapshot, safeEditorProfileId],
+  )
+  const knownClients = useMemo(
+    () => (Array.isArray(dashboardSnapshot.known_clients) ? dashboardSnapshot.known_clients : []),
+    [dashboardSnapshot.known_clients],
+  )
+  const ruleSuggestions = useMemo(
+    () => (Array.isArray(dashboardSnapshot.rule_suggestions) ? dashboardSnapshot.rule_suggestions : []),
+    [dashboardSnapshot.rule_suggestions],
+  )
+  const pendingRuleSuggestions = useMemo(
+    () => ruleSuggestions.filter((item) => item && item.status === 'pending'),
+    [ruleSuggestions],
+  )
   const normalizedRuleSuggestionsSearchTerm = String(ruleSuggestionsSearchTerm || '').trim().toLowerCase()
-  const filteredRuleSuggestions = ruleSuggestions
-    .filter((suggestion) => {
-      const status = String((suggestion && suggestion.status) || 'pending')
-      if (ruleSuggestionsStatusFilter !== 'all' && status !== ruleSuggestionsStatusFilter) {
-        return false
-      }
-      if (!normalizedRuleSuggestionsSearchTerm) {
-        return true
-      }
-      const rule = (suggestion && suggestion.rule) || {}
-      const conflicts = [
-        ...(
-          Array.isArray(suggestion.current_conflicts)
-            ? suggestion.current_conflicts
-            : []
-        ),
-        ...(
-          Array.isArray(suggestion.conflicts)
-            ? suggestion.conflicts
-            : []
-        ),
-      ]
-      const searchText = [
-        status,
-        suggestion.requested_at,
-        suggestion.resolved_at,
-        suggestion.requester,
-        suggestion.requester_username,
-        suggestion.requester_label,
-        suggestion.requester_ip,
-        suggestion.profile_id,
-        suggestion.profile_name,
-        suggestion.request_note,
-        suggestion.admin_message,
-        suggestion.current_error,
-        rule.pattern,
-        rule.match,
-        rule.action,
-        rule.duration,
-        rule.note,
-        ...conflicts.map((issue) => issue && issue.message),
-      ]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase()
-      return searchText.includes(normalizedRuleSuggestionsSearchTerm)
-    })
-    .sort((left, right) => {
-      const leftDate = parseDateText(left && left.requested_at)
-      const rightDate = parseDateText(right && right.requested_at)
-      const leftMs = leftDate ? leftDate.getTime() : 0
-      const rightMs = rightDate ? rightDate.getTime() : 0
-      if (leftMs !== rightMs) {
-        return rightMs - leftMs
-      }
-      return String(right && right.id ? right.id : '').localeCompare(String(left && left.id ? left.id : ''))
-    })
+  const filteredRuleSuggestions = useMemo(
+    () =>
+      ruleSuggestions
+        .filter((suggestion) => {
+          const status = String((suggestion && suggestion.status) || 'pending')
+          if (ruleSuggestionsStatusFilter !== 'all' && status !== ruleSuggestionsStatusFilter) {
+            return false
+          }
+          if (!normalizedRuleSuggestionsSearchTerm) {
+            return true
+          }
+          const rule = (suggestion && suggestion.rule) || {}
+          const conflicts = [
+            ...(
+              Array.isArray(suggestion.current_conflicts)
+                ? suggestion.current_conflicts
+                : []
+            ),
+            ...(
+              Array.isArray(suggestion.conflicts)
+                ? suggestion.conflicts
+                : []
+            ),
+          ]
+          const searchText = [
+            status,
+            suggestion.requested_at,
+            suggestion.resolved_at,
+            suggestion.requester,
+            suggestion.requester_username,
+            suggestion.requester_label,
+            suggestion.requester_ip,
+            suggestion.profile_id,
+            suggestion.profile_name,
+            suggestion.request_note,
+            suggestion.admin_message,
+            suggestion.current_error,
+            rule.pattern,
+            rule.match,
+            rule.action,
+            rule.duration,
+            rule.note,
+            ...conflicts.map((issue) => issue && issue.message),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          return searchText.includes(normalizedRuleSuggestionsSearchTerm)
+        })
+        .sort((left, right) => {
+          const leftDate = parseDateText(left && left.requested_at)
+          const rightDate = parseDateText(right && right.requested_at)
+          const leftMs = leftDate ? leftDate.getTime() : 0
+          const rightMs = rightDate ? rightDate.getTime() : 0
+          if (leftMs !== rightMs) {
+            return rightMs - leftMs
+          }
+          return String(right && right.id ? right.id : '').localeCompare(String(left && left.id ? left.id : ''))
+        }),
+    [normalizedRuleSuggestionsSearchTerm, ruleSuggestions, ruleSuggestionsStatusFilter],
+  )
   const totalRuleSuggestionPages = Math.max(
     1,
     Math.ceil(filteredRuleSuggestions.length / RULE_SUGGESTIONS_PAGE_SIZE),
@@ -2433,7 +2563,10 @@ function App() {
     (ruleSuggestionsPage - 1) * RULE_SUGGESTIONS_PAGE_SIZE,
     ruleSuggestionsPage * RULE_SUGGESTIONS_PAGE_SIZE,
   )
-  const snapshotClientBlockStatus = dashboardSnapshot.client_block_status || {}
+  const snapshotClientBlockStatus = useMemo(
+    () => dashboardSnapshot.client_block_status || {},
+    [dashboardSnapshot.client_block_status],
+  )
   const historyNote = historyError || buildHistoryNote(historyData)
   const historyPeriodTotals = Array.isArray(historyData.period_totals) ? historyData.period_totals : []
   const historyClientPeriodTotals = Array.isArray(historyData.client_period_totals)
@@ -2442,121 +2575,140 @@ function App() {
   const httpsTrafficRows = Array.isArray(httpsTrafficData.items) ? httpsTrafficData.items : []
   const httpsTrafficSelectedId = httpsTrafficDetail && httpsTrafficDetail.id ? httpsTrafficDetail.id : ''
   const normalizedUsersSearchTerm = String(usersSearchTerm || '').trim().toLowerCase()
-  const usersTableRows = knownClients
-    .map((row) => {
-      const blockStatus =
-        findExactClientBlock(currentRouterConfig.client_blocks, row.client) ||
-        snapshotClientBlockStatus[row.client] ||
-        null
-      const blockDuration =
-        clientBlockDraftDurations[row.client] || (blockStatus && blockStatus.duration) || '6h'
-      const kindLabel =
-        row.kind === 'user' ? 'User' : row.kind === 'network' ? 'Network' : 'IP'
-      const activeConnections = Number(row.active_connections || 0)
-      const totalBytes = Number(row.total_bytes || 0)
-      const lastSeenAt = row.last_seen_at ? String(row.last_seen_at) : ''
-      const lastSeenDate = parseDateText(lastSeenAt)
-      const blockRank = !blockStatus ? 0 : blockStatus.expires_at ? 1 : 2
-      const blockStatusText = !blockStatus
-        ? 'Allowed'
-        : blockStatus.expires_at
-          ? 'Blocked temporarily'
-          : 'Blocked always'
-      const searchText = [
-        row.client,
-        row.label,
-        row.username,
-        kindLabel,
-        Array.isArray(row.source_ips) ? row.source_ips.join(' ') : '',
-        Array.isArray(row.proxy_types) ? row.proxy_types.join(' ') : '',
-        row.configured ? 'configured' : '',
-        row.credential_enabled === true ? 'auth enabled' : row.credential_enabled === false ? 'auth disabled' : '',
-        blockStatusText,
-        blockStatus && blockStatus.target ? blockStatus.target : '',
-      ]
-        .filter(Boolean)
-        .join(' ')
-        .toLowerCase()
-      return {
-        activeConnections,
-        blockDuration,
-        blockRank,
-        blockStatus,
-        blockStatusText,
-        kindLabel,
-        lastSeenDate,
-        lastSeenMs: lastSeenDate ? lastSeenDate.getTime() : 0,
-        row,
-        searchText,
-        totalBytes,
-      }
-    })
-    .filter((item) => !normalizedUsersSearchTerm || item.searchText.includes(normalizedUsersSearchTerm))
-    .sort((left, right) => {
-      let compared = 0
-      if (usersSort.key === 'active') {
-        compared = compareNumbers(left.activeConnections, right.activeConnections, usersSort.direction)
-      } else if (usersSort.key === 'total') {
-        compared = compareNumbers(left.totalBytes, right.totalBytes, usersSort.direction)
-      } else if (usersSort.key === 'last_seen') {
-        compared = compareNumbers(left.lastSeenMs, right.lastSeenMs, usersSort.direction)
-      } else if (usersSort.key === 'block_status') {
-        compared = compareNumbers(left.blockRank, right.blockRank, usersSort.direction)
-      }
-      if (compared !== 0) {
-        return compared
-      }
-      return String(left.row.client || '').localeCompare(String(right.row.client || ''))
-    })
-  const quotaDeviceRows = dashboardSnapshot.totals_by_client.map((client) => {
-    const quota = dashboardSnapshot.client_quota_status[client.client] || {}
-    const usage = quota.usage || {}
-    const limit = quota.limit || {}
-    const used1h = Number((usage['1h'] || {}).total_bytes || 0)
-    const used3h = Number((usage['3h'] || {}).total_bytes || 0)
-    const activeConnections = Number(client.active_connections || 0)
-    const totalBytes = Number(client.total_bytes || 0)
-    const limitScope =
-      limit.scope === 'default'
-        ? 'Default'
-        : limit.scope === 'custom'
-          ? 'Custom'
-          : limit.scope === 'exempt'
-            ? 'Exempt'
-            : ''
-    const statusText = quota.limit
-      ? limit.scope === 'exempt'
-        ? limit.expires_at
-          ? `Exempt for ${formatDuration(
-              Math.max(1, Math.floor((new Date(limit.expires_at).getTime() - nowMs) / 1000)),
-            )}`
-          : 'Exempt'
-        : quota.allowed === false
-          ? `Blocked (${limitScope || 'Limit'}) for ${formatDuration(quota.retry_after_seconds)}`
-          : `Within ${limitScope || 'configured'} limit`
-      : 'No limit'
-    return {
-      activeConnections,
-      client,
-      limit,
-      quota,
-      statusText,
-      totalBytes,
-      used1h,
-      used3h,
-    }
-  })
-  const sortedQuotaDeviceRows = [...quotaDeviceRows].sort((left, right) => {
-    const compared = compareNumbers(
-      getQuotaClientSortValue(left, quotaDeviceSort.key),
-      getQuotaClientSortValue(right, quotaDeviceSort.key),
-      quotaDeviceSort.direction,
-    )
-    if (compared !== 0) {
-      return compared
-    }
-    return String(left.client.client).localeCompare(String(right.client.client))
-  })
+  const usersTableRows = useMemo(
+    () =>
+      knownClients
+        .map((row) => {
+          const blockStatus =
+            findExactClientBlock(currentRouterConfig.client_blocks, row.client) ||
+            snapshotClientBlockStatus[row.client] ||
+            null
+          const blockDuration =
+            clientBlockDraftDurations[row.client] || (blockStatus && blockStatus.duration) || '6h'
+          const kindLabel =
+            row.kind === 'user' ? 'User' : row.kind === 'network' ? 'Network' : 'IP'
+          const activeConnections = Number(row.active_connections || 0)
+          const totalBytes = Number(row.total_bytes || 0)
+          const lastSeenAt = row.last_seen_at ? String(row.last_seen_at) : ''
+          const lastSeenDate = parseDateText(lastSeenAt)
+          const blockRank = !blockStatus ? 0 : blockStatus.expires_at ? 1 : 2
+          const blockStatusText = !blockStatus
+            ? 'Allowed'
+            : blockStatus.expires_at
+              ? 'Blocked temporarily'
+              : 'Blocked always'
+          const searchText = [
+            row.client,
+            row.label,
+            row.username,
+            kindLabel,
+            Array.isArray(row.source_ips) ? row.source_ips.join(' ') : '',
+            Array.isArray(row.proxy_types) ? row.proxy_types.join(' ') : '',
+            row.configured ? 'configured' : '',
+            row.credential_enabled === true ? 'auth enabled' : row.credential_enabled === false ? 'auth disabled' : '',
+            blockStatusText,
+            blockStatus && blockStatus.target ? blockStatus.target : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase()
+          return {
+            activeConnections,
+            blockDuration,
+            blockRank,
+            blockStatus,
+            blockStatusText,
+            kindLabel,
+            lastSeenDate,
+            lastSeenMs: lastSeenDate ? lastSeenDate.getTime() : 0,
+            row,
+            searchText,
+            totalBytes,
+          }
+        })
+        .filter((item) => !normalizedUsersSearchTerm || item.searchText.includes(normalizedUsersSearchTerm))
+        .sort((left, right) => {
+          let compared = 0
+          if (usersSort.key === 'active') {
+            compared = compareNumbers(left.activeConnections, right.activeConnections, usersSort.direction)
+          } else if (usersSort.key === 'total') {
+            compared = compareNumbers(left.totalBytes, right.totalBytes, usersSort.direction)
+          } else if (usersSort.key === 'last_seen') {
+            compared = compareNumbers(left.lastSeenMs, right.lastSeenMs, usersSort.direction)
+          } else if (usersSort.key === 'block_status') {
+            compared = compareNumbers(left.blockRank, right.blockRank, usersSort.direction)
+          }
+          if (compared !== 0) {
+            return compared
+          }
+          return String(left.row.client || '').localeCompare(String(right.row.client || ''))
+        }),
+    [
+      clientBlockDraftDurations,
+      currentRouterConfig.client_blocks,
+      knownClients,
+      normalizedUsersSearchTerm,
+      snapshotClientBlockStatus,
+      usersSort,
+    ],
+  )
+  const quotaDeviceRows = useMemo(
+    () =>
+      dashboardSnapshot.totals_by_client.map((client) => {
+        const quota = dashboardSnapshot.client_quota_status[client.client] || {}
+        const usage = quota.usage || {}
+        const limit = quota.limit || {}
+        const used1h = Number((usage['1h'] || {}).total_bytes || 0)
+        const used3h = Number((usage['3h'] || {}).total_bytes || 0)
+        const activeConnections = Number(client.active_connections || 0)
+        const totalBytes = Number(client.total_bytes || 0)
+        const limitScope =
+          limit.scope === 'default'
+            ? 'Default'
+            : limit.scope === 'custom'
+              ? 'Custom'
+              : limit.scope === 'exempt'
+                ? 'Exempt'
+                : ''
+        const statusText = quota.limit
+          ? limit.scope === 'exempt'
+            ? limit.expires_at
+              ? `Exempt for ${formatDuration(
+                  Math.max(1, Math.floor((new Date(limit.expires_at).getTime() - nowMs) / 1000)),
+                )}`
+              : 'Exempt'
+            : quota.allowed === false
+              ? `Blocked (${limitScope || 'Limit'}) for ${formatDuration(quota.retry_after_seconds)}`
+              : `Within ${limitScope || 'configured'} limit`
+          : 'No limit'
+        return {
+          activeConnections,
+          client,
+          limit,
+          quota,
+          statusText,
+          totalBytes,
+          used1h,
+          used3h,
+        }
+      }),
+    [dashboardSnapshot.client_quota_status, dashboardSnapshot.totals_by_client, nowMs],
+  )
+  const sortedQuotaDeviceRows = useMemo(
+    () =>
+      [...quotaDeviceRows].sort((left, right) => {
+        const compared = compareNumbers(
+          getQuotaClientSortValue(left, quotaDeviceSort.key),
+          getQuotaClientSortValue(right, quotaDeviceSort.key),
+          quotaDeviceSort.direction,
+        )
+        if (compared !== 0) {
+          return compared
+        }
+        return String(left.client.client).localeCompare(String(right.client.client))
+      }),
+    [quotaDeviceRows, quotaDeviceSort],
+  )
   function toggleQuotaDeviceSort(key) {
     setQuotaDeviceSort((current) => ({
       key,
@@ -2569,54 +2721,58 @@ function App() {
     }
     return quotaDeviceSort.direction === 'asc' ? ' ↑' : ' ↓'
   }
-  const proxyClientTrafficRows = currentRouterConfig.proxies
-    .flatMap((proxy) => {
-      const proxyQuota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
-      const clientStatusMap =
-        proxyQuota.clients && typeof proxyQuota.clients === 'object' && !Array.isArray(proxyQuota.clients)
-          ? proxyQuota.clients
-          : {}
-      return Object.entries(clientStatusMap).map(([client, status]) => {
-        const clientUsage = (status && status.client_usage) || {}
-        const used1h = Number((clientUsage['1h'] || {}).total_bytes || 0)
-        const used3h = Number((clientUsage['3h'] || {}).total_bytes || 0)
-        const used7d = Number((clientUsage['7d'] || {}).total_bytes || 0)
-        const exceededWindows = Array.isArray(status.client_exceeded_windows)
-          ? status.client_exceeded_windows
-          : []
-        const globalExceededWindows = Array.isArray(status.exceeded_windows) ? status.exceeded_windows : []
-        return {
-          allowed: status.allowed !== false,
-          client,
-          exceededWindows,
-          globalExceededWindows,
-          proxy,
-          used1h,
-          used3h,
-          used7d,
-        }
-      })
-    })
-    .filter(
-      (row) =>
-        row.used1h > 0 ||
-        row.used3h > 0 ||
-        row.used7d > 0 ||
-        !row.allowed ||
-        row.exceededWindows.length > 0 ||
-        row.globalExceededWindows.length > 0,
-    )
-    .sort((left, right) => {
-      const priorityCompare = compareNumbers(Number(left.proxy.priority || 0), Number(right.proxy.priority || 0), 'asc')
-      if (priorityCompare !== 0) {
-        return priorityCompare
-      }
-      const proxyCompare = String(left.proxy.id || '').localeCompare(String(right.proxy.id || ''))
-      if (proxyCompare !== 0) {
-        return proxyCompare
-      }
-      return String(left.client || '').localeCompare(String(right.client || ''))
-    })
+  const proxyClientTrafficRows = useMemo(
+    () =>
+      currentRouterConfig.proxies
+        .flatMap((proxy) => {
+          const proxyQuota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
+          const clientStatusMap =
+            proxyQuota.clients && typeof proxyQuota.clients === 'object' && !Array.isArray(proxyQuota.clients)
+              ? proxyQuota.clients
+              : {}
+          return Object.entries(clientStatusMap).map(([client, status]) => {
+            const clientUsage = (status && status.client_usage) || {}
+            const used1h = Number((clientUsage['1h'] || {}).total_bytes || 0)
+            const used3h = Number((clientUsage['3h'] || {}).total_bytes || 0)
+            const used7d = Number((clientUsage['7d'] || {}).total_bytes || 0)
+            const exceededWindows = Array.isArray(status.client_exceeded_windows)
+              ? status.client_exceeded_windows
+              : []
+            const globalExceededWindows = Array.isArray(status.exceeded_windows) ? status.exceeded_windows : []
+            return {
+              allowed: status.allowed !== false,
+              client,
+              exceededWindows,
+              globalExceededWindows,
+              proxy,
+              used1h,
+              used3h,
+              used7d,
+            }
+          })
+        })
+        .filter(
+          (row) =>
+            row.used1h > 0 ||
+            row.used3h > 0 ||
+            row.used7d > 0 ||
+            !row.allowed ||
+            row.exceededWindows.length > 0 ||
+            row.globalExceededWindows.length > 0,
+        )
+        .sort((left, right) => {
+          const priorityCompare = compareNumbers(Number(left.proxy.priority || 0), Number(right.proxy.priority || 0), 'asc')
+          if (priorityCompare !== 0) {
+            return priorityCompare
+          }
+          const proxyCompare = String(left.proxy.id || '').localeCompare(String(right.proxy.id || ''))
+          if (proxyCompare !== 0) {
+            return proxyCompare
+          }
+          return String(left.client || '').localeCompare(String(right.client || ''))
+        }),
+    [currentRouterConfig.proxies, dashboardSnapshot.proxy_quota_status],
+  )
   function toggleRulesSort(key) {
     setRulesSort((current) => ({
       key,
@@ -2821,6 +2977,24 @@ function App() {
     }
   }
 
+  async function refreshDashboardScope(scope) {
+    const normalizedScope = String(scope || '').trim()
+    if (!normalizedScope) {
+      return
+    }
+    const response = await fetch(`/api/dashboard/${encodeURIComponent(normalizedScope)}`, {
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json',
+      },
+    })
+    if (!response.ok) {
+      throw new Error(`dashboard ${normalizedScope} HTTP ${response.status}`)
+    }
+    const payload = await response.json()
+    setDashboardSnapshot((existingSnapshot) => mergeDashboardSnapshot(existingSnapshot, payload))
+  }
+
   async function loadHttpsTrafficDetail(requestId) {
     if (!requestId) {
       setHttpsTrafficDetail(null)
@@ -2966,6 +3140,7 @@ function App() {
   useEffect(() => {
     refreshHistoryRef.current = refreshHistory
     refreshHttpsTrafficRef.current = refreshHttpsTraffic
+    refreshDashboardScopeRef.current = refreshDashboardScope
     loadRouterConfigRef.current = loadRouterConfig
   })
 
@@ -3036,6 +3211,26 @@ function App() {
       }, 250)
     }
 
+    function scheduleDashboardScopeRefresh(tab) {
+      const scope = dashboardScopeForTab(tab)
+      if (!scope || dashboardScopeRefreshTimerRef.current != null) {
+        return
+      }
+      dashboardScopeRefreshTimerRef.current = window.setTimeout(() => {
+        dashboardScopeRefreshTimerRef.current = null
+        const refresh = refreshDashboardScopeRef.current
+        if (!refresh) {
+          return
+        }
+        refresh(scope).catch((error) => {
+          setStatus({
+            text: `Dashboard ${scope} refresh paused: ${error.message}`,
+            warning: true,
+          })
+        })
+      }, 250)
+    }
+
     function connectLiveSocket() {
       if (disposed) {
         return
@@ -3069,7 +3264,7 @@ function App() {
         }
 
         setNowMs(Date.now())
-        setDashboardSnapshot(payload.snapshot)
+        setDashboardSnapshot((existingSnapshot) => mergeDashboardSnapshot(existingSnapshot, payload.snapshot))
         setStatus({
           text: `Live socket connected · ${new Date().toLocaleTimeString()}`,
           warning: false,
@@ -3090,6 +3285,7 @@ function App() {
         if (payload.https_traffic_changed && activeTabRef.current === 'https') {
           scheduleHttpsTrafficRefresh()
         }
+        scheduleDashboardScopeRefresh(activeTabRef.current)
       })
 
       socket.addEventListener('close', () => {
@@ -3132,6 +3328,10 @@ function App() {
         window.clearTimeout(httpsTrafficRefreshTimerRef.current)
         httpsTrafficRefreshTimerRef.current = null
       }
+      if (dashboardScopeRefreshTimerRef.current != null) {
+        window.clearTimeout(dashboardScopeRefreshTimerRef.current)
+        dashboardScopeRefreshTimerRef.current = null
+      }
       if (copyStatusTimerRef.current != null) {
         window.clearTimeout(copyStatusTimerRef.current)
         copyStatusTimerRef.current = null
@@ -3146,6 +3346,28 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    const scope = dashboardScopeForTab(activeTab)
+    if (!scope) {
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      const refresh = refreshDashboardScopeRef.current
+      if (!refresh) {
+        return
+      }
+      refresh(scope).catch((error) => {
+        setStatus({
+          text: `Dashboard ${scope} refresh paused: ${error.message}`,
+          warning: true,
+        })
+      })
+    }, 0)
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [activeTab])
 
   useEffect(() => {
     if (activeTab !== 'history') {
@@ -4876,6 +5098,21 @@ function App() {
                       />
                     </label>
                     <label className={fieldClass}>
+                      <span>Setup timeout seconds</span>
+                      <input
+                        className={cx(routerHasLocalChanges && dirtyInputClass)}
+                        type="number"
+                        min="1"
+                        max="120"
+                        value={currentRouterConfig.upstream_retry.connect_timeout_seconds}
+                        onChange={(event) => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.upstream_retry.connect_timeout_seconds = event.target.value.trim()
+                          setLocalRouterConfig(nextConfig)
+                        }}
+                      />
+                    </label>
+                    <label className={fieldClass}>
                       <span>First delay seconds</span>
                       <input
                         className={cx(routerHasLocalChanges && dirtyInputClass)}
@@ -5644,6 +5881,30 @@ function App() {
                     />
                     <span>Enable adaptive HTTPS request sniffing</span>
                   </label>
+                  {currentRouterConfig.https_interception.enabled &&
+                    currentRouterConfig.https_interception.mode === 'all' && (
+                      <div className={noteClass}>
+                        All-host HTTPS sniffing decrypts every CONNECT tunnel on port 443 and reduces raw proxy
+                        throughput.
+                      </div>
+                    )}
+                  {currentRouterConfig.https_interception.enabled && (
+                    <div className={tightButtonRowClass}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nextConfig = cloneJson(currentRouterConfig)
+                          nextConfig.https_interception.enabled = false
+                          nextConfig.https_interception.mode = 'allowlist'
+                          setLocalRouterConfig(nextConfig, {
+                            message: 'Throughput mode disables HTTPS sniffing and keeps raw CONNECT tunnels fast.',
+                          })
+                        }}
+                      >
+                        Use throughput mode
+                      </button>
+                    </div>
+                  )}
                   <div className={fieldGridClass}>
                     <label className={fieldClass}>
                       <span>Mode</span>

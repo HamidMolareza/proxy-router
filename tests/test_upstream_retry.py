@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from proxy_router.config import RouterConfigManager
-from proxy_router.proxy_server import retry_upstream_operation, should_retry_stream_setup_error
+from proxy_router.proxy_server import normalize_upstream_retry_policy, retry_upstream_operation, should_retry_stream_setup_error
 from proxy_router.runtime import AppRuntime
 from proxy_router.util import normalize_router_config, proxy_allows_client
 
@@ -29,6 +29,7 @@ class UpstreamRetryConfigTests(unittest.TestCase):
                 "upstream_retry": {
                     "enabled": True,
                     "attempts": "6",
+                    "connect_timeout_seconds": "7",
                     "initial_delay_seconds": "2",
                     "max_delay_seconds": "8",
                 },
@@ -40,10 +41,112 @@ class UpstreamRetryConfigTests(unittest.TestCase):
             {
                 "enabled": True,
                 "attempts": 6,
+                "connect_timeout_seconds": 7,
                 "initial_delay_seconds": 2,
                 "max_delay_seconds": 8,
             },
         )
+
+    def test_normalize_upstream_retry_policy_clamps_connect_timeout(self):
+        self.assertEqual(
+            normalize_upstream_retry_policy({"connect_timeout_seconds": "300"})["connect_timeout_seconds"],
+            120.0,
+        )
+        self.assertEqual(
+            normalize_upstream_retry_policy({"connect_timeout_seconds": "invalid"})["connect_timeout_seconds"],
+            8.0,
+        )
+
+    def test_route_decision_cache_reuses_match_and_returns_fresh_clone(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router-config.json")
+            try:
+                manager.update(
+                    {
+                        "default_action": "direct",
+                        "proxies": [
+                            {
+                                "id": "main",
+                                "enabled": True,
+                                "type": "socks5",
+                                "host": "127.0.0.1",
+                                "port": 8901,
+                                "priority": 1,
+                            }
+                        ],
+                        "rules": [
+                            {
+                                "enabled": True,
+                                "pattern": "example.com",
+                                "match": "suffix",
+                                "action": "proxy",
+                                "duration": "always",
+                            }
+                        ],
+                    }
+                )
+
+                import proxy_router.config as config_module
+
+                calls = []
+                original_rule_matches_host = config_module.rule_matches_host
+
+                def counted_rule_matches_host(rule, host):
+                    calls.append((rule["pattern"], host))
+                    return original_rule_matches_host(rule, host)
+
+                with patch("proxy_router.config.rule_matches_host", side_effect=counted_rule_matches_host):
+                    first = manager.decide("api.example.com", client_ip="127.0.0.1")
+                    first["connect_host"] = "mutated"
+                    first["upstream_candidates"].append({"id": "mutated"})
+                    second = manager.decide("api.example.com", client_ip="127.0.0.1")
+
+                self.assertEqual(first["action"], "proxy")
+                self.assertEqual(second["action"], "proxy")
+                self.assertNotIn("connect_host", second)
+                self.assertEqual([proxy["id"] for proxy in second["upstream_candidates"]], ["main"])
+                self.assertEqual(calls, [("example.com", "api.example.com")])
+            finally:
+                manager.shutdown()
+
+    def test_route_decision_cache_is_invalidated_after_config_update(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router-config.json")
+            try:
+                base_config = {
+                    "default_action": "direct",
+                    "proxies": [
+                        {
+                            "id": "main",
+                            "enabled": True,
+                            "type": "socks5",
+                            "host": "127.0.0.1",
+                            "port": 8901,
+                            "priority": 1,
+                        }
+                    ],
+                    "rules": [
+                        {
+                            "enabled": True,
+                            "pattern": "example.com",
+                            "match": "suffix",
+                            "action": "direct",
+                            "duration": "always",
+                        }
+                    ],
+                }
+                manager.update(base_config)
+                self.assertEqual(manager.decide("api.example.com", client_ip="127.0.0.1")["action"], "direct")
+
+                updated_config = dict(base_config)
+                updated_config["rules"] = [dict(base_config["rules"][0], action="proxy")]
+                manager.update(updated_config)
+
+                decision = manager.decide("api.example.com", client_ip="127.0.0.1")
+                self.assertEqual(decision["action"], "proxy")
+                self.assertEqual(decision["upstream"]["id"], "main")
+            finally:
+                manager.shutdown()
 
     def test_normalize_router_config_rejects_retry_max_below_initial_delay(self):
         with self.assertRaisesRegex(ValueError, "max_delay_seconds"):

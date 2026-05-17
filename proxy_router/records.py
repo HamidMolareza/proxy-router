@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -31,12 +32,14 @@ class UsageHistoryCache:
         self._offset = 0
         self._records = []
         self._invalid_lines = 0
+        self._history_payload_cache = {}
 
     def _reset(self):
         self._file_id = None
         self._offset = 0
         self._records = []
         self._invalid_lines = 0
+        self._history_payload_cache = {}
 
     def clear(self):
         with self._lock:
@@ -45,16 +48,18 @@ class UsageHistoryCache:
     def _load_if_needed(self):
         if self.log_file is None:
             self._reset()
-            return
+            return False
 
         try:
             stat = self.log_file.stat()
         except FileNotFoundError:
             self._reset()
-            return
+            return False
 
         file_id = (getattr(stat, "st_dev", None), getattr(stat, "st_ino", None))
         reload_full = self._file_id != file_id or stat.st_size < self._offset
+        previous_offset = self._offset
+        previous_invalid_lines = self._invalid_lines
 
         if reload_full:
             self._records = []
@@ -76,6 +81,46 @@ class UsageHistoryCache:
 
             self._offset = stream.tell()
             self._file_id = file_id
+        appended = self._offset != previous_offset or self._invalid_lines != previous_invalid_lines
+        changed = reload_full or appended
+        # Appends are loaded into memory immediately, but cached summaries may
+        # stay briefly stale so active traffic does not force full aggregation
+        # on every dashboard refresh. Rotation/truncation still invalidates.
+        if reload_full:
+            self._history_payload_cache = {}
+        return changed
+
+    def _history_payload_cache_key(
+        self,
+        *,
+        range_key: str,
+        proxy_type: str | None,
+        client: str | None,
+        upstream_proxy_id: str | None,
+        timezone_name: str | None,
+        timezone_offset_minutes,
+    ):
+        time_bucket = int(time.time() // HISTORY_SUMMARY_CACHE_SECONDS)
+        return (
+            self._file_id,
+            self._invalid_lines,
+            time_bucket,
+            str(range_key or ""),
+            str(proxy_type or ""),
+            str(client or ""),
+            str(upstream_proxy_id or ""),
+            str(timezone_name or ""),
+            str(timezone_offset_minutes or ""),
+        )
+
+    @staticmethod
+    def _clone_payload(payload):
+        return json.loads(json.dumps(payload))
+
+    def _remember_history_payload(self, cache_key, payload):
+        if len(self._history_payload_cache) >= HISTORY_SUMMARY_CACHE_MAX_SIZE:
+            self._history_payload_cache.pop(next(iter(self._history_payload_cache)), None)
+        self._history_payload_cache[cache_key] = self._clone_payload(payload)
 
     def build_history_payload(
         self,
@@ -89,10 +134,21 @@ class UsageHistoryCache:
     ):
         with self._lock:
             self._load_if_needed()
+            cache_key = self._history_payload_cache_key(
+                range_key=range_key,
+                proxy_type=proxy_type,
+                client=client,
+                upstream_proxy_id=upstream_proxy_id,
+                timezone_name=timezone_name,
+                timezone_offset_minutes=timezone_offset_minutes,
+            )
+            cached_payload = self._history_payload_cache.get(cache_key)
+            if cached_payload is not None:
+                return self._clone_payload(cached_payload)
             records = list(self._records)
             invalid_lines = self._invalid_lines
 
-        return summarize_history_records(
+        payload = summarize_history_records(
             records,
             invalid_lines=invalid_lines,
             range_key=range_key,
@@ -102,6 +158,10 @@ class UsageHistoryCache:
             timezone_name=timezone_name,
             timezone_offset_minutes=timezone_offset_minutes,
         )
+        with self._lock:
+            if cache_key[0] == self._file_id and cache_key[1] == self._invalid_lines:
+                self._remember_history_payload(cache_key, payload)
+        return self._clone_payload(payload)
 
     def recent_records(
         self,

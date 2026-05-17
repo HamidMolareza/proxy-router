@@ -6,7 +6,7 @@ import hashlib
 import html
 import http.client
 import json
-import select
+import selectors
 import socket
 import socketserver
 import ssl
@@ -23,6 +23,18 @@ from .constants import *
 from .output import debug_exception, debug_log, log_event
 from .records import UsageHistoryCache
 from .util import *
+
+_DEFAULT_CLIENT_SSL_CONTEXT = None
+_DEFAULT_CLIENT_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def default_client_ssl_context():
+    global _DEFAULT_CLIENT_SSL_CONTEXT
+    if _DEFAULT_CLIENT_SSL_CONTEXT is None:
+        with _DEFAULT_CLIENT_SSL_CONTEXT_LOCK:
+            if _DEFAULT_CLIENT_SSL_CONTEXT is None:
+                _DEFAULT_CLIENT_SSL_CONTEXT = ssl.create_default_context()
+    return _DEFAULT_CLIENT_SSL_CONTEXT
 
 
 def encode_websocket_text_frame(payload_text: str) -> bytes:
@@ -122,6 +134,7 @@ def default_upstream_retry_policy():
     return {
         "enabled": True,
         "attempts": UPSTREAM_RETRY_ATTEMPTS,
+        "connect_timeout_seconds": DEFAULT_CONNECT_TIMEOUT_SECONDS,
         "initial_delay_seconds": UPSTREAM_RETRY_INITIAL_DELAY_SECONDS,
         "max_delay_seconds": UPSTREAM_RETRY_MAX_DELAY_SECONDS,
     }
@@ -136,14 +149,24 @@ def normalize_upstream_retry_policy(policy):
     attempts = max(1, int(source.get("attempts", UPSTREAM_RETRY_ATTEMPTS)))
     if not enabled:
         attempts = 1
+    try:
+        raw_connect_timeout_seconds = float(source.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        raw_connect_timeout_seconds = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    connect_timeout_seconds = max(1.0, min(raw_connect_timeout_seconds, float(CONNECT_TIMEOUT_SECONDS_LIMIT)))
     initial_delay_seconds = max(0.0, float(source.get("initial_delay_seconds", UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)))
     max_delay_seconds = max(initial_delay_seconds, float(source.get("max_delay_seconds", UPSTREAM_RETRY_MAX_DELAY_SECONDS)))
     return {
         "enabled": enabled,
         "attempts": attempts,
+        "connect_timeout_seconds": connect_timeout_seconds,
         "initial_delay_seconds": initial_delay_seconds,
         "max_delay_seconds": max_delay_seconds,
     }
+
+
+def connect_timeout_from_retry_policy(policy) -> float:
+    return normalize_upstream_retry_policy(policy)["connect_timeout_seconds"]
 
 
 def retry_upstream_operation(
@@ -351,37 +374,74 @@ def build_websocket_upgrade_request(method: str, target_path: str, headers, host
 def tunnel_bidirectional(left_socket, right_socket):
     left_socket.setblocking(False)
     right_socket.setblocking(False)
-    sockets = [left_socket, right_socket]
+    selector = selectors.DefaultSelector()
+    buffers = {
+        left_socket: bytearray(),
+        right_socket: bytearray(),
+    }
     stats = {
         "left_to_right_bytes": 0,
         "right_to_left_bytes": 0,
     }
 
-    while True:
-        readable, _, exceptional = select.select(sockets, [], sockets, 1.0)
-        if exceptional:
-            return stats
+    def peer_for(sock):
+        return right_socket if sock is left_socket else left_socket
 
-        for current in readable:
+    def update_interest(sock):
+        events = 0
+        peer = peer_for(sock)
+        if len(buffers[peer]) < MAX_TUNNEL_PENDING_BYTES:
+            events |= selectors.EVENT_READ
+        if buffers[sock]:
+            events |= selectors.EVENT_WRITE
+        if not events:
             try:
-                data = current.recv(BUFFER_SIZE)
-            except OSError:
-                return stats
+                selector.unregister(sock)
+            except KeyError:
+                pass
+            return
+        try:
+            selector.modify(sock, events)
+        except KeyError:
+            selector.register(sock, events)
 
-            if not data:
-                return stats
+    update_interest(left_socket)
+    update_interest(right_socket)
 
-            target = right_socket if current is left_socket else left_socket
-            try:
-                target.sendall(data)
-            except OSError:
-                return stats
+    try:
+        while True:
+            for key, events in selector.select(timeout=1.0):
+                current = key.fileobj
+                if events & selectors.EVENT_READ:
+                    try:
+                        data = current.recv(BUFFER_SIZE)
+                    except OSError:
+                        return stats
 
-            if current is left_socket:
-                stats["left_to_right_bytes"] += len(data)
-            else:
-                stats["right_to_left_bytes"] += len(data)
+                    if not data:
+                        return stats
 
+                    target = peer_for(current)
+                    buffers[target].extend(data)
+                    if current is left_socket:
+                        stats["left_to_right_bytes"] += len(data)
+                    else:
+                        stats["right_to_left_bytes"] += len(data)
+                    update_interest(current)
+                    update_interest(target)
+
+                if events & selectors.EVENT_WRITE and buffers[current]:
+                    try:
+                        sent = current.send(buffers[current])
+                    except OSError:
+                        return stats
+                    if sent <= 0:
+                        return stats
+                    del buffers[current][:sent]
+                    update_interest(current)
+                    update_interest(peer_for(current))
+    finally:
+        selector.close()
 
 class ClientTracker:
     def __init__(self, proxy_label: str, runtime):
@@ -2217,10 +2277,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         raise last_error or OSError("upstream proxy selection failed")
 
     def _open_routed_stream_once(self, host: str, port: int, route_decision):
+        connect_timeout = connect_timeout_from_retry_policy(self.server.router_config.upstream_retry_settings())
         connect_host = route_decision.get("connect_host", host)
         connect_port = route_decision.get("connect_port", port)
         if route_decision["action"] != "proxy":
-            return socket.create_connection((connect_host, connect_port), timeout=self.server.timeout_seconds), None
+            return socket.create_connection((connect_host, connect_port), timeout=connect_timeout), None
 
         upstream = route_decision["upstream"]
         if upstream is None:
@@ -2232,7 +2293,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 upstream["port"],
                 host,
                 port,
-                self.server.timeout_seconds,
+                connect_timeout,
             )
             self.server.runtime.record_upstream_route_success(
                 route_decision,
@@ -2246,7 +2307,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             upstream["port"],
             host,
             port,
-            self.server.timeout_seconds,
+            connect_timeout,
         )
         self.server.runtime.record_upstream_route_success(
             route_decision,
@@ -2341,7 +2402,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     raw_stream, current_owner, selected_route = opened_stream
                 current_stream = raw_stream
                 if scheme == "https":
-                    current_stream = ssl.create_default_context().wrap_socket(raw_stream, server_hostname=host)
+                    current_stream = default_client_ssl_context().wrap_socket(raw_stream, server_hostname=host)
                 current_stream.settimeout(self.server.timeout_seconds)
 
                 self._debug(
@@ -2559,7 +2620,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
     def _perform_upstream_request_once(self, scheme, host, port, target_path, body, outbound_headers, *, route_decision):
         request_target = target_path
-        connection_kwargs = {"timeout": self.server.timeout_seconds}
+        connect_timeout = connect_timeout_from_retry_policy(self.server.router_config.upstream_retry_settings())
+        connection_kwargs = {"timeout": connect_timeout}
         connect_host = route_decision.get("connect_host", host)
         connect_port = route_decision.get("connect_port", port)
         connection = None
@@ -2574,7 +2636,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         connection = http.client.HTTPSConnection(
                             upstream["host"],
                             upstream["port"],
-                            context=ssl.create_default_context(),
+                            context=default_client_ssl_context(),
                             **connection_kwargs,
                         )
                         connection.set_tunnel(host, port)
@@ -2589,29 +2651,32 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         upstream["port"],
                         host,
                         port,
-                        self.server.timeout_seconds,
+                        connect_timeout,
                     )
                     if scheme == "https":
                         connection = PreconnectedHTTPSConnection(
                             host,
                             port=port,
                             preconnected_socket=upstream_socket,
-                            timeout=self.server.timeout_seconds,
-                            context=ssl.create_default_context(),
+                            timeout=connect_timeout,
+                            context=default_client_ssl_context(),
                         )
                     else:
                         connection = PreconnectedHTTPConnection(
                             host,
                             port=port,
                             preconnected_socket=upstream_socket,
-                            timeout=self.server.timeout_seconds,
+                            timeout=connect_timeout,
                         )
-                connection.connect()
             else:
                 connection_class = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
                 if scheme == "https":
-                    connection_kwargs["context"] = ssl.create_default_context()
+                    connection_kwargs["context"] = default_client_ssl_context()
                 connection = connection_class(connect_host, connect_port, **connection_kwargs)
+            connection.connect()
+            connection_socket = getattr(connection, "sock", None)
+            if connection_socket is not None:
+                connection_socket.settimeout(self.server.timeout_seconds)
         except Exception as exc:
             if connection is not None:
                 connection.close()
@@ -3723,6 +3788,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         raise last_error or OSError("upstream proxy selection failed")
 
     def _open_routed_stream_once(self, destination_host: str, destination_port: int, route_decision):
+        connect_timeout = connect_timeout_from_retry_policy(self.server.router_config.upstream_retry_settings())
         if route_decision["action"] == "proxy":
             proxy = route_decision["upstream"]
             if proxy is None:
@@ -3733,7 +3799,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     proxy["port"],
                     destination_host,
                     destination_port,
-                    self.server.timeout_seconds,
+                    connect_timeout,
                 )
                 return upstream_owner.sock, upstream_owner
             return (
@@ -3742,7 +3808,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     proxy["port"],
                     destination_host,
                     destination_port,
-                    self.server.timeout_seconds,
+                    connect_timeout,
                 ),
                 None,
             )
@@ -3753,7 +3819,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     route_decision.get("connect_host", destination_host),
                     route_decision.get("connect_port", destination_port),
                 ),
-                timeout=self.server.timeout_seconds,
+                timeout=connect_timeout,
             ),
             None,
         )

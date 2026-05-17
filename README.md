@@ -195,7 +195,7 @@ Current dashboard behaviors:
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
 - Admin clients can query request-history rows through `/api/history/requests` with client, host, route, upstream proxy, status, search, sort, and paging filters
-- Overview and live dashboard state are pushed over a WebSocket instead of a 2-second polling loop
+- Overview and live dashboard state are pushed over a lightweight WebSocket snapshot instead of a 2-second polling loop; heavier tab data is fetched from scoped dashboard endpoints only when that tab needs it
 - Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
@@ -203,6 +203,7 @@ Current dashboard behaviors:
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.
 - HTTPS interception can be enabled for all CONNECT port 443 hosts or only allowlisted host patterns, with adaptive fallback for devices/apps that reject the CA
+- The `HTTPS` tab includes a throughput mode action that disables sniffing and returns CONNECT traffic to the raw tunnel path.
 - Unmanaged direct HTTPS domains are learned in the background. The router probes direct TLS and upstream TLS without requiring a device CA; if direct fails and upstream succeeds, the existing temporary auto-proxy rule flow is activated.
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
 - Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried through allowed upstream proxies when auto-proxy is available; a proxy rule is added only if that retry succeeds
@@ -210,7 +211,7 @@ Current dashboard behaviors:
 - The `Users` tab can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
-- Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests.
+- Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests. The retry policy also controls the setup timeout used while opening each destination or upstream connection.
 - Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
 - Admin API tokens protect dashboard/API write endpoints after the first token is created. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
 - The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
@@ -222,7 +223,7 @@ Current dashboard behaviors:
 
 ## Performance Observability
 
-Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time.
+Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time. Usage, failure, and HTTPS analysis JSONL records are queued through a bounded background writer so request threads do not flush every log line synchronously. Dashboard history summaries are cached briefly by filter set and time bucket, while detailed request-history queries remain filterable and bounded.
 
 Use these fields when investigating slow traffic:
 
@@ -232,13 +233,14 @@ Use these fields when investigating slow traffic:
 - `throughput_bps`: completed bytes per second for records with a duration sample
 - `upstream_retry_count` and `upstream_retry_delay_ms`: retry attempts and configured backoff delay before a request succeeded or failed
 - `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`: selected upstream proxy and how many priority candidates were skipped before success
+- `upstream_retry.connect_timeout_seconds`: setup timeout for destination/upstream proxy connections; lower values fail over faster, higher values tolerate slow upstreams
 
 Diagnosis tips:
 
 - Compare `direct` and `proxy:*` route rows in the dashboard. If only proxied rows are slow, inspect the upstream proxy/VPN and retry settings first.
 - High `upstream_setup_ms` with low relay time usually points to DNS/connect/TLS/upstream latency.
 - Long `relay_ms` or low `throughput_bps` points to transfer speed, client Wi-Fi, upstream bandwidth, or a long-lived tunnel.
-- HTTPS interception can add TLS and body-preview work for matched hosts; raw CONNECT/SOCKS5 avoids that inspection path.
+- HTTPS interception can add TLS and body-preview work for matched hosts; use HTTPS throughput mode or an allowlist-only setup when raw CONNECT/SOCKS5 speed matters.
 - `python3 ./proxy-router usage-analyze /tmp/proxy-router-usage.log` prints timing samples from the same JSONL data for offline review.
 
 ## Quotas

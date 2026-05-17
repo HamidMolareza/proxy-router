@@ -1256,6 +1256,7 @@ def default_router_config():
         "upstream_retry": {
             "enabled": True,
             "attempts": UPSTREAM_RETRY_ATTEMPTS,
+            "connect_timeout_seconds": DEFAULT_CONNECT_TIMEOUT_SECONDS,
             "initial_delay_seconds": UPSTREAM_RETRY_INITIAL_DELAY_SECONDS,
             "max_delay_seconds": UPSTREAM_RETRY_MAX_DELAY_SECONDS,
         },
@@ -1538,6 +1539,15 @@ def normalize_router_config(payload):
         field_name="router upstream_retry attempts",
         minimum=1,
         maximum=UPSTREAM_RETRY_ATTEMPTS_LIMIT,
+    )
+    upstream_retry_connect_timeout_seconds = normalize_positive_int(
+        upstream_retry_payload.get(
+            "connect_timeout_seconds",
+            default_config["upstream_retry"]["connect_timeout_seconds"],
+        ),
+        field_name="router upstream_retry connect_timeout_seconds",
+        minimum=1,
+        maximum=CONNECT_TIMEOUT_SECONDS_LIMIT,
     )
     upstream_retry_initial_delay_seconds = normalize_positive_int(
         upstream_retry_payload.get(
@@ -1833,6 +1843,7 @@ def normalize_router_config(payload):
                 )
             ),
             "attempts": upstream_retry_attempts,
+            "connect_timeout_seconds": upstream_retry_connect_timeout_seconds,
             "initial_delay_seconds": upstream_retry_initial_delay_seconds,
             "max_delay_seconds": upstream_retry_max_delay_seconds,
         },

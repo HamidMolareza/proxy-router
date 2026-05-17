@@ -6,7 +6,7 @@
 
 - A Python backend that accepts proxy traffic and exposes dashboard APIs
 - A React frontend that renders the dashboard and talks to the backend through `/api/*`
-- A WebSocket live-update channel at `/api/live` for pushed dashboard snapshots
+- A WebSocket live-update channel at `/api/live` for lightweight overview snapshots and change notifications
 
 In Docker, the backend and dashboard use separate Dockerfiles.
 
@@ -66,8 +66,8 @@ Purpose:
 ### Dashboard traffic
 
 1. A browser opens the dashboard frontend.
-2. The frontend opens `/api/live` for pushed dashboard snapshots and change notifications.
-3. The frontend still uses `/api/*` for filtered history queries and config writes.
+2. The frontend opens `/api/live` for pushed overview snapshots and change notifications.
+3. The frontend still uses `/api/*` for filtered history queries, scoped tab data, and config writes.
 4. Nginx forwards those requests to the backend dashboard API on `127.0.0.1:18798`.
 5. The backend returns JSON payloads used by the React UI.
 
@@ -145,6 +145,7 @@ The backend executable remains:
 Important routes:
 
 - `GET /api/dashboard`
+- `GET /api/dashboard/{scope}` where `scope` is `overview`, `users`, `failures`, `proxies`, `quotas`, `routing`, `https-status`, or `full`
 - `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
 - `GET /api/history/requests` with optional `client`, `client_ip`, `proxy_type`, `upstream_proxy_id`, `route_label`, `host`, `method`, `status_code`, `search`, `sort`, `direction`, `page`, `page_size`, and `max_results` query parameters
 - `GET /api/router-config`
@@ -165,6 +166,7 @@ Important routes:
 History API notes:
 
 - `/api/history` returns aggregate summaries and period buckets for dashboard charts.
+- `/api/history` summary responses are cached briefly by usage-log identity, invalid-line count, range/filter values, timezone fields, and time bucket. Appends are loaded but may be reflected on the next cache bucket; truncation, rotation, or explicit traffic-data clears invalidate cached summaries immediately.
 - `/api/history/requests` returns summarized request rows from `usage.log`; it filters before sorting, applies `max_results` before paging, and clamps page sizes to keep MCP and dashboard callers bounded.
 - `/api/https-traffic` is separate from request history because it reads intercepted HTTPS analyzer records with request/response metadata from `https-traffic.log`.
 
@@ -190,7 +192,7 @@ Common defaults:
 ## Design Notes
 
 - The backend is mostly standard-library Python; HTTPS interception uses `cryptography` for certificate generation and optional body-preview decoders for common HTTP content encodings.
-- The dashboard frontend is separate from the backend and consumes JSON APIs.
+- The dashboard frontend is separate from the backend and consumes JSON APIs. The initial/live dashboard payload stays overview-oriented; heavier users, failure, proxy quota, routing suggestion, quota, and HTTPS-status sections are requested from scoped dashboard endpoints when those tabs are active.
 - The root executable is a thin shim; most backend behavior lives in `proxy_router/`.
 - Runtime state is centralized in `AppRuntime` instead of spreading service globals across the codebase.
 - Optional proxy authentication supports HTTP Basic `Proxy-Authorization` and SOCKS5 username/password. Anonymous access can remain enabled, and authenticated traffic is logged, limited, and exempted as `user:<username>` while retaining the source IP metadata.

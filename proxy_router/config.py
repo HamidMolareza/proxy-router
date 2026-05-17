@@ -637,10 +637,17 @@ class RouterConfigManager:
         self._change_callback = change_callback
         self._lock = threading.Lock()
         self._config = default_router_config()
+        self._route_decision_cache = {}
+        self._route_decision_generation = 0
+        self._next_expiration_at = None
         self._network_monitor = NetworkProfileMonitor(change_callback=self._notify_change)
         self._load()
+        self._refresh_next_expiration_locked()
 
     def _notify_change(self, reason: str):
+        if reason == "network-profile":
+            with self._lock:
+                self._clear_route_decision_cache_locked()
         if callable(self._change_callback):
             self._change_callback(reason)
 
@@ -660,10 +667,56 @@ class RouterConfigManager:
 
         self._config = normalize_router_config(json.loads(content))
 
+    def _clear_route_decision_cache_locked(self):
+        self._route_decision_cache.clear()
+        self._route_decision_generation += 1
+
+    def _clone_route_decision(self, decision: dict) -> dict:
+        cloned = dict(decision)
+        if isinstance(cloned.get("matched_rule"), dict):
+            cloned["matched_rule"] = dict(cloned["matched_rule"])
+        if isinstance(cloned.get("upstream"), dict):
+            cloned["upstream"] = dict(cloned["upstream"])
+        if isinstance(cloned.get("profile_signature"), dict):
+            cloned["profile_signature"] = json.loads(json.dumps(cloned["profile_signature"]))
+        if isinstance(cloned.get("upstream_candidates"), list):
+            cloned["upstream_candidates"] = [
+                dict(proxy) if isinstance(proxy, dict) else proxy
+                for proxy in cloned["upstream_candidates"]
+            ]
+        return cloned
+
+    def _refresh_next_expiration_locked(self):
+        expirations = []
+
+        def add_expiration(value):
+            parsed = parse_datetime_text(value)
+            if parsed is not None:
+                expirations.append(parsed)
+
+        for rule in self._config.get("rules", []):
+            add_expiration(rule.get("expires_at"))
+        for profile in self._config.get("routing_profiles", []):
+            for rule in profile.get("rules", []):
+                add_expiration(rule.get("expires_at"))
+        for exemption in self._config.get("client_traffic_exemptions", []):
+            add_expiration(exemption.get("expires_at"))
+        for block in self._config.get("client_blocks", []):
+            add_expiration(block.get("expires_at"))
+
+        self._next_expiration_at = min(expirations) if expirations else None
+
+    def _remember_route_decision_locked(self, cache_key, decision: dict):
+        if len(self._route_decision_cache) >= ROUTE_DECISION_CACHE_MAX_SIZE:
+            self._route_decision_cache.pop(next(iter(self._route_decision_cache)), None)
+        self._route_decision_cache[cache_key] = self._clone_route_decision(decision)
+
     def _write_config_locked(self, normalized_config):
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         self.config_file.write_text(json.dumps(normalized_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self._config = normalized_config
+        self._refresh_next_expiration_locked()
+        self._clear_route_decision_cache_locked()
 
     def _public_config_locked(self):
         config = json.loads(json.dumps(self._config))
@@ -709,41 +762,53 @@ class RouterConfigManager:
 
     def _prune_expired_rules_locked(self) -> bool:
         now = datetime.now().astimezone()
-        expired_found = False
+        if self._next_expiration_at is None or self._next_expiration_at > now:
+            return False
+
+        expired_found = any(is_rule_expired(rule, now=now) for rule in self._config.get("rules", []))
+        if not expired_found:
+            expired_found = any(
+                is_rule_expired(rule, now=now)
+                for profile in self._config.get("routing_profiles", [])
+                for rule in profile.get("rules", [])
+            )
+        if not expired_found:
+            expired_found = any(
+                is_client_traffic_exemption_expired(exemption, now=now)
+                for exemption in self._config.get("client_traffic_exemptions", [])
+            )
+        if not expired_found:
+            expired_found = any(
+                is_client_block_expired(block, now=now)
+                for block in self._config.get("client_blocks", [])
+            )
+        if not expired_found:
+            self._refresh_next_expiration_locked()
+            return False
+
         config = json.loads(json.dumps(self._config))
         config["rules"] = [
             rule
             for rule in config.get("rules", [])
             if not is_rule_expired(rule, now=now)
         ]
-        if len(config["rules"]) != len(self._config.get("rules", [])):
-            expired_found = True
 
         for index, profile in enumerate(config.get("routing_profiles", [])):
             original_rules = profile.get("rules", [])
             active_rules = [rule for rule in original_rules if not is_rule_expired(rule, now=now)]
-            if len(active_rules) != len(original_rules):
-                config["routing_profiles"][index]["rules"] = active_rules
-                expired_found = True
+            config["routing_profiles"][index]["rules"] = active_rules
 
         config["client_traffic_exemptions"] = [
             exemption
             for exemption in config.get("client_traffic_exemptions", [])
             if not is_client_traffic_exemption_expired(exemption, now=now)
         ]
-        if len(config["client_traffic_exemptions"]) != len(self._config.get("client_traffic_exemptions", [])):
-            expired_found = True
 
         config["client_blocks"] = [
             block
             for block in config.get("client_blocks", [])
             if not is_client_block_expired(block, now=now)
         ]
-        if len(config["client_blocks"]) != len(self._config.get("client_blocks", [])):
-            expired_found = True
-
-        if not expired_found:
-            return False
 
         normalized = normalize_router_config(config)
         self._write_config_locked(normalized)
@@ -1221,6 +1286,9 @@ class RouterConfigManager:
             return {
                 "enabled": bool(settings.get("enabled", True)),
                 "attempts": int(settings.get("attempts", UPSTREAM_RETRY_ATTEMPTS)),
+                "connect_timeout_seconds": int(
+                    settings.get("connect_timeout_seconds", DEFAULT_CONNECT_TIMEOUT_SECONDS)
+                ),
                 "initial_delay_seconds": int(
                     settings.get("initial_delay_seconds", UPSTREAM_RETRY_INITIAL_DELAY_SECONDS)
                 ),
@@ -1442,8 +1510,21 @@ class RouterConfigManager:
     def decide(self, host: str, *, client_id: str | None = None, client_ip: str | None = None):
         normalized_host = normalize_host(host)
         network_state = self._network_monitor.snapshot()
+        network_signature_key = str((network_state or {}).get("signature_key") or "")
         with self._lock:
             self._prune_expired_rules_locked()
+            cache_generation = self._route_decision_generation
+            cache_key = (
+                cache_generation,
+                network_signature_key,
+                normalized_host,
+                str(client_id or "").strip(),
+                str(client_ip or "").strip(),
+            )
+            cached_decision = self._route_decision_cache.get(cache_key)
+            if cached_decision is not None:
+                return self._clone_route_decision(cached_decision)
+
             config = self._config
             resolution = self._resolve_effective_profile_locked(network_state=network_state)
             profile = resolution["profile"]
@@ -1473,7 +1554,7 @@ class RouterConfigManager:
             )
             upstream = dict(upstream_candidates[0]) if upstream_candidates else None
 
-        return {
+        decision = {
             "host": normalized_host,
             "action": action,
             "matched_rule": matched_rule,
@@ -1496,3 +1577,7 @@ class RouterConfigManager:
                 )
             ),
         }
+        with self._lock:
+            if cache_generation == self._route_decision_generation:
+                self._remember_route_decision_locked(cache_key, decision)
+        return self._clone_route_decision(decision)

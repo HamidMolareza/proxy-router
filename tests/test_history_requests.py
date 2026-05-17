@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from proxy_router.records import UsageHistoryCache
 
@@ -103,6 +104,95 @@ class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
             self.assertEqual(payload["total"], 4)
             self.assertTrue(payload["truncated"])
             self.assertEqual(payload["items"], [])
+
+    def test_build_history_payload_reuses_cached_summary_until_cache_window_expires(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "usage.log"
+            first_record = {
+                "timestamp": "2026-05-01T10:00:00+00:00",
+                "client": "user:mobile",
+                "proxy_type": "http",
+                "destination": "https://api.example.com/v1/items",
+                "total_bytes": 100,
+            }
+            second_record = {
+                "timestamp": "2026-05-01T10:01:00+00:00",
+                "client": "user:mobile",
+                "proxy_type": "http",
+                "destination": "https://api.example.com/v1/login",
+                "total_bytes": 50,
+            }
+            log_file.write_text(json.dumps(first_record) + "\n", encoding="utf-8")
+
+            call_record_counts = []
+
+            def fake_summary(records, **kwargs):
+                call_record_counts.append(len(records))
+                return {
+                    "summary": {"count": len(records)},
+                    "invalid_lines": kwargs["invalid_lines"],
+                    "range": kwargs["range_key"],
+                }
+
+            cache = UsageHistoryCache(log_file)
+            with patch("proxy_router.records.summarize_history_records", side_effect=fake_summary):
+                with patch("proxy_router.records.time.time", return_value=1000):
+                    first_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                    first_payload["summary"]["count"] = 999
+                    second_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                    with log_file.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(second_record) + "\n")
+                    appended_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                with patch("proxy_router.records.time.time", return_value=1070):
+                    expired_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+
+            self.assertEqual(call_record_counts, [1, 2])
+            self.assertEqual(second_payload["summary"]["count"], 1)
+            self.assertEqual(appended_payload["summary"]["count"], 1)
+            self.assertEqual(expired_payload["summary"]["count"], 2)
+
+    def test_build_history_payload_invalidates_cached_summary_on_log_rotation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "usage.log"
+            first_record = {
+                "timestamp": "2026-05-01T10:00:00+00:00",
+                "client": "user:mobile",
+                "proxy_type": "http",
+                "destination": "https://api.example.com/v1/items",
+                "total_bytes": 100,
+            }
+            rotated_record = {
+                "timestamp": "2026-05-01T10:01:00+00:00",
+                "client": "192.168.1.30",
+                "proxy_type": "connect",
+                "destination": "rotated.example.com:443",
+                "total_bytes": 50,
+            }
+            log_file.write_text(json.dumps(first_record) + "\n", encoding="utf-8")
+
+            call_record_counts = []
+
+            def fake_summary(records, **kwargs):
+                call_record_counts.append(len(records))
+                return {
+                    "summary": {"first_client": records[0]["client"] if records else ""},
+                    "invalid_lines": kwargs["invalid_lines"],
+                    "range": kwargs["range_key"],
+                }
+
+            cache = UsageHistoryCache(log_file)
+            with (
+                patch("proxy_router.records.time.time", return_value=1000),
+                patch("proxy_router.records.summarize_history_records", side_effect=fake_summary),
+            ):
+                first_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                log_file.unlink()
+                log_file.write_text(json.dumps(rotated_record) + "\n", encoding="utf-8")
+                second_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+
+            self.assertEqual(call_record_counts, [1, 1])
+            self.assertEqual(first_payload["summary"]["first_client"], "user:mobile")
+            self.assertEqual(second_payload["summary"]["first_client"], "192.168.1.30")
 
 
 if __name__ == "__main__":

@@ -140,6 +140,27 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(record["upstream_proxy_id"], "fallback")
             self.assertEqual(record["proxy_failover_count"], 1)
 
+    def test_usage_logger_clear_waits_for_pending_async_writes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "usage.log"
+            logger = UsageLogger(log_file)
+            try:
+                for index in range(25):
+                    logger.record(
+                        proxy_label="http",
+                        kind="http",
+                        client="127.0.0.1",
+                        destination=f"example-{index}.com",
+                        uploaded_bytes=10,
+                        downloaded_bytes=20,
+                        timestamp="2026-05-01T03:08:00+00:00",
+                    )
+                logger.clear_data()
+            finally:
+                logger.close()
+
+            self.assertEqual(log_file.read_text(encoding="utf-8"), "")
+
     def test_proxy_quota_manager_tracks_global_and_per_client_proxy_usage(self):
         manager = TrafficQuotaManager()
         proxy = {

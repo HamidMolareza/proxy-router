@@ -156,56 +156,144 @@ def build_client_block_status_map(client_rows, router_config):
     return status_map
 
 
-def build_dashboard_snapshot(server):
-    snapshot = server.runtime.dashboard_state.snapshot()
-    full_router_config_snapshot = server.router_config.snapshot()
+def build_router_runtime_dashboard_snapshot(server):
     router_runtime_snapshot = server.router_config.runtime_snapshot()
     router_runtime_snapshot["upstream_status"] = server.runtime.upstream_status.snapshot()
     router_runtime_snapshot["https_interception_status"] = server.runtime.https_interception_status(
         server.router_config.https_interception_settings()
     )
-    active_profile = router_runtime_snapshot.get("active_profile") or {}
-    active_profile_id = str(active_profile.get("id") or DEFAULT_ROUTING_PROFILE_ID)
-    routing_snapshot = server.router_config.effective_routing_snapshot(profile_id=active_profile_id)
+    return router_runtime_snapshot
+
+
+def _filtered_recent_failures(server, snapshot, active_profile_id: str):
     manager = server.runtime.auto_proxy_failure_manager
     if manager is not None:
-        snapshot["recent_failures"] = manager.filter_resolved_failures(
+        recent_failures = manager.filter_resolved_failures(
             snapshot.get("recent_failures", []),
             profile_id=active_profile_id,
         )
         review_failures = manager.manual_review_failures(profile_id=active_profile_id)
     else:
+        recent_failures = list(snapshot.get("recent_failures", []))
         review_failures = []
     if review_failures:
-        recent_failures = list(snapshot.get("recent_failures", [])) + review_failures
+        recent_failures = list(recent_failures) + review_failures
         recent_failures.sort(key=lambda item: str(item.get("timestamp", "")), reverse=True)
-        snapshot["recent_failures"] = recent_failures
-    snapshot["failure_summary"] = build_failure_snapshot_from_records(
-        snapshot.get("recent_failures", []),
-        routing_snapshot,
-    )
-    snapshot["client_quota_status"] = build_client_quota_status_map(
-        snapshot.get("totals_by_client", []),
-        server.runtime,
-        server.router_config,
-    )
-    snapshot["proxy_quota_status"] = server.runtime.traffic_quota_manager.proxy_snapshot(
-        full_router_config_snapshot.get("proxies", []),
-        [row.get("client") for row in snapshot.get("totals_by_client", [])],
-    )
-    snapshot["known_clients"] = build_known_client_rows(snapshot, full_router_config_snapshot)
-    snapshot["client_block_status"] = build_client_block_status_map(
-        snapshot["known_clients"],
-        server.router_config,
-    )
+    return recent_failures
+
+
+def build_dashboard_overview_snapshot(server):
+    snapshot = server.runtime.dashboard_state.snapshot()
+    snapshot.pop("recent_failures", None)
+    snapshot["router_runtime"] = build_router_runtime_dashboard_snapshot(server)
+    return snapshot
+
+
+def build_dashboard_failures_snapshot(server):
+    snapshot = server.runtime.dashboard_state.snapshot()
+    router_runtime_snapshot = build_router_runtime_dashboard_snapshot(server)
+    active_profile = router_runtime_snapshot.get("active_profile") or {}
+    active_profile_id = str(active_profile.get("id") or DEFAULT_ROUTING_PROFILE_ID)
+    routing_snapshot = server.router_config.effective_routing_snapshot(profile_id=active_profile_id)
+    recent_failures = _filtered_recent_failures(server, snapshot, active_profile_id)
+    return {
+        "recent_failures": recent_failures,
+        "failure_summary": build_failure_snapshot_from_records(
+            recent_failures,
+            routing_snapshot,
+        ),
+    }
+
+
+def build_dashboard_users_snapshot(server):
+    snapshot = server.runtime.dashboard_state.snapshot()
+    full_router_config_snapshot = server.router_config.snapshot()
+    known_clients = build_known_client_rows(snapshot, full_router_config_snapshot)
+    return {
+        "known_clients": known_clients,
+        "client_block_status": build_client_block_status_map(
+            known_clients,
+            server.router_config,
+        ),
+    }
+
+
+def build_dashboard_quotas_snapshot(server):
+    snapshot = server.runtime.dashboard_state.snapshot()
+    totals_by_client = snapshot.get("totals_by_client", [])
+    return {
+        "totals_by_client": totals_by_client,
+        "client_quota_status": build_client_quota_status_map(
+            totals_by_client,
+            server.runtime,
+            server.router_config,
+        ),
+    }
+
+
+def build_dashboard_proxies_snapshot(server):
+    snapshot = server.runtime.dashboard_state.snapshot()
+    full_router_config_snapshot = server.router_config.snapshot()
+    return {
+        "proxy_quota_status": server.runtime.traffic_quota_manager.proxy_snapshot(
+            full_router_config_snapshot.get("proxies", []),
+            [row.get("client") for row in snapshot.get("totals_by_client", [])],
+        ),
+    }
+
+
+def build_dashboard_routing_snapshot(server):
     rule_suggestion_manager = getattr(server.runtime, "rule_suggestion_manager", None)
     if rule_suggestion_manager is not None:
-        snapshot["rule_suggestions"] = rule_suggestion_manager.snapshot(
-            include_current_conflicts=True
-        )
+        rule_suggestions = rule_suggestion_manager.snapshot(include_current_conflicts=True)
     else:
-        snapshot["rule_suggestions"] = []
-    snapshot["router_runtime"] = router_runtime_snapshot
+        rule_suggestions = []
+    return {
+        "router_runtime": build_router_runtime_dashboard_snapshot(server),
+        "rule_suggestions": rule_suggestions,
+    }
+
+
+def build_dashboard_https_status_snapshot(server):
+    return {
+        "router_runtime": {
+            "https_interception_status": server.runtime.https_interception_status(
+                server.router_config.https_interception_settings()
+            )
+        }
+    }
+
+
+def build_dashboard_snapshot(server, *, scope: str = "overview"):
+    normalized_scope = str(scope or "overview").strip().lower()
+    if normalized_scope == "overview":
+        return build_dashboard_overview_snapshot(server)
+    if normalized_scope == "failures":
+        return build_dashboard_failures_snapshot(server)
+    if normalized_scope == "users":
+        return build_dashboard_users_snapshot(server)
+    if normalized_scope == "quotas":
+        return build_dashboard_quotas_snapshot(server)
+    if normalized_scope == "proxies":
+        return build_dashboard_proxies_snapshot(server)
+    if normalized_scope == "routing":
+        return build_dashboard_routing_snapshot(server)
+    if normalized_scope == "https-status":
+        return build_dashboard_https_status_snapshot(server)
+    if normalized_scope != "full":
+        return build_dashboard_overview_snapshot(server)
+
+    snapshot = build_dashboard_overview_snapshot(server)
+    snapshot.update(build_dashboard_failures_snapshot(server))
+    snapshot.update(build_dashboard_users_snapshot(server))
+    snapshot.update(build_dashboard_quotas_snapshot(server))
+    snapshot.update(build_dashboard_proxies_snapshot(server))
+    routing_snapshot = build_dashboard_routing_snapshot(server)
+    snapshot["rule_suggestions"] = routing_snapshot.get("rule_suggestions", [])
+    snapshot["router_runtime"] = {
+        **snapshot.get("router_runtime", {}),
+        **routing_snapshot.get("router_runtime", {}),
+    }
     return snapshot
 
 
@@ -368,6 +456,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(build_dashboard_snapshot(self.server))
             return
 
+        dashboard_scope_prefix = "/api/dashboard/"
+        if route_path.startswith(dashboard_scope_prefix):
+            scope = route_path[len(dashboard_scope_prefix):].removesuffix(".json")
+            allowed_scopes = {"overview", "users", "failures", "proxies", "quotas", "routing", "https-status", "full"}
+            if scope not in allowed_scopes:
+                self._send_json({"error": "unknown dashboard scope"}, status=404)
+                return
+            self._send_json(build_dashboard_snapshot(self.server, scope=scope))
+            return
+
         if route_path in {"/api/history", "/api/history.json"}:
             query = parse_qs(parsed.query)
             range_key = first_query_value(query, "range") or HISTORY_DEFAULT_RANGE
@@ -498,7 +596,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route_path in {"/api/failures", "/api/failures.json"}:
-            snapshot = build_dashboard_snapshot(self.server)
+            snapshot = build_dashboard_snapshot(self.server, scope="failures")
             self._send_json(snapshot.get("failure_summary", {}))
             return
 
@@ -551,7 +649,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "ok": True,
-                    "snapshot": build_dashboard_snapshot(self.server),
+                    "snapshot": build_dashboard_snapshot(self.server, scope="full"),
                     "history": self.server.history_cache.build_history_payload(
                         range_key=HISTORY_DEFAULT_RANGE
                     ),

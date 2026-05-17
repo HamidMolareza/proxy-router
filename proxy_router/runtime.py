@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import errno
+import queue
 import socket
 import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime
@@ -335,6 +337,9 @@ class DashboardLiveUpdateHub:
         self._condition = threading.Condition(self._lock)
         self._revision = 0
         self._events = deque(maxlen=DASHBOARD_LIVE_EVENT_BACKLOG)
+        self._pending_debounced_reasons = set()
+        self._debounce_timer = None
+        self._last_emit_monotonic = 0.0
 
     def current_revision(self) -> int:
         with self._lock:
@@ -342,6 +347,24 @@ class DashboardLiveUpdateHub:
 
     def notify(self, reason: str):
         normalized_reason = str(reason or "dashboard").strip() or "dashboard"
+        if normalized_reason in {"usage", "https-traffic", "connections"}:
+            with self._condition:
+                now = time.monotonic()
+                elapsed = now - self._last_emit_monotonic
+                if elapsed < DASHBOARD_LIVE_DEBOUNCE_SECONDS:
+                    self._pending_debounced_reasons.add(normalized_reason)
+                    if self._debounce_timer is None:
+                        delay = max(0.0, DASHBOARD_LIVE_DEBOUNCE_SECONDS - elapsed)
+                        self._debounce_timer = threading.Timer(delay, self._flush_debounced)
+                        self._debounce_timer.daemon = True
+                        self._debounce_timer.start()
+                    return
+            self._emit(normalized_reason)
+            return
+
+        self._emit(normalized_reason)
+
+    def _emit(self, normalized_reason: str):
         event = {
             "revision": 0,
             "reason": normalized_reason,
@@ -350,10 +373,19 @@ class DashboardLiveUpdateHub:
             "router_config_changed": normalized_reason == "router-config",
         }
         with self._condition:
+            self._last_emit_monotonic = time.monotonic()
             self._revision += 1
             event["revision"] = self._revision
             self._events.append(event)
             self._condition.notify_all()
+
+    def _flush_debounced(self):
+        with self._condition:
+            reasons = sorted(self._pending_debounced_reasons)
+            self._pending_debounced_reasons.clear()
+            self._debounce_timer = None
+        for reason in reasons:
+            self._emit(reason)
 
     def wait_for_changes(self, last_revision: int, *, timeout: float):
         with self._condition:
@@ -643,15 +675,121 @@ class UpstreamProxyStatus:
             }
         self._notify()
 
-class UsageLogger:
+
+class AsyncJsonlWriter:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
         self._lock = threading.Lock()
         self._stream = None
+        self._queue = None
+        self._thread = None
+        self._closed = False
 
         if self.log_file is not None:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+            self._queue = queue.Queue(maxsize=LOG_WRITER_QUEUE_MAX_SIZE)
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"proxy-router-jsonl-writer-{self.log_file.name}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def write(self, event):
+        if self.log_file is None:
+            return
+
+        line = json.dumps(event, sort_keys=True) + "\n"
+        with self._lock:
+            if self._closed:
+                return
+            writer_queue = self._queue
+
+        if writer_queue is None:
+            return
+
+        try:
+            writer_queue.put_nowait(line)
+        except queue.Full:
+            self._write_line(line)
+
+    def flush(self):
+        writer_queue = self._queue
+        if writer_queue is not None:
+            writer_queue.join()
+        self._flush_stream()
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            writer_queue = self._queue
+            writer_thread = self._thread
+
+        if writer_queue is not None:
+            writer_queue.put(None)
+            writer_queue.join()
+        if writer_thread is not None:
+            writer_thread.join(timeout=5.0)
+
+        with self._lock:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+            self._queue = None
+            self._thread = None
+
+    def clear_data(self):
+        if self.log_file is None:
+            return
+
+        self.flush()
+        with self._lock:
+            if self._stream is not None:
+                self._stream.seek(0)
+                self._stream.truncate(0)
+                self._stream.flush()
+                return
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file.write_text("", encoding="utf-8")
+
+    def _run(self):
+        while True:
+            try:
+                item = self._queue.get(timeout=LOG_WRITER_FLUSH_INTERVAL_SECONDS)
+            except queue.Empty:
+                self._flush_stream()
+                continue
+
+            if item is None:
+                self._queue.task_done()
+                break
+
+            self._write_line(item, flush=False)
+            self._queue.task_done()
+
+        self._flush_stream()
+
+    def _write_line(self, line: str, *, flush: bool = True):
+        with self._lock:
+            if self._stream is None:
+                return
+            self._stream.write(line)
+            if flush:
+                self._stream.flush()
+
+    def _flush_stream(self):
+        with self._lock:
+            if self._stream is not None:
+                self._stream.flush()
+
+
+class UsageLogger:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._writer = AsyncJsonlWriter(log_file)
 
     def record(
         self,
@@ -682,7 +820,7 @@ class UsageLogger:
         upstream_proxy_access_mode: str | None = None,
         proxy_failover_count: int | None = None,
     ):
-        if self._stream is None:
+        if self.log_file is None:
             return
 
         event = {
@@ -729,81 +867,37 @@ class UsageLogger:
         if proxy_failover_count is not None:
             event["proxy_failover_count"] = int(proxy_failover_count)
 
-        with self._lock:
-            self._stream.write(json.dumps(event, sort_keys=True) + "\n")
-            self._stream.flush()
+        self._writer.write(event)
 
     def close(self):
-        if self._stream is None:
-            return
-
-        with self._lock:
-            self._stream.close()
-            self._stream = None
+        self._writer.close()
 
     def clear_data(self):
-        if self.log_file is None:
-            return
-
-        with self._lock:
-            if self._stream is not None:
-                self._stream.seek(0)
-                self._stream.truncate(0)
-                self._stream.flush()
-                return
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            self.log_file.write_text("", encoding="utf-8")
+        self._writer.clear_data()
 
 
 class HttpsTrafficLogger:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
-        self._lock = threading.Lock()
-        self._stream = None
-
-        if self.log_file is not None:
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+        self._writer = AsyncJsonlWriter(log_file)
 
     def record(self, event):
-        if self._stream is None:
-            return
-
-        with self._lock:
-            self._stream.write(json.dumps(event, sort_keys=True) + "\n")
-            self._stream.flush()
-
-    def close(self):
-        if self._stream is None:
-            return
-
-        with self._lock:
-            self._stream.close()
-            self._stream = None
-
-    def clear_data(self):
         if self.log_file is None:
             return
 
-        with self._lock:
-            if self._stream is not None:
-                self._stream.seek(0)
-                self._stream.truncate(0)
-                self._stream.flush()
-                return
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            self.log_file.write_text("", encoding="utf-8")
+        self._writer.write(event)
+
+    def close(self):
+        self._writer.close()
+
+    def clear_data(self):
+        self._writer.clear_data()
 
 
 class FailureLogger:
     def __init__(self, log_file: Path | None):
         self.log_file = log_file
-        self._lock = threading.Lock()
-        self._stream = None
-
-        if self.log_file is not None:
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            self._stream = self.log_file.open("a", encoding="utf-8", buffering=1)
+        self._writer = AsyncJsonlWriter(log_file)
 
     def record(
         self,
@@ -872,31 +966,13 @@ class FailureLogger:
             upstream_retry_delay_ms=upstream_retry_delay_ms,
         )
 
-        if self._stream is not None:
-            with self._lock:
-                self._stream.write(json.dumps(event, sort_keys=True) + "\n")
-                self._stream.flush()
+        self._writer.write(event)
 
     def close(self):
-        if self._stream is None:
-            return
-
-        with self._lock:
-            self._stream.close()
-            self._stream = None
+        self._writer.close()
 
     def clear_data(self):
-        if self.log_file is None:
-            return
-
-        with self._lock:
-            if self._stream is not None:
-                self._stream.seek(0)
-                self._stream.truncate(0)
-                self._stream.flush()
-                return
-            self.log_file.parent.mkdir(parents=True, exist_ok=True)
-            self.log_file.write_text("", encoding="utf-8")
+        self._writer.clear_data()
 
 
 class SelfEndpoints:
