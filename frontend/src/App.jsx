@@ -765,13 +765,22 @@ function normalizeRulePattern(pattern) {
     .replace(/\.+$/, '')
 }
 
-function normalizeRules(rules) {
+function normalizeRuleDraftPattern(pattern) {
+  return String(pattern || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\*\./, '')
+    .replace(/^\.+/, '')
+}
+
+function normalizeRules(rules, options = {}) {
+  const normalizePattern = options.preserveRulePatternDrafts ? normalizeRuleDraftPattern : normalizeRulePattern
   const normalizedRules = (Array.isArray(rules) ? rules : [])
     .map((rule) => {
       const source = normalizeRuleSource(rule)
       return ensureRuleExpiration({
         enabled: rule.enabled !== false,
-        pattern: normalizeRulePattern(rule.pattern),
+        pattern: normalizePattern(rule.pattern),
         match: ['exact', 'suffix', 'contains'].includes(rule.match) ? rule.match : 'suffix',
         action: ['proxy', 'block'].includes(rule.action) ? rule.action : 'direct',
         note: String(rule.note || ''),
@@ -833,7 +842,7 @@ function profileSignatureKey(signature) {
   })
 }
 
-function normalizeRoutingTarget(target) {
+function normalizeRoutingTarget(target, options = {}) {
   const source = target && typeof target === 'object' ? target : {}
   const ignoredFailureHosts = Array.isArray(source.ignored_failure_hosts)
     ? source.ignored_failure_hosts
@@ -844,13 +853,13 @@ function normalizeRoutingTarget(target) {
     ignored_failure_hosts: ignoredFailureHosts
       .map((host) => summarizeDomain(host) || String(host || '').trim().toLowerCase())
       .filter((host, index, items) => host && items.indexOf(host) === index),
-    rules: normalizeRules(source.rules),
+    rules: normalizeRules(source.rules, options),
   }
 }
 
-function normalizeRoutingProfile(profile, index) {
+function normalizeRoutingProfile(profile, index, options = {}) {
   const source = profile && typeof profile === 'object' ? profile : {}
-  const routingTarget = normalizeRoutingTarget(source)
+  const routingTarget = normalizeRoutingTarget(source, options)
   const fallbackId = `profile-${String(index + 1)}`
   const fallbackName = `Profile ${String(index + 1)}`
   return {
@@ -923,7 +932,7 @@ function formatClientAuthCredentialStatus(credential) {
   return 'Needs password'
 }
 
-function normalizeRouterConfig(config) {
+function normalizeRouterConfig(config, options = {}) {
   const source = config && typeof config === 'object' ? config : {}
   const upstream = source.upstream && typeof source.upstream === 'object' ? source.upstream : {}
   const proxiesPayload = Array.isArray(source.proxies) ? source.proxies : []
@@ -949,7 +958,7 @@ function normalizeRouterConfig(config) {
     typeof source.default_authenticated_client_traffic_limit === 'object'
       ? source.default_authenticated_client_traffic_limit
       : {}
-  const defaultRoutingTarget = normalizeRoutingTarget(source)
+  const defaultRoutingTarget = normalizeRoutingTarget(source, options)
 
   return {
     default_action: defaultRoutingTarget.default_action,
@@ -1061,7 +1070,7 @@ function normalizeRouterConfig(config) {
     proxies: proxiesPayload.map((proxy, index) => normalizeUpstreamProxy(proxy, index)),
     rules: defaultRoutingTarget.rules,
     routing_profiles: (Array.isArray(source.routing_profiles) ? source.routing_profiles : []).map(
-      (profile, index) => normalizeRoutingProfile(profile, index),
+      (profile, index) => normalizeRoutingProfile(profile, index, options),
     ),
   }
 }
@@ -1143,7 +1152,7 @@ function buildPersistableRouterConfig(config) {
 }
 
 function reconcileSavedClientAuthCredentials(existingConfig, savedConfig) {
-  const existing = normalizeRouterConfig(existingConfig)
+  const existing = normalizeRouterConfig(existingConfig, { preserveRulePatternDrafts: true })
   const saved = normalizeRouterConfig(savedConfig)
   const savedCredentialsByUsername = new Map(
     saved.client_auth.credentials.map((credential) => [credential.username, credential]),
@@ -1162,9 +1171,16 @@ function reconcileSavedClientAuthCredentials(existingConfig, savedConfig) {
   }
 }
 
+function countRulePatternDrafts(rules) {
+  return (Array.isArray(rules) ? rules : []).filter(
+    (rule) => String((rule && rule.pattern) || '') !== normalizeRulePattern(rule && rule.pattern),
+  ).length
+}
+
 function countRouterDraftItems(config) {
   const normalized = normalizeRouterConfig(config)
-  let count = normalized.rules.filter((rule) => !isPersistableRule(rule)).length
+  let count = countRulePatternDrafts(config && config.rules)
+  count += normalized.rules.filter((rule) => !isPersistableRule(rule)).length
   count += normalized.client_auth.credentials.filter(
     (credential) => !isPersistableClientAuthCredential(credential),
   ).length
@@ -1173,6 +1189,10 @@ function countRouterDraftItems(config) {
   count += normalized.client_traffic_exemptions.filter((exemption) => !isPersistableClientTrafficExemption(exemption)).length
   count += normalized.routing_profiles.reduce(
     (sum, profile) => sum + (profile.rules || []).filter((rule) => !isPersistableRule(rule)).length,
+    0,
+  )
+  count += (Array.isArray(config && config.routing_profiles) ? config.routing_profiles : []).reduce(
+    (sum, profile) => sum + countRulePatternDrafts(profile && profile.rules),
     0,
   )
   return count
@@ -3766,7 +3786,7 @@ function App() {
       })
       return
     }
-    const normalizedNextConfig = normalizeRouterConfig(nextConfig)
+    const normalizedNextConfig = normalizeRouterConfig(nextConfig, { preserveRulePatternDrafts: true })
     const nextBlockingRuleIssues = findRouterRuleIssues(normalizedNextConfig, DEFAULT_ROUTING_PROFILE_ID)
     if (!routerBlockingRuleIssues.length && nextBlockingRuleIssues.length) {
       const firstIssue = nextBlockingRuleIssues[0]
