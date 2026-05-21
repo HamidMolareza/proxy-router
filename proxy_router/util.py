@@ -1793,12 +1793,6 @@ def normalize_router_config(payload):
             enabled_profile_signatures[signature_key] = normalized_profile["name"]
         normalized_routing_profiles.append(normalized_profile)
 
-    if not enabled_proxies:
-        routing_targets = [normalized_routing_defaults] + normalized_routing_profiles
-        for target in routing_targets:
-            if target["default_action"] == "proxy" or any(rule["action"] == "proxy" for rule in target["rules"]):
-                raise ValueError("router must have at least one enabled proxy before any rule or default action can use proxy")
-
     known_proxy_ids = {proxy["id"] for proxy in normalized_proxies}
     for target in [normalized_routing_defaults] + normalized_routing_profiles:
         for rule in target["rules"]:

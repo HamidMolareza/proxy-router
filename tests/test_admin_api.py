@@ -97,6 +97,28 @@ class AdminApiTokenTests(unittest.TestCase):
             finally:
                 manager.shutdown()
 
+    def test_preview_without_admin_api_hides_preserved_token_hashes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "admin_api": {
+                            "enabled": True,
+                            "tokens": [{"id": "codex", "name": "Codex", "token": "secret-token"}],
+                        }
+                    }
+                )
+
+                preview = manager.preview_update({"rules": [{"pattern": "example.com", "action": "direct"}]})
+
+                token = preview["router_config"]["admin_api"]["tokens"][0]
+                self.assertNotIn("token", token)
+                self.assertNotIn("token_hash", token)
+                self.assertEqual(token["id"], "codex")
+            finally:
+                manager.shutdown()
+
     def test_created_admin_token_enables_auth_and_verifies(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = RouterConfigManager(Path(temp_dir) / "router.json")

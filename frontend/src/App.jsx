@@ -104,6 +104,7 @@ const pageClass = [
   "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[var(--pr-input-border)] [&_input[type='search']]:bg-[var(--pr-control-bg)] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2 [&_input[type='search']]:text-[var(--pr-text)]",
   "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[var(--pr-input-border)] [&_input[type='text']]:bg-[var(--pr-control-bg)] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2 [&_input[type='text']]:text-[var(--pr-text)]",
   '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[var(--pr-input-border)] [&_select]:bg-[var(--pr-control-bg)] [&_select]:px-3 [&_select]:py-2 [&_select]:text-[var(--pr-text)]',
+  '[&_input:disabled]:cursor-not-allowed [&_input:disabled]:opacity-55 [&_select:disabled]:cursor-not-allowed [&_select:disabled]:opacity-55',
 ].join(' ')
 const shellClass = 'mx-auto w-full max-w-[1200px] px-2 py-3 sm:px-4 sm:py-6'
 const heroClass = 'mb-3 flex flex-col items-start gap-2 sm:mb-4 min-[901px]:flex-row min-[901px]:items-end min-[901px]:justify-between'
@@ -2545,7 +2546,8 @@ function App() {
   const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference
   const routerConfigWriteAuthBlocked = Boolean(adminApiStatus.requires_auth && !String(adminApiToken || '').trim())
   const routerConfigAuthBlockedText =
-    'Admin API token required for config changes · open Quotas -> Admin API tokens'
+    'Admin API token required for config changes · paste a token to resume autosave'
+  const routerConfigInputsDisabled = routerConfigWriteAuthBlocked
   const activeDashboardScope = dashboardScopeForTab(activeTab)
 
   const safeEditorProfileId = useMemo(
@@ -3764,7 +3766,18 @@ function App() {
       })
       return
     }
-    setCurrentRouterConfig(normalizeRouterConfig(nextConfig))
+    const normalizedNextConfig = normalizeRouterConfig(nextConfig)
+    const nextBlockingRuleIssues = findRouterRuleIssues(normalizedNextConfig, DEFAULT_ROUTING_PROFILE_ID)
+    if (!routerBlockingRuleIssues.length && nextBlockingRuleIssues.length) {
+      const firstIssue = nextBlockingRuleIssues[0]
+      setRouterSaveError('')
+      setRouterStatusOverride({
+        text: `Rule change not applied: ${firstIssue.message}`,
+        warning: true,
+      })
+      return
+    }
+    setCurrentRouterConfig(normalizedNextConfig)
     setRouterEditVersion((version) => version + 1)
     setRouterSaveError('')
     if (Object.prototype.hasOwnProperty.call(options, 'editorProfileId')) {
@@ -4507,6 +4520,18 @@ function App() {
           </div>
           <div className="flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:items-center sm:flex-wrap">
             <div className={cx(pillClass, routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
+            {adminApiStatus.requires_auth ? (
+              <label className={cx(fieldClass, 'min-w-[18rem] flex-1 sm:max-w-[24rem]')}>
+                <span>Admin API token</span>
+                <input
+                  type="password"
+                  value={adminApiToken}
+                  onChange={(event) => updateAdminApiToken(event.target.value)}
+                  placeholder="Paste token to enable autosave"
+                  autoComplete="off"
+                />
+              </label>
+            ) : null}
             <button
               type="button"
               disabled={isSavingRouter}
@@ -5002,7 +5027,7 @@ function App() {
                   >
                     {isCheckingProxies ? 'Checking proxies…' : 'Check all proxies'}
                   </button>
-                  <button type="button" onClick={() => addUpstreamProxy()}>
+                  <button type="button" disabled={routerConfigInputsDisabled} onClick={() => addUpstreamProxy()}>
                     Add proxy
                   </button>
                 </div>
@@ -5056,6 +5081,7 @@ function App() {
                               <input
                                 type="checkbox"
                                 checked={proxy.enabled}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'enabled', event.target.checked)}
                               />
                             </td>
@@ -5064,6 +5090,7 @@ function App() {
                                 type="number"
                                 min="1"
                                 value={proxy.priority}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) =>
                                   updateUpstreamProxyField(index, 'priority', event.target.value.trim())
                                 }
@@ -5073,6 +5100,7 @@ function App() {
                               <input
                                 type="text"
                                 value={proxy.id}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'id', event.target.value)}
                               />
                             </td>
@@ -5080,12 +5108,14 @@ function App() {
                               <input
                                 type="text"
                                 value={proxy.name}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'name', event.target.value)}
                               />
                             </td>
                             <td>
                               <select
                                 value={proxy.type}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'type', event.target.value)}
                               >
                                 <option value="http">HTTP</option>
@@ -5096,6 +5126,7 @@ function App() {
                               <input
                                 type="text"
                                 value={proxy.host}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'host', event.target.value.trim())}
                               />
                             </td>
@@ -5105,12 +5136,14 @@ function App() {
                                 min="1"
                                 max="65535"
                                 value={proxy.port}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'port', event.target.value.trim())}
                               />
                             </td>
                             <td>
                               <select
                                 value={proxy.access_mode}
+                                disabled={routerConfigInputsDisabled}
                                 onChange={(event) => updateUpstreamProxyField(index, 'access_mode', event.target.value)}
                               >
                                 <option value="public">Public</option>
@@ -5122,6 +5155,7 @@ function App() {
                               <input
                                 type="text"
                                 value={proxy.allowed_clients.join(', ')}
+                                disabled={routerConfigInputsDisabled}
                                 placeholder={
                                   proxy.access_mode === 'private'
                                     ? 'remote clients only; localhost is automatic'
@@ -5152,6 +5186,7 @@ function App() {
                                     <input
                                       type="checkbox"
                                       checked={limit.enabled}
+                                      disabled={routerConfigInputsDisabled}
                                       onChange={(event) =>
                                         updateUpstreamProxyLimit(index, limitKey, 'enabled', event.target.checked)
                                       }
@@ -5170,6 +5205,7 @@ function App() {
                                           type="number"
                                           min="1"
                                           value={limit[field] ?? ''}
+                                          disabled={routerConfigInputsDisabled}
                                           onChange={(event) =>
                                             updateUpstreamProxyLimit(
                                               index,
@@ -5202,6 +5238,7 @@ function App() {
                             <td className={ruleActionsClass}>
                               <button
                                 type="button"
+                                disabled={routerConfigInputsDisabled}
                                 onClick={() => {
                                   const nextConfig = cloneJson(currentRouterConfig)
                                   nextConfig.proxies.splice(index, 1)

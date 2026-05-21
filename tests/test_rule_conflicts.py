@@ -1,9 +1,16 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from proxy_router.config import RouterConfigManager
-from proxy_router.util import find_router_rule_issues, normalize_router_config, validate_router_rule_issues
+from proxy_router.util import (
+    default_router_config,
+    find_router_rule_issues,
+    is_auto_proxy_rule,
+    normalize_router_config,
+    validate_router_rule_issues,
+)
 
 
 def profile_signature():
@@ -142,6 +149,58 @@ class RuleConflictTests(unittest.TestCase):
                             ]
                         }
                     )
+            finally:
+                manager.shutdown()
+
+    def test_shared_auto_rule_skips_profile_duplicate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = default_router_config()
+            config["auto_proxy_failures"]["enabled"] = True
+            config["upstream"] = {
+                "enabled": True,
+                "type": "socks5",
+                "host": "127.0.0.1",
+                "port": 9050,
+            }
+            config["routing_profiles"] = [
+                {
+                    "id": "profile-home",
+                    "name": "Home",
+                    "enabled": True,
+                    "signature": profile_signature(),
+                    "rules": [],
+                }
+            ]
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            manager.update(config)
+            expires_at = datetime.now().astimezone() + timedelta(hours=1)
+            try:
+                profile_result = manager.add_auto_proxy_rule(
+                    "api.blocked.example.com",
+                    duration_seconds=3600,
+                    stage_index=0,
+                    expires_at=expires_at,
+                    profile_id="profile-home",
+                )
+                shared_result = manager.add_auto_proxy_rule(
+                    "api.blocked.example.com",
+                    duration_seconds=3600,
+                    stage_index=0,
+                    expires_at=expires_at,
+                )
+
+                snapshot = manager.snapshot()
+                self.assertEqual(profile_result["status"], "added")
+                self.assertEqual(shared_result["status"], "skipped")
+                self.assertEqual(shared_result["reason"], "rule-issues")
+                self.assertFalse(any(is_auto_proxy_rule(rule, "example.com") for rule in snapshot["rules"]))
+                self.assertTrue(
+                    any(
+                        is_auto_proxy_rule(rule, "example.com")
+                        for rule in snapshot["routing_profiles"][0]["rules"]
+                    )
+                )
+                self.assertEqual(find_router_rule_issues(snapshot), [])
             finally:
                 manager.shutdown()
 

@@ -215,8 +215,8 @@ Current dashboard behaviors:
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests. The retry policy also controls the setup timeout used while opening each destination or upstream connection.
-- Routing rules cannot sync while the effective ruleset has duplicates or enabled overlapping rules with different actions.
-- Admin API tokens protect dashboard/API write endpoints after the first token is created. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
+- The dashboard rejects rule edits that introduce duplicates or enabled overlapping rules with different actions before autosync; backend validation rejects invalid rulesets from API writes and skips automatic auto-proxy additions that would create the same issues.
+- Admin API tokens protect dashboard/API write endpoints after the first token is created. When a token is required, the dashboard shows a token field in the top Configuration panel and disables config editors until a token is present. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
 - The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
 - Approving a suggestion keeps the same rule validation as manual edits, so still-conflicting suggestions must be resolved before approval succeeds.
 - `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.

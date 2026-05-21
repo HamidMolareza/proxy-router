@@ -718,8 +718,8 @@ class RouterConfigManager:
         self._refresh_next_expiration_locked()
         self._clear_route_decision_cache_locked()
 
-    def _public_config_locked(self):
-        config = json.loads(json.dumps(self._config))
+    def _public_config(self, raw_config):
+        config = json.loads(json.dumps(raw_config))
         admin_api = config.get("admin_api") or {}
         public_tokens = []
         for token in admin_api.get("tokens") or []:
@@ -738,6 +738,9 @@ class RouterConfigManager:
             "tokens": public_tokens,
         }
         return config
+
+    def _public_config_locked(self):
+        return self._public_config(self._config)
 
     def _payload_has_admin_api_secrets(self, payload) -> bool:
         if not isinstance(payload, dict):
@@ -1030,7 +1033,7 @@ class RouterConfigManager:
         issues = find_router_rule_issues(normalized)
         return {
             "ok": not bool(issues),
-            "router_config": normalized,
+            "router_config": self._public_config(normalized),
             "issues": issues,
         }
 
@@ -1441,6 +1444,14 @@ class RouterConfigManager:
                 rule["proxy_id"] = selected_proxy_id
             target_profile.setdefault("rules", []).append(rule)
             normalized = normalize_router_config(config)
+            issues = find_router_rule_issues(normalized)
+            if issues:
+                return {
+                    "status": "skipped",
+                    "reason": "rule-issues",
+                    "pattern": pattern,
+                    "issues": issues,
+                }
             self._write_config_locked(normalized)
             return {
                 "status": "added",

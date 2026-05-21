@@ -299,6 +299,34 @@ class UpstreamRetryConfigTests(unittest.TestCase):
         self.assertTrue(proxy_allows_client(proxy, "user:local-tool", client_ip="::1"))
         self.assertFalse(proxy_allows_client(proxy, "user:local-tool", client_ip="192.168.1.50"))
 
+    def test_proxy_rules_can_load_when_all_proxies_are_disabled(self):
+        config = normalize_router_config(
+            {
+                "proxies": [
+                    {
+                        "id": "disabled-proxy",
+                        "enabled": False,
+                        "type": "socks5",
+                        "host": "127.0.0.1",
+                        "port": 9050,
+                    },
+                ],
+                "default_action": "direct",
+                "rules": [
+                    {
+                        "enabled": True,
+                        "pattern": "example.com",
+                        "match": "suffix",
+                        "action": "proxy",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(config["rules"][0]["action"], "proxy")
+        self.assertFalse(config["proxies"][0]["enabled"])
+        self.assertFalse(config["upstream"]["enabled"])
+
     def test_route_decision_filters_private_proxies_by_client_ip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = RouterConfigManager(Path(temp_dir) / "router.json")
