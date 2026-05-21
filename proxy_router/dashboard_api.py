@@ -16,6 +16,18 @@ from .records import HttpsTrafficCache, UsageHistoryCache, build_failure_snapsho
 from .util import client_identity_from_username, first_query_value, normalize_history_filter
 
 
+DASHBOARD_SCOPES = {"overview", "users", "failures", "proxies", "quotas", "routing", "https-status", "full"}
+DASHBOARD_LIVE_SCOPES = DASHBOARD_SCOPES - {"full"}
+DASHBOARD_SCOPE_REASON_MAP = {
+    "failures": {"failure", "clear", "router-config"},
+    "https-status": {"https-interception", "router-config", "clear"},
+    "proxies": {"usage", "proxy-status", "router-config", "clear"},
+    "quotas": {"usage", "router-config", "clear"},
+    "routing": {"rule-suggestions", "network-profile", "router-config", "failure", "clear"},
+    "users": {"usage", "connections", "router-config", "clear"},
+}
+
+
 class ThreadedDashboardServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -268,7 +280,7 @@ def build_dashboard_https_status_snapshot(server):
 
 
 def build_dashboard_snapshot(server, *, scope: str = "overview"):
-    normalized_scope = str(scope or "overview").strip().lower()
+    normalized_scope = normalize_dashboard_scope(scope, allow_full=True)
     if normalized_scope == "overview":
         return build_dashboard_overview_snapshot(server)
     if normalized_scope == "failures":
@@ -300,6 +312,53 @@ def build_dashboard_snapshot(server, *, scope: str = "overview"):
     return snapshot
 
 
+def normalize_dashboard_scope(scope: str | None, *, allow_full: bool = False):
+    normalized_scope = str(scope or "overview").strip().lower()
+    allowed_scopes = DASHBOARD_SCOPES if allow_full else DASHBOARD_LIVE_SCOPES
+    if normalized_scope not in allowed_scopes:
+        return "overview"
+    return normalized_scope
+
+
+def dashboard_scope_matches_reasons(scope: str, reasons, *, initial: bool = False):
+    normalized_scope = normalize_dashboard_scope(scope)
+    if initial or normalized_scope == "overview":
+        return True
+    normalized_reasons = {str(reason or "").strip() for reason in (reasons or [])}
+    if "clear" in normalized_reasons or "router-config" in normalized_reasons:
+        return True
+    return bool(DASHBOARD_SCOPE_REASON_MAP.get(normalized_scope, set()) & normalized_reasons)
+
+
+def merge_dashboard_scope_snapshot(base, patch):
+    merged = dict(base or {})
+    patch = dict(patch or {})
+    base_runtime = merged.get("router_runtime")
+    patch_runtime = patch.pop("router_runtime", None)
+    if isinstance(base_runtime, dict) or isinstance(patch_runtime, dict):
+        merged["router_runtime"] = {
+            **(base_runtime if isinstance(base_runtime, dict) else {}),
+            **(patch_runtime if isinstance(patch_runtime, dict) else {}),
+        }
+    merged.update(patch)
+    return merged
+
+
+def build_dashboard_live_snapshot(server, *, scope: str, reasons, initial: bool = False):
+    normalized_scope = normalize_dashboard_scope(scope)
+    snapshot = build_dashboard_snapshot(server, scope="overview")
+    if normalized_scope != "overview" and dashboard_scope_matches_reasons(
+        normalized_scope,
+        reasons,
+        initial=initial,
+    ):
+        snapshot = merge_dashboard_scope_snapshot(
+            snapshot,
+            build_dashboard_snapshot(server, scope=normalized_scope),
+        )
+    return snapshot
+
+
 def encode_websocket_text_frame(payload_text: str) -> bytes:
     payload = payload_text.encode("utf-8")
     payload_length = len(payload)
@@ -312,18 +371,25 @@ def encode_websocket_text_frame(payload_text: str) -> bytes:
     return header + payload
 
 
-def build_live_update_message(server, event_summary, *, initial: bool = False):
+def build_live_update_message(server, event_summary, *, initial: bool = False, scope: str = "overview"):
     revision = 0 if initial else int(event_summary.get("revision", 0))
     reasons = [] if initial else list(event_summary.get("reasons") or [])
+    normalized_scope = normalize_dashboard_scope(scope)
     return {
         "type": "snapshot",
         "revision": revision,
         "initial": initial,
+        "scope": normalized_scope,
         "reasons": reasons,
         "history_changed": False if initial else bool(event_summary.get("history_changed")),
         "https_traffic_changed": False if initial else bool(event_summary.get("https_traffic_changed")),
         "router_config_changed": False if initial else bool(event_summary.get("router_config_changed")),
-        "snapshot": build_dashboard_snapshot(server),
+        "snapshot": build_dashboard_live_snapshot(
+            server,
+            scope=normalized_scope,
+            reasons=reasons,
+            initial=initial,
+        ),
     }
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -399,7 +465,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         self.connection.sendall(encode_websocket_text_frame(body))
 
-    def _handle_live_websocket(self):
+    def _handle_live_websocket(self, *, scope: str = "overview"):
         websocket_key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
         if not websocket_key:
             self.send_error(400, "Missing Sec-WebSocket-Key header")
@@ -421,7 +487,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         last_revision = self.server.runtime.live_updates.current_revision()
         self._send_websocket_json(
-            build_live_update_message(self.server, {"revision": last_revision}, initial=True)
+            build_live_update_message(
+                self.server,
+                {"revision": last_revision},
+                initial=True,
+                scope=scope,
+            )
         )
 
         while True:
@@ -439,7 +510,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 continue
 
             last_revision = int(event_summary["revision"])
-            self._send_websocket_json(build_live_update_message(self.server, event_summary))
+            self._send_websocket_json(build_live_update_message(self.server, event_summary, scope=scope))
 
     def do_GET(self):
         parsed = urlsplit(self.path)
@@ -450,7 +521,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Expected a WebSocket upgrade request")
                 return
             try:
-                self._handle_live_websocket()
+                query = parse_qs(parsed.query)
+                self._handle_live_websocket(scope=first_query_value(query, "scope") or "overview")
             except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
                 return
             return
@@ -462,8 +534,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         dashboard_scope_prefix = "/api/dashboard/"
         if route_path.startswith(dashboard_scope_prefix):
             scope = route_path[len(dashboard_scope_prefix):].removesuffix(".json")
-            allowed_scopes = {"overview", "users", "failures", "proxies", "quotas", "routing", "https-status", "full"}
-            if scope not in allowed_scopes:
+            if scope not in DASHBOARD_SCOPES:
                 self._send_json({"error": "unknown dashboard scope"}, status=404)
                 return
             self._send_json(build_dashboard_snapshot(self.server, scope=scope))

@@ -1409,12 +1409,14 @@ class TrafficQuotaManager:
         self._records_by_client = {}
         self._records_by_proxy = {}
         self._records_by_proxy_client = {}
+        self._proxy_snapshot_cache = {}
 
     def clear(self):
         with self._lock:
             self._records_by_client = {}
             self._records_by_proxy = {}
             self._records_by_proxy_client = {}
+            self._proxy_snapshot_cache = {}
 
     def load_from_log(self, log_file: Path | None):
         if log_file is None:
@@ -1473,6 +1475,7 @@ class TrafficQuotaManager:
             self._records_by_client = loaded_records
             self._records_by_proxy = loaded_proxy_records
             self._records_by_proxy_client = loaded_proxy_client_records
+            self._proxy_snapshot_cache = {}
 
     def record_usage(
         self,
@@ -1629,11 +1632,21 @@ class TrafficQuotaManager:
         proxy_id = str((proxy or {}).get("id") or "").strip()
         usage = self.usage_for_proxy(proxy_id)
         client_usage = self.usage_for_proxy(proxy_id, client) if client else {}
+        return self._evaluate_proxy_from_usage(
+            proxy,
+            usage=usage,
+            client=client,
+            client_usage=client_usage,
+        )
+
+    def _evaluate_proxy_from_usage(self, proxy, *, usage, client: str | None = None, client_usage=None):
+        proxy = proxy or {}
+        proxy_id = str(proxy.get("id") or "").strip()
         evaluation = {
             "proxy_id": proxy_id,
             "client": client,
             "usage": usage,
-            "client_usage": client_usage,
+            "client_usage": client_usage or {},
             "allowed": True,
             "exceeded_windows": [],
             "client_exceeded_windows": [],
@@ -1656,19 +1669,100 @@ class TrafficQuotaManager:
         return evaluation
 
     def proxy_snapshot(self, proxies, clients):
+        current_time = datetime.now().astimezone()
+        normalized_clients = tuple(sorted({
+            str(client or "").strip()
+            for client in clients
+            if str(client or "").strip()
+        }))
+        normalized_proxies = [
+            proxy
+            for proxy in (proxies or [])
+            if str((proxy or {}).get("id") or "").strip()
+        ]
+        cache_key = self._proxy_snapshot_cache_key(
+            normalized_proxies,
+            normalized_clients,
+            current_time,
+        )
+        with self._lock:
+            cached_snapshot = self._proxy_snapshot_cache.get(cache_key)
+            if cached_snapshot is not None:
+                return json.loads(json.dumps(cached_snapshot))
+
+            proxy_records = {}
+            proxy_client_records = {}
+            for proxy in normalized_proxies:
+                proxy_id = str((proxy or {}).get("id") or "").strip()
+                self._prune_proxy_locked(proxy_id, now=current_time)
+                proxy_records[proxy_id] = list(self._records_by_proxy.get(proxy_id, ()))
+                for client in normalized_clients:
+                    self._prune_proxy_client_locked(proxy_id, client, now=current_time)
+                    proxy_client_records[(proxy_id, client)] = list(
+                        self._records_by_proxy_client.get((proxy_id, client), ())
+                    )
+
         snapshot = {}
-        normalized_clients = [str(client or "").strip() for client in clients if str(client or "").strip()]
-        for proxy in proxies or []:
+        for proxy in normalized_proxies:
             proxy_id = str((proxy or {}).get("id") or "").strip()
-            if not proxy_id:
-                continue
-            proxy_payload = self.evaluate_proxy(proxy)
+            usage = self._usage_from_records(proxy_records.get(proxy_id, ()), current_time)
+            proxy_payload = self._evaluate_proxy_from_usage(proxy, usage=usage)
             proxy_payload["clients"] = {
-                client: self.evaluate_proxy(proxy, client=client)
+                client: self._evaluate_proxy_from_usage(
+                    proxy,
+                    usage=usage,
+                    client=client,
+                    client_usage=self._usage_from_records(
+                        proxy_client_records.get((proxy_id, client), ()),
+                        current_time,
+                    ),
+                )
                 for client in normalized_clients
             }
             snapshot[proxy_id] = proxy_payload
+
+        with self._lock:
+            if len(self._proxy_snapshot_cache) >= PROXY_QUOTA_SNAPSHOT_CACHE_MAX_SIZE:
+                self._proxy_snapshot_cache.pop(next(iter(self._proxy_snapshot_cache)), None)
+            self._proxy_snapshot_cache[cache_key] = json.loads(json.dumps(snapshot))
         return snapshot
+
+    def _proxy_snapshot_cache_key(self, proxies, clients, current_time: datetime):
+        bucket = int(current_time.timestamp() // PROXY_QUOTA_SNAPSHOT_CACHE_SECONDS)
+        proxy_fingerprints = tuple(
+            json.dumps(
+                {
+                    "id": str((proxy or {}).get("id") or "").strip(),
+                    "enabled": bool((proxy or {}).get("enabled", True)),
+                    "priority": int((proxy or {}).get("priority") or 0),
+                    "traffic_limit": (proxy or {}).get("traffic_limit") or {},
+                    "per_client_traffic_limit": (proxy or {}).get("per_client_traffic_limit") or {},
+                },
+                sort_keys=True,
+            )
+            for proxy in proxies
+        )
+        return (bucket, proxy_fingerprints, tuple(clients))
+
+    def _usage_from_records(self, records, current_time: datetime):
+        usage = {}
+        totals = {window_key: 0 for window_key in PROXY_TRAFFIC_WINDOW_CONFIG}
+        cutoffs = {
+            window_key: current_time - window_config["window"]
+            for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items()
+        }
+        for record in records:
+            timestamp = record.get("timestamp")
+            total_bytes = int(record.get("total_bytes") or 0)
+            for window_key, cutoff in cutoffs.items():
+                if timestamp >= cutoff:
+                    totals[window_key] += total_bytes
+        for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items():
+            usage[window_key] = {
+                "window_seconds": int(window_config["window"].total_seconds()),
+                "total_bytes": totals[window_key],
+            }
+        return usage
 
     def proxy_allowed(self, proxy, *, client: str | None = None):
         return self.evaluate_proxy(proxy, client=client).get("allowed", True)

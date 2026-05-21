@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -145,11 +146,19 @@ class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
                     appended_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
                 with patch("proxy_router.records.time.time", return_value=1070):
                     expired_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                    deadline = time.monotonic() + 2
+                    refreshed_payload = None
+                    while time.monotonic() < deadline:
+                        refreshed_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
+                        if refreshed_payload["summary"]["count"] == 2:
+                            break
+                        time.sleep(0.01)
 
             self.assertEqual(call_record_counts, [1, 2])
             self.assertEqual(second_payload["summary"]["count"], 1)
             self.assertEqual(appended_payload["summary"]["count"], 1)
-            self.assertEqual(expired_payload["summary"]["count"], 2)
+            self.assertEqual(expired_payload["summary"]["count"], 1)
+            self.assertEqual(refreshed_payload["summary"]["count"], 2)
 
     def test_build_history_payload_invalidates_cached_summary_on_log_rotation(self):
         with tempfile.TemporaryDirectory() as temp_dir:

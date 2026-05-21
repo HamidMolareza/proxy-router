@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from proxy_router.config import RouterConfigManager
-from proxy_router.dashboard_api import build_dashboard_snapshot
+from proxy_router.dashboard_api import build_dashboard_snapshot, build_live_update_message
 from proxy_router.runtime import DashboardState
 
 
@@ -139,6 +139,36 @@ class DashboardApiScopeTests(unittest.TestCase):
                 self.assertIn("client_quota_status", full)
                 self.assertIn("proxy_quota_status", full)
                 self.assertIn("rule_suggestions", full)
+            finally:
+                router_config.shutdown()
+
+    def test_live_update_can_include_active_scope_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            server, router_config = self._server(temp_dir)
+            try:
+                initial = build_live_update_message(
+                    server,
+                    {"revision": 1},
+                    initial=True,
+                    scope="proxies",
+                )
+                usage_update = build_live_update_message(
+                    server,
+                    {"revision": 2, "reasons": ["usage"], "history_changed": True},
+                    scope="proxies",
+                )
+                connection_update = build_live_update_message(
+                    server,
+                    {"revision": 3, "reasons": ["connections"]},
+                    scope="proxies",
+                )
+
+                self.assertEqual(initial["scope"], "proxies")
+                self.assertIn("recent_requests", initial["snapshot"])
+                self.assertIn("proxy_quota_status", initial["snapshot"])
+                self.assertIn("proxy_quota_status", usage_update["snapshot"])
+                self.assertNotIn("proxy_quota_status", connection_update["snapshot"])
+                self.assertIn("recent_requests", connection_update["snapshot"])
             finally:
                 router_config.shutdown()
 

@@ -187,15 +187,17 @@ Client self-service portal:
 - Authenticated devices can clear their own Rule Suggestions history; admins can clear the full Rule Suggestions table from the dashboard
 - This portal is separate from the admin dashboard and does not expose direct routing or config controls
 - The portal uses a Bootstrap-based responsive layout for mobile screens
+- The portal, quota page, and CA helper pages use the same browser-local `System`/`Light`/`Dark` theme behavior as the admin dashboard
 - The portal uses a filtered WebSocket at `/api/client/live` for live updates scoped to the connected client IP; `proxy.router` pages open the socket against the direct listener address to avoid browser-specific WebSocket proxy handling
 - The admin dashboard can create Bearer PATs for admin API writes, including MCP-driven routing-rule changes. Newly created tokens are shown once and stored only as hashes in `router-config.json`.
 
 Current dashboard behaviors:
 
 - Router, profile, quota, and exemption changes sync automatically without a Save button
+- The dashboard theme switch supports `System`, `Light`, and `Dark`; the choice is stored per browser and `System` follows the OS color-scheme preference.
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
 - Admin clients can query request-history rows through `/api/history/requests` with client, host, route, upstream proxy, status, search, sort, and paging filters
-- Overview and live dashboard state are pushed over a lightweight WebSocket snapshot instead of a 2-second polling loop; heavier tab data is fetched from scoped dashboard endpoints only when that tab needs it
+- Overview and active-tab dashboard state are pushed over a lightweight scoped WebSocket snapshot instead of frequent scoped HTTP polling; scoped dashboard endpoints remain available for direct API use and socket fallback
 - Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.

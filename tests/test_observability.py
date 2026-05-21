@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from proxy_router.runtime import DashboardState, UsageLogger
 from proxy_router.traffic import TrafficQuotaManager
@@ -189,6 +190,34 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(evaluation["client_exceeded_windows"][0]["key"], "1h")
         self.assertFalse(other_user["allowed"])
         self.assertEqual(other_user["client_exceeded_windows"], [])
+
+    def test_proxy_quota_snapshot_reuses_cached_aggregate(self):
+        manager = TrafficQuotaManager()
+        proxy = {
+            "id": "main",
+            "traffic_limit": {
+                "enabled": True,
+                "max_past_hour_mb": 1,
+            },
+            "per_client_traffic_limit": {
+                "enabled": True,
+                "max_past_hour_mb": 1,
+            },
+        }
+        manager.record_usage(
+            client="user:phone",
+            upstream_proxy_id="main",
+            total_bytes=1_100_000,
+        )
+
+        with patch.object(manager, "_usage_from_records", wraps=manager._usage_from_records) as usage_from_records:
+            first_snapshot = manager.proxy_snapshot([proxy], ["user:phone"])
+            second_snapshot = manager.proxy_snapshot([proxy], ["user:phone"])
+
+        self.assertFalse(first_snapshot["main"]["allowed"])
+        self.assertFalse(first_snapshot["main"]["clients"]["user:phone"]["allowed"])
+        self.assertEqual(second_snapshot, first_snapshot)
+        self.assertEqual(usage_from_records.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -56,66 +56,98 @@ const DEFAULT_FAILURE_PAGE_SIZE = 10
 const BYTES_IN_MB = 1_000_000
 const MB_IN_GB = 1024
 const ADMIN_API_TOKEN_STORAGE_KEY = 'proxy-router-admin-api-token'
+const THEME_STORAGE_KEY = 'proxy-router-theme'
+const THEME_OPTIONS = [
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+]
 
 function cx(...classes) {
   return classes.filter(Boolean).join(' ')
 }
 
+function getSystemTheme() {
+  if (typeof window === 'undefined' || !window.matchMedia) {
+    return 'light'
+  }
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function normalizeThemePreference(value) {
+  return THEME_OPTIONS.some((item) => item.value === value) ? value : 'system'
+}
+
+function isAdminApiAuthErrorMessage(message) {
+  const normalized = String(message || '').toLowerCase()
+  return normalized.includes('admin api token') || normalized.includes('unauthorized')
+}
+
+function getStoredThemePreference() {
+  try {
+    return normalizeThemePreference(window.localStorage.getItem(THEME_STORAGE_KEY))
+  } catch {
+    return 'system'
+  }
+}
+
 const pageClass = [
-  'min-h-screen bg-[linear-gradient(180deg,#f6f2e9_0%,#ece6d8_100%)] text-[#1f2a30]',
+  'theme-root min-h-screen bg-[linear-gradient(180deg,var(--pr-page-from)_0%,var(--pr-page-to)_100%)] text-[var(--pr-text)]',
   "font-['IBM_Plex_Sans','Noto_Sans',sans-serif]",
   '[&_h1]:text-2xl [&_h1]:leading-tight [&_h1]:font-bold sm:[&_h1]:text-3xl',
   '[&_h2]:text-lg [&_h2]:leading-snug [&_h2]:font-bold sm:[&_h2]:text-xl',
   '[&_h3]:text-base [&_h3]:leading-snug [&_h3]:font-bold',
-  "[&_button]:min-h-10 [&_button]:cursor-pointer [&_button]:rounded-[10px] [&_button]:border [&_button]:border-[#c8c0b2] [&_button]:bg-[#fffdf8] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[#1f2a30]",
+  '[&_button]:min-h-10 [&_button]:cursor-pointer [&_button]:rounded-[10px] [&_button]:border [&_button]:border-[var(--pr-control-border)] [&_button]:bg-[var(--pr-control-bg)] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[var(--pr-text)]',
   '[&_button:disabled]:cursor-default [&_button:disabled]:opacity-55',
-  "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[10px] [&_input[type='number']]:border [&_input[type='number']]:border-[#d8d1c2] [&_input[type='number']]:bg-[#fffdf8] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2",
-  "[&_input[type='password']]:w-full [&_input[type='password']]:rounded-[10px] [&_input[type='password']]:border [&_input[type='password']]:border-[#d8d1c2] [&_input[type='password']]:bg-[#fffdf8] [&_input[type='password']]:px-3 [&_input[type='password']]:py-2",
-  "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[#d8d1c2] [&_input[type='search']]:bg-[#fffdf8] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2",
-  "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[#d8d1c2] [&_input[type='text']]:bg-[#fffdf8] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2",
-  '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[#d8d1c2] [&_select]:bg-[#fffdf8] [&_select]:px-3 [&_select]:py-2',
+  "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[10px] [&_input[type='number']]:border [&_input[type='number']]:border-[var(--pr-input-border)] [&_input[type='number']]:bg-[var(--pr-control-bg)] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2 [&_input[type='number']]:text-[var(--pr-text)]",
+  "[&_input[type='password']]:w-full [&_input[type='password']]:rounded-[10px] [&_input[type='password']]:border [&_input[type='password']]:border-[var(--pr-input-border)] [&_input[type='password']]:bg-[var(--pr-control-bg)] [&_input[type='password']]:px-3 [&_input[type='password']]:py-2 [&_input[type='password']]:text-[var(--pr-text)]",
+  "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[var(--pr-input-border)] [&_input[type='search']]:bg-[var(--pr-control-bg)] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2 [&_input[type='search']]:text-[var(--pr-text)]",
+  "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[var(--pr-input-border)] [&_input[type='text']]:bg-[var(--pr-control-bg)] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2 [&_input[type='text']]:text-[var(--pr-text)]",
+  '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[var(--pr-input-border)] [&_select]:bg-[var(--pr-control-bg)] [&_select]:px-3 [&_select]:py-2 [&_select]:text-[var(--pr-text)]',
 ].join(' ')
 const shellClass = 'mx-auto w-full max-w-[1200px] px-2 py-3 sm:px-4 sm:py-6'
 const heroClass = 'mb-3 flex flex-col items-start gap-2 sm:mb-4 min-[901px]:flex-row min-[901px]:items-end min-[901px]:justify-between'
-const panelClass = 'min-w-0 rounded-xl border border-[#d8d1c2] bg-[#fffdf8] p-3 shadow-[0_8px_20px_rgba(24,36,39,0.06)] sm:rounded-[18px] sm:p-4 sm:shadow-[0_12px_30px_rgba(24,36,39,0.08)]'
-const subpanelClass = 'min-w-0 overflow-x-auto rounded-xl border border-[#e8e0d1] bg-gradient-to-b from-white to-[#f6f4ed] p-3 sm:rounded-[14px] sm:p-4'
+const panelClass = 'min-w-0 rounded-xl border border-[var(--pr-panel-border)] bg-[var(--pr-panel)] p-3 shadow-[var(--pr-panel-shadow)] sm:rounded-[18px] sm:p-4'
+const subpanelClass = 'min-w-0 overflow-x-auto rounded-xl border border-[var(--pr-card-border)] bg-[linear-gradient(180deg,var(--pr-surface-strong)_0%,var(--pr-surface-muted)_100%)] p-3 sm:rounded-[14px] sm:p-4'
 const panelHeaderClass = 'flex flex-wrap items-stretch justify-between gap-3 sm:items-center sm:gap-4'
-const noteClass = 'mt-2 text-sm leading-relaxed text-[#6a6f73]'
+const noteClass = 'mt-2 text-sm leading-relaxed text-[var(--pr-muted)]'
 const statusPillClass = 'mt-3 rounded-[8px] border px-3 py-2 text-sm'
-const mutedClass = 'text-[#6a6f73]'
-const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[#d9ece8] px-3 py-1.5 font-semibold text-[#116466]'
-const warningPillClass = 'bg-[#f7e4bb] text-[#9b6b00]'
-const errorPillClass = 'bg-[#fde2dd] text-[#a33a2c]'
-const mutedPillClass = 'bg-[#ece7dc] text-[#6a6f73]'
+const mutedClass = 'text-[var(--pr-muted)]'
+const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[var(--pr-accent-soft)] px-3 py-1.5 font-semibold text-[var(--pr-accent)]'
+const warningPillClass = '!bg-[var(--pr-warning-soft)] !text-[var(--pr-warning)]'
+const errorPillClass = '!bg-[var(--pr-error-soft)] !text-[var(--pr-error)]'
+const mutedPillClass = '!bg-[var(--pr-muted-soft)] !text-[var(--pr-muted)]'
 const gridClass = 'grid grid-cols-12 gap-4'
 const cardGridClass = 'col-span-full grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(150px,1fr))] sm:gap-3'
-const cardClass = 'min-w-0 rounded-[10px] border border-[#e8e0d1] bg-gradient-to-b from-white to-[#f6f4ed] p-3 sm:rounded-[14px] sm:p-4'
-const cardLabelClass = 'text-xs text-[#6a6f73] sm:text-sm'
+const cardClass = 'min-w-0 rounded-[10px] border border-[var(--pr-card-border)] bg-[linear-gradient(180deg,var(--pr-surface-strong)_0%,var(--pr-surface-muted)_100%)] p-3 sm:rounded-[14px] sm:p-4'
+const cardLabelClass = 'text-xs text-[var(--pr-muted)] sm:text-sm'
 const cardValueClass = 'mt-1 [overflow-wrap:anywhere] text-base leading-tight font-bold sm:text-xl'
 const tableWrapClass = [
   '-mx-1 w-full overflow-x-auto px-1 pb-1 [-webkit-overflow-scrolling:touch]',
   '[&_table]:w-full [&_table]:border-collapse [&_table]:text-sm max-sm:[&_table]:min-w-[42rem] sm:[&_table]:text-[0.95rem]',
-  '[&_th]:border-b [&_th]:border-[#ece5d8] [&_th]:px-2 [&_th]:py-2 [&_th]:text-left [&_th]:align-top [&_th]:text-xs [&_th]:font-semibold [&_th]:tracking-[0.05em] [&_th]:text-[#6a6f73] [&_th]:uppercase',
-  '[&_td]:border-b [&_td]:border-[#ece5d8] [&_td]:px-2 [&_td]:py-2 [&_td]:align-top',
+  '[&_th]:border-b [&_th]:border-[var(--pr-table-border)] [&_th]:px-2 [&_th]:py-2 [&_th]:text-left [&_th]:align-top [&_th]:text-xs [&_th]:font-semibold [&_th]:tracking-[0.05em] [&_th]:text-[var(--pr-muted)] [&_th]:uppercase',
+  '[&_td]:border-b [&_td]:border-[var(--pr-table-border)] [&_td]:px-2 [&_td]:py-2 [&_td]:align-top',
 ].join(' ')
-const controlClass = 'flex min-w-0 flex-col gap-1 text-sm text-[#6a6f73] sm:min-w-36'
+const controlClass = 'flex min-w-0 flex-col gap-1 text-sm text-[var(--pr-muted)] sm:min-w-36'
 const controlsClass = 'mt-3 mb-1 grid grid-cols-1 gap-3 sm:flex sm:flex-wrap'
 const fieldGridClass = 'mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fit,minmax(180px,1fr))]'
-const fieldClass = 'flex min-w-0 flex-col gap-1 text-sm text-[#6a6f73]'
+const fieldClass = 'flex min-w-0 flex-col gap-1 text-sm text-[var(--pr-muted)]'
 const buttonRowClass = 'mt-3 flex flex-wrap gap-3 max-sm:[&>button]:w-full'
 const tightButtonRowClass = 'mt-0 flex flex-wrap gap-3 max-sm:[&>button]:w-full'
-const warnButtonClass = '!border-[#e4c980] !bg-[#f7e4bb] !text-[#6b4a00]'
-const primaryButtonClass = '!border-[#116466] !bg-[#116466] !text-white'
-const dirtyInputClass = '!border-[#116466] shadow-[0_0_0_3px_rgba(17,100,102,0.12)]'
+const warnButtonClass = '!border-[var(--pr-warning-border)] !bg-[var(--pr-warning-soft)] !text-[var(--pr-warning-strong)]'
+const primaryButtonClass = '!border-[var(--pr-accent)] !bg-[var(--pr-accent)] !text-white'
+const dirtyInputClass = '!border-[var(--pr-accent)] shadow-[0_0_0_3px_var(--pr-focus-ring)]'
 const readOnlyInputClass = 'opacity-70'
 const chipListClass = 'mt-3 flex flex-wrap gap-2'
-const chipClass = 'inline-flex max-w-full items-center gap-2 [overflow-wrap:anywhere] rounded-full border border-[#ddd2bf] bg-white px-3 py-1.5 text-sm'
-const chipButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !font-bold !text-[#8c5a00]'
+const chipClass = 'inline-flex max-w-full items-center gap-2 [overflow-wrap:anywhere] rounded-full border border-[var(--pr-chip-border)] bg-[var(--pr-surface-strong)] px-3 py-1.5 text-sm'
+const chipButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !font-bold !text-[var(--pr-warning)]'
 const ruleActionsClass = 'flex flex-wrap gap-2 max-sm:flex-col max-sm:items-stretch max-sm:[&_button]:w-full max-sm:[&_button]:whitespace-nowrap'
-const rulePillClass = 'inline-flex items-center rounded-full border border-[#dbcdb7] bg-[#f1ece2] px-2 py-1 text-xs font-bold text-[#5a4631]'
-const autoRulePillClass = '!border-[#b9d7d8] !bg-[#e3f1f1] !text-[#13595b]'
+const rulePillClass = 'inline-flex items-center rounded-full border border-[var(--pr-rule-border)] bg-[var(--pr-rule-bg)] px-2 py-1 text-xs font-bold text-[var(--pr-rule-text)]'
+const autoRulePillClass = '!border-[var(--pr-accent-border)] !bg-[var(--pr-accent-soft)] !text-[var(--pr-accent)]'
 const ruleMetaClass = 'flex flex-col gap-1 text-sm'
-const sortableHeaderButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !text-left !text-xs !font-semibold !tracking-[0.05em] !text-[#6a6f73] !uppercase'
+const sortableHeaderButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !text-left !text-xs !font-semibold !tracking-[0.05em] !text-[var(--pr-muted)] !uppercase'
+const themeSwitchClass = 'flex rounded-[10px] border border-[var(--pr-control-border)] bg-[var(--pr-segment-bg)] p-1'
+const themeButtonClass = '!min-h-0 !border-0 !bg-transparent !px-2 !py-1 !text-xs sm:!px-3'
 
 function compareNumbers(left, right, direction) {
   const leftValue = Number(left || 0)
@@ -342,6 +374,12 @@ function dashboardScopeForTab(tab) {
     return 'failures'
   }
   return ''
+}
+
+const HEAVY_DASHBOARD_SCOPES = new Set(['failures', 'proxies', 'quotas', 'routing', 'users'])
+
+function dashboardScopeMinRefreshMs(scope) {
+  return HEAVY_DASHBOARD_SCOPES.has(scope) ? 5000 : 1000
 }
 
 function emptyUpstreamStatus() {
@@ -2244,9 +2282,11 @@ function buildRulesExportPayload(config) {
   }
 }
 
-function buildLiveSocketUrl() {
+function buildLiveSocketUrl(scope = '') {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/api/live`
+  const normalizedScope = String(scope || '').trim()
+  const query = normalizedScope ? `?scope=${encodeURIComponent(normalizedScope)}` : ''
+  return `${protocol}//${window.location.host}/api/live${query}`
 }
 
 function createProfileId() {
@@ -2419,6 +2459,8 @@ function BodyPreviewBox({ title, preview, mode, onModeChange, onCopy }) {
 
 function App() {
   const [activeTab, setActiveTab] = useState(getTabFromHash())
+  const [themePreference, setThemePreference] = useState(getStoredThemePreference)
+  const [systemTheme, setSystemTheme] = useState(getSystemTheme)
   const [dashboardSnapshot, setDashboardSnapshot] = useState(emptyDashboardSnapshot())
   const [historyData, setHistoryData] = useState(emptyHistoryData())
   const [historyRange, setHistoryRange] = useState('24h')
@@ -2475,6 +2517,7 @@ function App() {
   const [httpsHostPatternsText, setHttpsHostPatternsText] = useState('')
   const [httpsBypassPatternsText, setHttpsBypassPatternsText] = useState('')
   const routerEditVersionRef = useRef(0)
+  const lastSavedRouterConfigRef = useRef(normalizeRouterConfig({}))
   const liveSocketRef = useRef(null)
   const liveSocketReconnectRef = useRef(null)
   const historyRefreshTimerRef = useRef(null)
@@ -2484,7 +2527,7 @@ function App() {
   const historyUpstreamProxyIdRef = useRef(historyUpstreamProxyId)
   const historyClientRef = useRef(historyClient)
   const httpsTrafficRefreshTimerRef = useRef(null)
-  const dashboardScopeRefreshTimerRef = useRef(null)
+  const dashboardScopeRefreshStateRef = useRef({})
   const httpsTrafficFiltersRef = useRef(httpsTrafficFilters)
   const copyStatusTimerRef = useRef(null)
   const routerHasLocalChangesRef = useRef(false)
@@ -2499,6 +2542,11 @@ function App() {
     const token = String(adminApiToken || '').trim()
     return token ? { Authorization: `Bearer ${token}` } : {}
   }, [adminApiToken])
+  const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference
+  const routerConfigWriteAuthBlocked = Boolean(adminApiStatus.requires_auth && !String(adminApiToken || '').trim())
+  const routerConfigAuthBlockedText =
+    'Admin API token required for config changes · open Quotas -> Admin API tokens'
+  const activeDashboardScope = dashboardScopeForTab(activeTab)
 
   const safeEditorProfileId = useMemo(
     () =>
@@ -2560,7 +2608,12 @@ function App() {
   const routerDirty = routerPersistableFingerprint !== lastSavedRouterFingerprint
   const routerDraftCount = countRouterDraftItems(currentRouterConfig)
   const routerHasLocalChanges = routerDirty || routerDraftCount > 0
-  const routerStatus = routerBlockingRuleIssues.length
+  const routerStatus = routerConfigWriteAuthBlocked
+    ? {
+        text: routerConfigAuthBlockedText,
+        warning: true,
+      }
+    : routerBlockingRuleIssues.length
     ? {
         text: `${routerBlockingRuleIssues.length} rule issue${
           routerBlockingRuleIssues.length === 1 ? '' : 's'
@@ -2980,6 +3033,35 @@ function App() {
   }, [])
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themePreference)
+    } catch {
+      // Keep the in-memory selection when browser storage is unavailable.
+    }
+  }, [themePreference])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = resolvedTheme
+    document.documentElement.style.colorScheme = resolvedTheme
+  }, [resolvedTheme])
+
+  useEffect(() => {
+    if (!window.matchMedia) {
+      return undefined
+    }
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    const handleThemeChange = () => {
+      setSystemTheme(mediaQuery.matches ? 'dark' : 'light')
+    }
+
+    handleThemeChange()
+    mediaQuery.addEventListener('change', handleThemeChange)
+    return () => {
+      mediaQuery.removeEventListener('change', handleThemeChange)
+    }
+  }, [])
+
+  useEffect(() => {
     function handleHashChange() {
       setActiveTab(getTabFromHash())
     }
@@ -3006,7 +3088,7 @@ function App() {
     }
   }, [])
 
-  async function loadRouterConfig({ showStatus = false } = {}) {
+  async function loadRouterConfig({ showStatus = false, checkProxies = false } = {}) {
     const response = await fetch('/api/router-config', {
       cache: 'no-store',
       headers: {
@@ -3028,7 +3110,7 @@ function App() {
     } else {
       setRouterStatusOverride(null)
     }
-    if (loadedConfig.proxies.some((proxy) => proxy.enabled !== false)) {
+    if (checkProxies && loadedConfig.proxies.some((proxy) => proxy.enabled !== false)) {
       triggerAllProxyChecks({ showStatus: false })
     }
   }
@@ -3129,22 +3211,79 @@ function App() {
     }
   }
 
-  async function refreshDashboardScope(scope) {
+  async function refreshDashboardScope(scope, options = {}) {
     const normalizedScope = String(scope || '').trim()
     if (!normalizedScope) {
       return
     }
-    const response = await fetch(`/api/dashboard/${encodeURIComponent(normalizedScope)}`, {
-      cache: 'no-store',
-      headers: {
-        Accept: 'application/json',
-      },
-    })
-    if (!response.ok) {
-      throw new Error(`dashboard ${normalizedScope} HTTP ${response.status}`)
+    const force = Boolean(options.force)
+    const state =
+      dashboardScopeRefreshStateRef.current[normalizedScope] ||
+      {
+        inFlight: false,
+        pending: false,
+        timer: null,
+        lastStartedAt: 0,
+        promise: null,
+      }
+    dashboardScopeRefreshStateRef.current[normalizedScope] = state
+    if (force && state.timer != null) {
+      window.clearTimeout(state.timer)
+      state.timer = null
+      state.pending = false
     }
-    const payload = await response.json()
-    setDashboardSnapshot((existingSnapshot) => mergeDashboardSnapshot(existingSnapshot, payload))
+    const minRefreshMs = force ? 0 : dashboardScopeMinRefreshMs(normalizedScope)
+    const waitMs = Math.max(0, minRefreshMs - (Date.now() - state.lastStartedAt))
+    if (state.inFlight) {
+      state.pending = true
+      return state.promise || Promise.resolve()
+    }
+    if (waitMs > 0) {
+      state.pending = true
+      if (state.timer == null) {
+        state.timer = window.setTimeout(() => {
+          state.timer = null
+          state.pending = false
+          refreshDashboardScope(normalizedScope, { force: true }).catch((error) => {
+            setStatus({
+              text: `Dashboard ${normalizedScope} refresh paused: ${error.message}`,
+              warning: true,
+            })
+          })
+        }, waitMs)
+      }
+      return Promise.resolve()
+    }
+    state.inFlight = true
+    state.lastStartedAt = Date.now()
+    state.promise = (async () => {
+      const response = await fetch(`/api/dashboard/${encodeURIComponent(normalizedScope)}`, {
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+        },
+      })
+      if (!response.ok) {
+        throw new Error(`dashboard ${normalizedScope} HTTP ${response.status}`)
+      }
+      const payload = await response.json()
+      setDashboardSnapshot((existingSnapshot) => mergeDashboardSnapshot(existingSnapshot, payload))
+    })()
+    try {
+      await state.promise
+    } finally {
+      state.inFlight = false
+      state.promise = null
+      if (state.pending) {
+        state.pending = false
+        refreshDashboardScope(normalizedScope).catch((error) => {
+          setStatus({
+            text: `Dashboard ${normalizedScope} refresh paused: ${error.message}`,
+            warning: true,
+          })
+        })
+      }
+    }
   }
 
   async function loadHttpsTrafficDetail(requestId) {
@@ -3266,6 +3405,10 @@ function App() {
   }, [routerEditVersion])
 
   useEffect(() => {
+    lastSavedRouterConfigRef.current = lastSavedRouterConfig
+  }, [lastSavedRouterConfig])
+
+  useEffect(() => {
     activeTabRef.current = activeTab
     historyRangeRef.current = historyRange
     historyProxyTypeRef.current = historyProxyType
@@ -3328,6 +3471,7 @@ function App() {
   useEffect(() => {
     let disposed = false
     let reconnectDelayMs = 1000
+    const dashboardScopeRefreshState = dashboardScopeRefreshStateRef.current
 
     function scheduleHistoryRefresh() {
       if (historyRefreshTimerRef.current != null) {
@@ -3366,32 +3510,12 @@ function App() {
       }, 250)
     }
 
-    function scheduleDashboardScopeRefresh(tab) {
-      const scope = dashboardScopeForTab(tab)
-      if (!scope || dashboardScopeRefreshTimerRef.current != null) {
-        return
-      }
-      dashboardScopeRefreshTimerRef.current = window.setTimeout(() => {
-        dashboardScopeRefreshTimerRef.current = null
-        const refresh = refreshDashboardScopeRef.current
-        if (!refresh) {
-          return
-        }
-        refresh(scope).catch((error) => {
-          setStatus({
-            text: `Dashboard ${scope} refresh paused: ${error.message}`,
-            warning: true,
-          })
-        })
-      }, 250)
-    }
-
     function connectLiveSocket() {
       if (disposed) {
         return
       }
 
-      const socket = new WebSocket(buildLiveSocketUrl())
+      const socket = new WebSocket(buildLiveSocketUrl(activeDashboardScope))
       liveSocketRef.current = socket
 
       socket.addEventListener('open', () => {
@@ -3440,7 +3564,6 @@ function App() {
         if (payload.https_traffic_changed && activeTabRef.current === 'https') {
           scheduleHttpsTrafficRefresh()
         }
-        scheduleDashboardScopeRefresh(activeTabRef.current)
       })
 
       socket.addEventListener('close', () => {
@@ -3483,9 +3606,11 @@ function App() {
         window.clearTimeout(httpsTrafficRefreshTimerRef.current)
         httpsTrafficRefreshTimerRef.current = null
       }
-      if (dashboardScopeRefreshTimerRef.current != null) {
-        window.clearTimeout(dashboardScopeRefreshTimerRef.current)
-        dashboardScopeRefreshTimerRef.current = null
+      for (const state of Object.values(dashboardScopeRefreshState)) {
+        if (state.timer != null) {
+          window.clearTimeout(state.timer)
+          state.timer = null
+        }
       }
       if (copyStatusTimerRef.current != null) {
         window.clearTimeout(copyStatusTimerRef.current)
@@ -3500,7 +3625,7 @@ function App() {
         liveSocketRef.current = null
       }
     }
-  }, [])
+  }, [activeDashboardScope])
 
   useEffect(() => {
     const scope = dashboardScopeForTab(activeTab)
@@ -3508,17 +3633,21 @@ function App() {
       return
     }
     const timeoutId = window.setTimeout(() => {
+      const socket = liveSocketRef.current
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        return
+      }
       const refresh = refreshDashboardScopeRef.current
       if (!refresh) {
         return
       }
-      refresh(scope).catch((error) => {
+      refresh(scope, { force: true }).catch((error) => {
         setStatus({
           text: `Dashboard ${scope} refresh paused: ${error.message}`,
           warning: true,
         })
       })
-    }, 0)
+    }, 1000)
     return () => {
       window.clearTimeout(timeoutId)
     }
@@ -3606,6 +3735,14 @@ function App() {
         })
         .catch((error) => {
           setRouterSaveError(error.message)
+          if (isAdminApiAuthErrorMessage(error.message)) {
+            setCurrentRouterConfig(cloneJson(lastSavedRouterConfigRef.current))
+            setRouterStatusOverride({
+              text: `${error.message} · open Quotas -> Admin API tokens`,
+              warning: true,
+            })
+            return
+          }
           setRouterStatusOverride(null)
         })
         .finally(() => {
@@ -3619,6 +3756,14 @@ function App() {
   }, [adminApiHeaders, routerDirty, routerEditVersion, routerPersistableFingerprint, routerBlockingRuleIssues.length])
 
   function setLocalRouterConfig(nextConfig, options = {}) {
+    if (routerConfigWriteAuthBlocked) {
+      setRouterSaveError('admin API token is required')
+      setRouterStatusOverride({
+        text: routerConfigAuthBlockedText,
+        warning: true,
+      })
+      return
+    }
     setCurrentRouterConfig(normalizeRouterConfig(nextConfig))
     setRouterEditVersion((version) => version + 1)
     setRouterSaveError('')
@@ -3645,6 +3790,10 @@ function App() {
   function updateAdminApiToken(value) {
     const token = String(value || '')
     setAdminApiToken(token)
+    if (token.trim()) {
+      setRouterSaveError('')
+      setRouterStatusOverride(null)
+    }
     try {
       if (token.trim()) {
         window.localStorage.setItem(ADMIN_API_TOKEN_STORAGE_KEY, token.trim())
@@ -4325,14 +4474,29 @@ function App() {
   }
 
   return (
-    <main className={pageClass}>
+    <main className={pageClass} data-theme={resolvedTheme} style={{ colorScheme: resolvedTheme }}>
       <div className={shellClass}>
       <section className={heroClass}>
         <div>
           <h1>proxy-router dashboard</h1>
           <p>Current session view for traffic totals, per-device usage, and the latest completed request.</p>
         </div>
-        <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
+        <div className="flex w-full flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end sm:flex-wrap">
+          <div className={themeSwitchClass} aria-label="Theme">
+            {THEME_OPTIONS.map((item) => (
+              <button
+                key={item.value}
+                className={cx(themeButtonClass, themePreference === item.value && primaryButtonClass)}
+                type="button"
+                aria-pressed={themePreference === item.value ? 'true' : 'false'}
+                onClick={() => setThemePreference(item.value)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
+        </div>
       </section>
 
       <section className={cx(panelClass, 'mb-4')}>

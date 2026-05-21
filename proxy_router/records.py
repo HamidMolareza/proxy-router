@@ -33,6 +33,8 @@ class UsageHistoryCache:
         self._records = []
         self._invalid_lines = 0
         self._history_payload_cache = {}
+        self._history_payload_stale_cache = {}
+        self._history_payload_refreshing = set()
 
     def _reset(self):
         self._file_id = None
@@ -40,6 +42,8 @@ class UsageHistoryCache:
         self._records = []
         self._invalid_lines = 0
         self._history_payload_cache = {}
+        self._history_payload_stale_cache = {}
+        self._history_payload_refreshing = set()
 
     def clear(self):
         with self._lock:
@@ -88,6 +92,8 @@ class UsageHistoryCache:
         # on every dashboard refresh. Rotation/truncation still invalidates.
         if reload_full:
             self._history_payload_cache = {}
+            self._history_payload_stale_cache = {}
+            self._history_payload_refreshing = set()
         return changed
 
     def _history_payload_cache_key(
@@ -101,10 +107,28 @@ class UsageHistoryCache:
         timezone_offset_minutes,
     ):
         time_bucket = int(time.time() // HISTORY_SUMMARY_CACHE_SECONDS)
+        return (time_bucket,) + self._history_payload_stale_key(
+            range_key=range_key,
+            proxy_type=proxy_type,
+            client=client,
+            upstream_proxy_id=upstream_proxy_id,
+            timezone_name=timezone_name,
+            timezone_offset_minutes=timezone_offset_minutes,
+        )
+
+    def _history_payload_stale_key(
+        self,
+        *,
+        range_key: str,
+        proxy_type: str | None,
+        client: str | None,
+        upstream_proxy_id: str | None,
+        timezone_name: str | None,
+        timezone_offset_minutes,
+    ):
         return (
             self._file_id,
             self._invalid_lines,
-            time_bucket,
             str(range_key or ""),
             str(proxy_type or ""),
             str(client or ""),
@@ -117,10 +141,104 @@ class UsageHistoryCache:
     def _clone_payload(payload):
         return json.loads(json.dumps(payload))
 
-    def _remember_history_payload(self, cache_key, payload):
+    def _remember_history_payload(self, cache_key, stale_key, payload):
         if len(self._history_payload_cache) >= HISTORY_SUMMARY_CACHE_MAX_SIZE:
             self._history_payload_cache.pop(next(iter(self._history_payload_cache)), None)
         self._history_payload_cache[cache_key] = self._clone_payload(payload)
+        if len(self._history_payload_stale_cache) >= HISTORY_SUMMARY_CACHE_MAX_SIZE:
+            self._history_payload_stale_cache.pop(next(iter(self._history_payload_stale_cache)), None)
+        self._history_payload_stale_cache[stale_key] = self._clone_payload(payload)
+
+    def _summarize_history_payload(
+        self,
+        records,
+        *,
+        invalid_lines: int,
+        range_key: str,
+        proxy_type: str | None,
+        client: str | None,
+        upstream_proxy_id: str | None,
+        timezone_name: str | None,
+        timezone_offset_minutes,
+    ):
+        return summarize_history_records(
+            records,
+            invalid_lines=invalid_lines,
+            range_key=range_key,
+            proxy_type=proxy_type,
+            client=client,
+            upstream_proxy_id=upstream_proxy_id,
+            timezone_name=timezone_name,
+            timezone_offset_minutes=timezone_offset_minutes,
+        )
+
+    def _refresh_history_payload(
+        self,
+        *,
+        cache_key,
+        stale_key,
+        records,
+        invalid_lines: int,
+        range_key: str,
+        proxy_type: str | None,
+        client: str | None,
+        upstream_proxy_id: str | None,
+        timezone_name: str | None,
+        timezone_offset_minutes,
+    ):
+        try:
+            payload = self._summarize_history_payload(
+                records,
+                invalid_lines=invalid_lines,
+                range_key=range_key,
+                proxy_type=proxy_type,
+                client=client,
+                upstream_proxy_id=upstream_proxy_id,
+                timezone_name=timezone_name,
+                timezone_offset_minutes=timezone_offset_minutes,
+            )
+            with self._lock:
+                if stale_key[0] == self._file_id and stale_key[1] == self._invalid_lines:
+                    self._remember_history_payload(cache_key, stale_key, payload)
+        finally:
+            with self._lock:
+                self._history_payload_refreshing.discard(stale_key)
+
+    def _start_history_payload_refresh(
+        self,
+        *,
+        cache_key,
+        stale_key,
+        records,
+        invalid_lines: int,
+        range_key: str,
+        proxy_type: str | None,
+        client: str | None,
+        upstream_proxy_id: str | None,
+        timezone_name: str | None,
+        timezone_offset_minutes,
+    ):
+        if stale_key in self._history_payload_refreshing:
+            return
+        self._history_payload_refreshing.add(stale_key)
+        refresh_thread = threading.Thread(
+            target=self._refresh_history_payload,
+            kwargs={
+                "cache_key": cache_key,
+                "stale_key": stale_key,
+                "records": records,
+                "invalid_lines": invalid_lines,
+                "range_key": range_key,
+                "proxy_type": proxy_type,
+                "client": client,
+                "upstream_proxy_id": upstream_proxy_id,
+                "timezone_name": timezone_name,
+                "timezone_offset_minutes": timezone_offset_minutes,
+            },
+            name="usage-history-summary-refresh",
+            daemon=True,
+        )
+        refresh_thread.start()
 
     def build_history_payload(
         self,
@@ -145,10 +263,33 @@ class UsageHistoryCache:
             cached_payload = self._history_payload_cache.get(cache_key)
             if cached_payload is not None:
                 return self._clone_payload(cached_payload)
+            stale_key = self._history_payload_stale_key(
+                range_key=range_key,
+                proxy_type=proxy_type,
+                client=client,
+                upstream_proxy_id=upstream_proxy_id,
+                timezone_name=timezone_name,
+                timezone_offset_minutes=timezone_offset_minutes,
+            )
+            stale_payload = self._history_payload_stale_cache.get(stale_key)
             records = list(self._records)
             invalid_lines = self._invalid_lines
+            if stale_payload is not None:
+                self._start_history_payload_refresh(
+                    cache_key=cache_key,
+                    stale_key=stale_key,
+                    records=records,
+                    invalid_lines=invalid_lines,
+                    range_key=range_key,
+                    proxy_type=proxy_type,
+                    client=client,
+                    upstream_proxy_id=upstream_proxy_id,
+                    timezone_name=timezone_name,
+                    timezone_offset_minutes=timezone_offset_minutes,
+                )
+                return self._clone_payload(stale_payload)
 
-        payload = summarize_history_records(
+        payload = self._summarize_history_payload(
             records,
             invalid_lines=invalid_lines,
             range_key=range_key,
@@ -159,8 +300,8 @@ class UsageHistoryCache:
             timezone_offset_minutes=timezone_offset_minutes,
         )
         with self._lock:
-            if cache_key[0] == self._file_id and cache_key[1] == self._invalid_lines:
-                self._remember_history_payload(cache_key, payload)
+            if stale_key[0] == self._file_id and stale_key[1] == self._invalid_lines:
+                self._remember_history_payload(cache_key, stale_key, payload)
         return self._clone_payload(payload)
 
     def recent_records(

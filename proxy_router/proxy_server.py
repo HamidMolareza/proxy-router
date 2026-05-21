@@ -3980,6 +3980,180 @@ def build_client_portal_snapshot(server, client: str, *, range_key: str, client_
     }
 
 
+def render_panel_theme_script() -> str:
+    return """<script>
+(function () {
+  var storageKey = "proxy-router-theme";
+  var choices = ["system", "light", "dark"];
+  var mediaQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+
+  function readPreference() {
+    try {
+      var value = window.localStorage.getItem(storageKey);
+      return choices.indexOf(value) >= 0 ? value : "system";
+    } catch (_error) {
+      return "system";
+    }
+  }
+
+  function writePreference(value) {
+    try {
+      window.localStorage.setItem(storageKey, value);
+    } catch (_error) {
+      return;
+    }
+  }
+
+  function resolvedTheme(preference) {
+    if (preference === "dark" || preference === "light") return preference;
+    return mediaQuery && mediaQuery.matches ? "dark" : "light";
+  }
+
+  function applyTheme(preference) {
+    var nextPreference = choices.indexOf(preference) >= 0 ? preference : readPreference();
+    var nextTheme = resolvedTheme(nextPreference);
+    document.documentElement.dataset.theme = nextTheme;
+    document.documentElement.dataset.themePreference = nextPreference;
+    document.documentElement.style.colorScheme = nextTheme;
+    document.querySelectorAll("[data-theme-choice-button]").forEach(function (button) {
+      var pressed = button.getAttribute("data-theme-choice-button") === nextPreference;
+      button.setAttribute("aria-pressed", pressed ? "true" : "false");
+    });
+  }
+
+  applyTheme(readPreference());
+
+  document.addEventListener("DOMContentLoaded", function () {
+    applyTheme(readPreference());
+    document.querySelectorAll("[data-theme-choice-button]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var nextPreference = button.getAttribute("data-theme-choice-button") || "system";
+        writePreference(nextPreference);
+        applyTheme(nextPreference);
+      });
+    });
+  });
+
+  if (mediaQuery && mediaQuery.addEventListener) {
+    mediaQuery.addEventListener("change", function () {
+      if (readPreference() === "system") applyTheme("system");
+    });
+  }
+})();
+  </script>"""
+
+
+def render_panel_theme_css() -> str:
+    return """
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0b1120;
+      --panel: #182232;
+      --ink: #e5edf5;
+      --muted: #a8b3c2;
+      --accent: #4fd1c5;
+      --accent-dark: #38bdb2;
+      --accent-soft: #123f44;
+      --warn: #f6c96f;
+      --warn-soft: #3f2f11;
+      --border: #334155;
+      --shadow: rgba(0, 0, 0, 0.34);
+    }
+    .theme-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 14px;
+    }
+    .theme-switch {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 8px 24px var(--shadow);
+    }
+    .theme-switch button {
+      min-height: 34px;
+      border: 0;
+      border-radius: 9px;
+      padding: 7px 10px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+    }
+    .theme-switch button[aria-pressed="true"] {
+      background: var(--accent);
+      color: #ffffff;
+    }
+    html[data-theme="dark"] a {
+      color: var(--accent);
+    }
+    html[data-theme="dark"] body {
+      background: linear-gradient(180deg, #111827 0%, var(--bg) 100%);
+    }
+    html[data-theme="dark"] .button.secondary,
+    html[data-theme="dark"] .install-button.secondary,
+    html[data-theme="dark"] .suggestion-submit.secondary,
+    html[data-theme="dark"] .range-link,
+    html[data-theme="dark"] .suggestion-inline-button {
+      background: #111827;
+      color: var(--accent);
+      border-color: var(--border);
+    }
+    html[data-theme="dark"] .range-link.active,
+    html[data-theme="dark"] .pill,
+    html[data-theme="dark"] .install-panel,
+    html[data-theme="dark"] .steps,
+    html[data-theme="dark"] code {
+      background: var(--accent-soft);
+      border-color: #25666d;
+      color: var(--ink);
+    }
+    html[data-theme="dark"] .guide-card,
+    html[data-theme="dark"] pre,
+    html[data-theme="dark"] .portal-table th,
+    html[data-theme="dark"] .table-responsive,
+    html[data-theme="dark"] .suggestion-grid input,
+    html[data-theme="dark"] .suggestion-grid select,
+    html[data-theme="dark"] .suggestion-note input {
+      background: #111827;
+      color: var(--ink);
+      border-color: var(--border);
+    }
+    html[data-theme="dark"] .install-panel p {
+      color: var(--muted);
+    }
+    html[data-theme="dark"] .quota-banner,
+    html[data-theme="dark"] .note {
+      background: var(--accent-soft);
+      border-color: #25666d;
+      color: var(--ink);
+    }
+    @media (max-width: 575.98px) {
+      .theme-toolbar {
+        justify-content: stretch;
+      }
+      .theme-switch,
+      .theme-switch button {
+        width: 100%;
+      }
+    }
+"""
+
+
+def render_panel_theme_switch() -> str:
+    return """<div class="theme-toolbar">
+      <div class="theme-switch" aria-label="Theme">
+        <button type="button" data-theme-choice-button="system" aria-pressed="true">System</button>
+        <button type="button" data-theme-choice-button="light" aria-pressed="false">Light</button>
+        <button type="button" data-theme-choice-button="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>"""
+
+
 def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination: str) -> str:
     limit = evaluation.get("limit") or {}
     rows = []
@@ -4005,10 +4179,11 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {render_panel_theme_script()}
   <title>Traffic limit reached</title>
   <style>
     :root {{
-      color-scheme: light;
+      color-scheme: light dark;
       --bg: #f5efe4;
       --panel: #fffdf8;
       --ink: #1f2937;
@@ -4084,10 +4259,12 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
       background: #fffbeb;
       border: 1px solid var(--border);
     }}
+{render_panel_theme_css()}
   </style>
 </head>
 <body>
   <main class="card">
+    {render_panel_theme_switch()}
     <h1>Traffic limit reached</h1>
     <p class="lead">This device has reached its allowed traffic budget on this proxy, so new requests are paused for now.</p>
     <div class="meta">
@@ -4135,10 +4312,11 @@ def render_ca_install_html(snapshot) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {render_panel_theme_script()}
   <title>Install proxy-router CA</title>
   <style>
     :root {{
-      color-scheme: light;
+      color-scheme: light dark;
       --bg: #f6f8fb;
       --panel: #ffffff;
       --ink: #172033;
@@ -4264,10 +4442,12 @@ def render_ca_install_html(snapshot) -> str:
       main {{ padding: 20px; }}
       .button {{ width: 100%; }}
     }}
+{render_panel_theme_css()}
   </style>
 </head>
 <body>
   <main>
+    {render_panel_theme_switch()}
     <h1>Install proxy-router CA</h1>
     <p>Install this certificate on your device only if you want proxy-router to inspect HTTPS requests for hosts you enable in the dashboard.</p>
     <div class="actions">
@@ -4370,10 +4550,11 @@ def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {render_panel_theme_script()}
   <title>{html.escape(title)}</title>
   <style>
     :root {{
-      color-scheme: light;
+      color-scheme: light dark;
       --bg: #f6f8fb;
       --panel: #ffffff;
       --ink: #172033;
@@ -4440,10 +4621,12 @@ def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
       main {{ padding: 20px; }}
       .button {{ width: 100%; }}
     }}
+{render_panel_theme_css()}
   </style>
 </head>
 <body>
   <main>
+    {render_panel_theme_switch()}
     <h1>{html.escape(title)}</h1>
     <p>{html.escape(message)}</p>
     <div class="meta">
@@ -5200,11 +5383,12 @@ def render_client_portal_html(snapshot) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {render_panel_theme_script()}
   <title>Your proxy usage</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     :root {{
-      color-scheme: light;
+      color-scheme: light dark;
       --bg: #f7f8fb;
       --panel: #ffffff;
       --ink: #172033;
@@ -5613,10 +5797,12 @@ def render_client_portal_html(snapshot) -> str:
         min-width: 560px;
       }}
     }}
+{render_panel_theme_css()}
   </style>
 </head>
 <body>
   <main class="portal-shell">
+    {render_panel_theme_switch()}
     <section class="hero">
       <div class="eyebrow">Proxy client portal</div>
       <h1>Your device usage</h1>
