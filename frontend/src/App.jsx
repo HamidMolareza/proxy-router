@@ -2345,6 +2345,146 @@ function buildRulesExportPayload(config) {
   }
 }
 
+function ruleDedupKey(rule) {
+  const normalized = normalizeRules([rule])[0]
+  if (!normalized || !normalizeRulePattern(normalized.pattern)) {
+    return ''
+  }
+  return JSON.stringify({
+    enabled: normalized.enabled !== false,
+    pattern: normalizeRulePattern(normalized.pattern),
+    match: normalized.match,
+    action: normalized.action,
+    note: normalized.note || '',
+    source: normalizeRuleSource(normalized),
+    duration: normalizeRuleDuration(normalized.duration, normalizeRuleSource(normalized)),
+    expires_at: normalized.expires_at || null,
+  })
+}
+
+function mergeImportedRules(targetRules, importedRules) {
+  const existingRules = Array.isArray(targetRules) ? targetRules : []
+  const existingKeys = new Set(existingRules.map((rule) => ruleDedupKey(rule)).filter(Boolean))
+  const mergedRules = [...existingRules]
+  let importedCount = 0
+  let skippedCount = 0
+
+  normalizeRules(importedRules).forEach((rule) => {
+    const key = ruleDedupKey(rule)
+    if (!key) {
+      skippedCount += 1
+      return
+    }
+    if (existingKeys.has(key)) {
+      skippedCount += 1
+      return
+    }
+    existingKeys.add(key)
+    mergedRules.push(rule)
+    importedCount += 1
+  })
+
+  return {
+    rules: mergedRules,
+    importedCount,
+    skippedCount,
+  }
+}
+
+function mergeImportedIgnoredHosts(targetHosts, importedHosts) {
+  const hosts = Array.isArray(targetHosts) ? [...targetHosts] : []
+  const seen = new Set(hosts.map((host) => summarizeDomain(host) || String(host || '').trim().toLowerCase()).filter(Boolean))
+  ;(Array.isArray(importedHosts) ? importedHosts : []).forEach((host) => {
+    const normalizedHost = summarizeDomain(host) || String(host || '').trim().toLowerCase()
+    if (!normalizedHost || seen.has(normalizedHost)) {
+      return
+    }
+    seen.add(normalizedHost)
+    hosts.push(normalizedHost)
+  })
+  return hosts
+}
+
+function hasProfileSignatureIdentity(signature) {
+  const normalized = normalizeProfileSignature(signature)
+  return Boolean(
+    normalized.internet_key ||
+      normalized.route_interface ||
+      normalized.route_gateway ||
+      normalized.vpn_keys.length,
+  )
+}
+
+function mergeRulesImportPayload(config, payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('rules import must be a JSON object')
+  }
+  const hasSharedRules = payload.shared && typeof payload.shared === 'object' && Array.isArray(payload.shared.rules)
+  const hasProfileRules = Array.isArray(payload.routing_profiles)
+  if (!hasSharedRules && !hasProfileRules) {
+    throw new Error('rules import must include shared.rules or routing_profiles')
+  }
+
+  const nextConfig = cloneJson(config)
+  const summary = {
+    importedRules: 0,
+    skippedRules: 0,
+    createdProfiles: 0,
+    mergedProfiles: 0,
+  }
+
+  if (payload.shared && typeof payload.shared === 'object') {
+    const sharedResult = mergeImportedRules(nextConfig.rules, payload.shared.rules)
+    nextConfig.rules = sharedResult.rules
+    nextConfig.ignored_failure_hosts = mergeImportedIgnoredHosts(
+      nextConfig.ignored_failure_hosts,
+      payload.shared.ignored_failure_hosts,
+    )
+    summary.importedRules += sharedResult.importedCount
+    summary.skippedRules += sharedResult.skippedCount
+  }
+
+  ;(Array.isArray(payload.routing_profiles) ? payload.routing_profiles : []).forEach((profilePayload, index) => {
+    if (!profilePayload || typeof profilePayload !== 'object') {
+      throw new Error(`routing profile #${index + 1} must be an object`)
+    }
+    const profileId = String(profilePayload.id || '').trim()
+    if (!profileId) {
+      throw new Error(`routing profile #${index + 1} is missing id`)
+    }
+    const existingProfile = getRoutingTargetById(nextConfig, profileId)
+    if (existingProfile) {
+      const profileResult = mergeImportedRules(existingProfile.rules, profilePayload.rules)
+      existingProfile.rules = profileResult.rules
+      existingProfile.ignored_failure_hosts = mergeImportedIgnoredHosts(
+        existingProfile.ignored_failure_hosts,
+        profilePayload.ignored_failure_hosts,
+      )
+      summary.importedRules += profileResult.importedCount
+      summary.skippedRules += profileResult.skippedCount
+      summary.mergedProfiles += 1
+      return
+    }
+
+    if (!hasProfileSignatureIdentity(profilePayload.signature)) {
+      throw new Error(`routing profile '${profileId}' is missing a network signature`)
+    }
+    const importedProfile = normalizeRoutingProfile(profilePayload, nextConfig.routing_profiles.length)
+    const profileResult = mergeImportedRules([], importedProfile.rules)
+    importedProfile.rules = profileResult.rules
+    importedProfile.ignored_failure_hosts = mergeImportedIgnoredHosts([], importedProfile.ignored_failure_hosts)
+    nextConfig.routing_profiles.push(importedProfile)
+    summary.importedRules += profileResult.importedCount
+    summary.skippedRules += profileResult.skippedCount
+    summary.createdProfiles += 1
+  })
+
+  return {
+    config: nextConfig,
+    summary,
+  }
+}
+
 function buildLiveSocketUrl(scope = '') {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const normalizedScope = String(scope || '').trim()
@@ -2599,6 +2739,7 @@ function App() {
   const refreshDashboardScopeRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
   const autoSelectedRulesTargetRef = useRef(false)
+  const rulesImportInputRef = useRef(null)
   const httpsHostPatternsFocusedRef = useRef(false)
   const httpsBypassPatternsFocusedRef = useRef(false)
   const adminApiHeaders = useCallback(() => {
@@ -4348,6 +4489,44 @@ function App() {
     })
   }
 
+  function importRulesFromFile(file) {
+    if (!file) {
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const payload = JSON.parse(String(reader.result || ''))
+        const { config, summary } = mergeRulesImportPayload(currentRouterConfig, payload)
+        setRulesSort({ key: 'order', direction: 'asc' })
+        setLocalRouterConfig(config, {
+          activateTab: 'routing',
+          resetRulesPage: true,
+          message: `Rules imported: ${summary.importedRules} added, ${summary.skippedRules} duplicate/invalid skipped, ${summary.createdProfiles} profile(s) created, ${summary.mergedProfiles} profile(s) merged.`,
+        })
+      } catch (error) {
+        setRouterStatusOverride({
+          text: `Rules import failed: ${error.message}`,
+          warning: true,
+        })
+      } finally {
+        if (rulesImportInputRef.current) {
+          rulesImportInputRef.current.value = ''
+        }
+      }
+    }
+    reader.onerror = () => {
+      setRouterStatusOverride({
+        text: 'Rules import failed: could not read the selected file.',
+        warning: true,
+      })
+      if (rulesImportInputRef.current) {
+        rulesImportInputRef.current.value = ''
+      }
+    }
+    reader.readAsText(file)
+  }
+
   function ignoreAutoRule(scope, index) {
     const nextConfig = cloneJson(currentRouterConfig)
     const targetScope = getRoutingTargetById(nextConfig, scope)
@@ -5963,6 +6142,20 @@ function App() {
                       </button>
                       <button className={warnButtonClass} id="clear-rules-button" type="button" onClick={clearCurrentScopeRules}>
                         Clear rules
+                      </button>
+                      <input
+                        ref={rulesImportInputRef}
+                        className="hidden"
+                        type="file"
+                        accept="application/json,.json"
+                        onChange={(event) => importRulesFromFile(event.target.files && event.target.files[0])}
+                      />
+                      <button
+                        id="import-rules-button"
+                        type="button"
+                        onClick={() => rulesImportInputRef.current && rulesImportInputRef.current.click()}
+                      >
+                        Import rules
                       </button>
                       <button id="export-rules-button" type="button" onClick={exportRulesConfig}>
                         Export rules
