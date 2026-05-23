@@ -765,12 +765,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self._set_client_identity(self._anonymous_client_identity())
             return True
 
-        if self._is_local_client():
-            self._set_client_identity(self._anonymous_client_identity())
-            return True
-
         header = str(self.headers.get("Proxy-Authorization") or "").strip()
         if not header:
+            if self._is_local_client():
+                self._set_client_identity(self._anonymous_client_identity())
+                return True
             inherited_identity = self._inherited_authenticated_http_identity()
             if inherited_identity is not None:
                 self._set_client_identity(inherited_identity)

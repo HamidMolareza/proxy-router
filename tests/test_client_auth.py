@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import tempfile
@@ -310,6 +311,34 @@ class ClientAuthTests(unittest.TestCase):
         self.assertTrue(handler._authenticate_http_client())
         self.assertEqual(handler._client_identity()["auth_type"], "anonymous")
         self.assertEqual(handler._client_id(), "127.0.0.1")
+
+    def test_loopback_http_client_uses_basic_auth_when_header_is_present(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        handler.client_address = ("127.0.0.1", 50000)
+        token = base64.b64encode(b"phone:secret").decode("ascii")
+        handler.headers = {"Proxy-Authorization": f"Basic {token}"}
+        handler.server = SimpleNamespace(
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {
+                    "enabled": True,
+                    "allow_anonymous": False,
+                    "realm": "lab",
+                    "credentials": [
+                        {
+                            "username": "phone",
+                            "password_hash": hash_client_auth_password("secret"),
+                            "label": "Phone",
+                            "enabled": True,
+                        }
+                    ],
+                }
+            ),
+            client_tracker=SimpleNamespace(reidentified=lambda *_args, **_kwargs: None),
+        )
+
+        self.assertTrue(handler._authenticate_http_client())
+        self.assertEqual(handler._client_identity()["auth_type"], "basic")
+        self.assertEqual(handler._client_id(), "user:phone")
 
     def test_remote_http_client_still_requires_auth_when_anonymous_disabled(self):
         handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
