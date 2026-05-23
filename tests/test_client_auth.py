@@ -15,6 +15,7 @@ from proxy_router.constants import (
 )
 from proxy_router.config import RouterConfigManager
 from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler, is_loopback_client_ip
+from proxy_router.traffic import TrafficQuotaManager
 from proxy_router.util import (
     authenticate_client_auth_credentials,
     client_ip_matches_limit_target,
@@ -213,6 +214,55 @@ class ClientAuthTests(unittest.TestCase):
             },
         )
 
+    def test_normalize_router_config_defaults_quota_groups_to_empty_list(self):
+        config = normalize_router_config({})
+
+        self.assertEqual(config["client_quota_groups"], [])
+
+    def test_normalize_router_config_accepts_quota_groups(self):
+        config = normalize_router_config(
+            {
+                "client_quota_groups": [
+                    {
+                        "id": "Ali Devices",
+                        "label": "Ali",
+                        "enabled": True,
+                        "members": ["user:ali-phone", "ali-laptop", "user:ali-phone"],
+                    }
+                ],
+                "client_traffic_limits": [
+                    {
+                        "client": "group:Ali Devices",
+                        "max_past_hour_mb": "500",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            config["client_quota_groups"],
+            [
+                {
+                    "id": "ali-devices",
+                    "label": "Ali",
+                    "enabled": True,
+                    "members": ["user:ali-phone", "user:ali-laptop"],
+                }
+            ],
+        )
+        self.assertEqual(config["client_traffic_limits"][0]["client"], "group:ali-devices")
+
+    def test_normalize_router_config_rejects_duplicate_enabled_group_members(self):
+        with self.assertRaises(ValueError):
+            normalize_router_config(
+                {
+                    "client_quota_groups": [
+                        {"id": "ali", "members": ["user:ali-phone"]},
+                        {"id": "ali-alt", "members": ["user:ali-phone"]},
+                    ]
+                }
+            )
+
     def test_authenticated_default_quota_overrides_general_default(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = RouterConfigManager(Path(temp_dir) / "router.json")
@@ -289,6 +339,120 @@ class ClientAuthTests(unittest.TestCase):
                 self.assertEqual(authenticated_limit["scope"], "custom")
                 self.assertEqual(authenticated_limit["target"], "user:mobile")
                 self.assertEqual(authenticated_limit["max_past_hour_mb"], 5)
+            finally:
+                manager.shutdown()
+
+    def test_group_quota_applies_to_members_and_aggregates_usage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            quota_manager = TrafficQuotaManager()
+            try:
+                manager.update(
+                    {
+                        "client_quota_groups": [
+                            {
+                                "id": "ali",
+                                "label": "Ali",
+                                "members": ["user:ali-phone", "user:ali-laptop"],
+                            }
+                        ],
+                        "client_traffic_limits": [
+                            {
+                                "client": "group:ali",
+                                "max_past_hour_mb": 1,
+                            }
+                        ],
+                    }
+                )
+                quota_manager.record_usage(client="user:ali-phone", total_bytes=600_000)
+                quota_manager.record_usage(client="user:ali-laptop", total_bytes=500_000)
+
+                phone_limit = manager.find_client_traffic_limit("user:ali-phone")
+                laptop_limit = manager.find_client_traffic_limit("user:ali-laptop")
+                evaluation = quota_manager.evaluate_client("user:ali-phone", manager)
+
+                self.assertEqual(phone_limit["scope"], "group")
+                self.assertEqual(laptop_limit["scope"], "group")
+                self.assertEqual(phone_limit["target"], "group:ali")
+                self.assertEqual(evaluation["usage"]["1h"]["total_bytes"], 1_100_000)
+                self.assertFalse(evaluation["allowed"])
+                self.assertEqual(evaluation["exceeded_windows"][0]["key"], "1h")
+            finally:
+                manager.shutdown()
+
+    def test_user_quota_overrides_group_quota(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_quota_groups": [
+                            {
+                                "id": "ali",
+                                "members": ["user:ali-phone", "user:ali-laptop"],
+                            }
+                        ],
+                        "client_traffic_limits": [
+                            {
+                                "client": "group:ali",
+                                "max_past_hour_mb": 1,
+                            },
+                            {
+                                "client": "user:ali-phone",
+                                "max_past_hour_mb": 5,
+                            },
+                        ],
+                    }
+                )
+
+                phone_limit = manager.find_client_traffic_limit("user:ali-phone")
+                laptop_limit = manager.find_client_traffic_limit("user:ali-laptop")
+
+                self.assertEqual(phone_limit["scope"], "custom")
+                self.assertEqual(phone_limit["target"], "user:ali-phone")
+                self.assertEqual(phone_limit["max_past_hour_mb"], 5)
+                self.assertEqual(laptop_limit["scope"], "group")
+                self.assertEqual(laptop_limit["target"], "group:ali")
+            finally:
+                manager.shutdown()
+
+    def test_user_exemption_overrides_user_and_group_quota(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "client_quota_groups": [
+                            {
+                                "id": "ali",
+                                "members": ["user:ali-phone", "user:ali-laptop"],
+                            }
+                        ],
+                        "client_traffic_limits": [
+                            {
+                                "client": "group:ali",
+                                "max_past_hour_mb": 1,
+                            },
+                            {
+                                "client": "user:ali-phone",
+                                "max_past_hour_mb": 5,
+                            },
+                        ],
+                        "client_traffic_exemptions": [
+                            {
+                                "client": "user:ali-phone",
+                                "duration": "always",
+                            }
+                        ],
+                    }
+                )
+
+                phone_limit = manager.find_client_traffic_limit("user:ali-phone")
+                laptop_limit = manager.find_client_traffic_limit("user:ali-laptop")
+
+                self.assertEqual(phone_limit["scope"], "exempt")
+                self.assertTrue(phone_limit["exempt"])
+                self.assertEqual(laptop_limit["scope"], "group")
             finally:
                 manager.shutdown()
 

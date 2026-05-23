@@ -1164,6 +1164,79 @@ class RouterConfigManager:
         self._notify_change("router-config")
         return saved
 
+    def _client_quota_group_for_client(self, client_id: str, configured_groups) -> dict | None:
+        normalized_client = str(client_id or "").strip()
+        if not normalized_client.startswith("user:"):
+            return None
+        for group in configured_groups:
+            if not group.get("enabled", True):
+                continue
+            members = [str(member or "").strip() for member in group.get("members") or []]
+            if normalized_client in members:
+                return dict(group)
+        return None
+
+    def _client_target_matches(
+        self,
+        client_id: str,
+        target: str,
+        configured_groups,
+    ) -> bool:
+        normalized_target = str(target or "").strip()
+        if normalized_target.startswith("group:"):
+            group_id = normalized_target.split(":", 1)[1]
+            group = next(
+                (
+                    item
+                    for item in configured_groups
+                    if item.get("enabled", True) and str(item.get("id") or "") == group_id
+                ),
+                None,
+            )
+            return bool(group and str(client_id or "").strip() in (group.get("members") or []))
+        return client_ip_matches_limit_target(client_id, normalized_target)
+
+    def find_client_quota_group_traffic_limit(self, group_id: str):
+        normalized_group_id = normalize_client_quota_group_id(group_id)
+        if not normalized_group_id:
+            return None
+        with self._lock:
+            self._prune_expired_rules_locked()
+            configured_groups = list(self._config.get("client_quota_groups", []))
+            configured_limits = list(self._config.get("client_traffic_limits", []))
+
+        group = next(
+            (
+                item
+                for item in configured_groups
+                if item.get("enabled", True) and str(item.get("id") or "") == normalized_group_id
+            ),
+            None,
+        )
+        if group is None:
+            return None
+
+        group_target = client_quota_group_identity(normalized_group_id)
+        matched_limit = next(
+            (
+                dict(limit)
+                for limit in configured_limits
+                if limit.get("enabled", True) and str(limit.get("client") or "") == group_target
+            ),
+            None,
+        )
+        if matched_limit is None:
+            return None
+
+        matched_limit["scope"] = "group"
+        matched_limit["target"] = group_target
+        matched_limit["group_id"] = group.get("id")
+        matched_limit["group_label"] = group.get("label")
+        matched_limit["group_members"] = list(group.get("members") or [])
+        matched_limit["max_past_hour_bytes"] = traffic_limit_mb_to_bytes(matched_limit.get("max_past_hour_mb"))
+        matched_limit["max_past_3h_bytes"] = traffic_limit_mb_to_bytes(matched_limit.get("max_past_3h_mb"))
+        return matched_limit
+
     def ignored_failure_hosts(self, profile_id: str | None = None):
         with self._lock:
             self._prune_expired_rules_locked()
@@ -1175,6 +1248,7 @@ class RouterConfigManager:
             self._prune_expired_rules_locked()
             configured_exemptions = list(self._config.get("client_traffic_exemptions", []))
             configured_limits = list(self._config.get("client_traffic_limits", []))
+            configured_groups = list(self._config.get("client_quota_groups", []))
             default_limit = dict(
                 self._config.get(
                     "default_client_traffic_limit",
@@ -1194,7 +1268,7 @@ class RouterConfigManager:
             if not exemption.get("enabled", True):
                 continue
             target = exemption.get("client")
-            if not target or not client_ip_matches_limit_target(client_ip, target):
+            if not target or not self._client_target_matches(client_ip, target, configured_groups):
                 continue
 
             specificity = client_limit_target_specificity(target)
@@ -1214,13 +1288,32 @@ class RouterConfigManager:
             if not limit.get("enabled", True):
                 continue
             target = limit.get("client")
-            if not target or not client_ip_matches_limit_target(client_ip, target):
+            if not target or str(target).startswith("group:"):
+                continue
+            if not client_ip_matches_limit_target(client_ip, target):
                 continue
 
             specificity = client_limit_target_specificity(target)
             if specificity > matched_specificity:
                 matched_limit = dict(limit)
                 matched_specificity = specificity
+
+        if matched_limit is None:
+            matched_group = self._client_quota_group_for_client(client_ip, configured_groups)
+            if matched_group is not None:
+                group_target = client_quota_group_identity(matched_group.get("id"))
+                for limit in configured_limits:
+                    if not limit.get("enabled", True):
+                        continue
+                    if str(limit.get("client") or "") != group_target:
+                        continue
+                    matched_limit = dict(limit)
+                    matched_limit["scope"] = "group"
+                    matched_limit["target"] = group_target
+                    matched_limit["group_id"] = matched_group.get("id")
+                    matched_limit["group_label"] = matched_group.get("label")
+                    matched_limit["group_members"] = list(matched_group.get("members") or [])
+                    break
 
         if matched_limit is None:
             if str(client_ip or "").startswith("user:") and default_authenticated_limit.get("enabled", False):
@@ -1233,7 +1326,7 @@ class RouterConfigManager:
                 matched_limit["target"] = "all devices"
             else:
                 return None
-        else:
+        elif matched_limit.get("scope") != "group":
             matched_limit["scope"] = "custom"
             matched_limit["target"] = matched_limit.get("client")
 

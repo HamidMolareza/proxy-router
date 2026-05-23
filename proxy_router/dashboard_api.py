@@ -46,6 +46,54 @@ def build_client_quota_status_map(client_rows, runtime, router_config):
     return runtime.traffic_quota_manager.snapshot_for_clients(clients, router_config)
 
 
+def build_client_quota_group_rows(snapshot, runtime, router_config_snapshot, router_config):
+    totals_by_client = {
+        str(item.get("client") or "").strip(): item
+        for item in snapshot.get("totals_by_client", [])
+        if str(item.get("client") or "").strip()
+    }
+    rows = []
+    for group in router_config_snapshot.get("client_quota_groups", []):
+        if not group.get("enabled", True):
+            continue
+        members = [str(member or "").strip() for member in group.get("members") or [] if str(member or "").strip()]
+        proxy_types = set()
+        last_seen_at = None
+        row = {
+            "id": str(group.get("id") or "").strip(),
+            "target": f"group:{str(group.get('id') or '').strip()}",
+            "label": str(group.get("label") or group.get("id") or "").strip(),
+            "enabled": True,
+            "members": members,
+            "active_connections": 0,
+            "count": 0,
+            "uploaded_bytes": 0,
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "proxy_types": [],
+            "last_seen_at": None,
+            "quota": runtime.traffic_quota_manager.evaluate_client_quota_group(group, router_config),
+        }
+        for member in members:
+            member_total = totals_by_client.get(member)
+            if member_total is None:
+                continue
+            row["active_connections"] += int(member_total.get("active_connections") or 0)
+            row["count"] += int(member_total.get("count") or 0)
+            row["uploaded_bytes"] += int(member_total.get("uploaded_bytes") or 0)
+            row["downloaded_bytes"] += int(member_total.get("downloaded_bytes") or 0)
+            row["total_bytes"] += int(member_total.get("total_bytes") or 0)
+            proxy_types.update(str(item) for item in (member_total.get("proxy_types") or []) if str(item))
+            member_last_seen = str(member_total.get("last_seen_at") or "").strip()
+            if member_last_seen and (last_seen_at is None or member_last_seen > last_seen_at):
+                last_seen_at = member_last_seen
+        row["proxy_types"] = sorted(proxy_types)
+        row["last_seen_at"] = last_seen_at
+        rows.append(row)
+    rows.sort(key=lambda item: (-int(item.get("total_bytes") or 0), str(item.get("id") or "")))
+    return rows
+
+
 def build_known_client_rows(snapshot, router_config_snapshot):
     rows_by_client = {}
     configured_user_ids = {
@@ -236,11 +284,18 @@ def build_dashboard_users_snapshot(server):
 def build_dashboard_quotas_snapshot(server):
     snapshot = server.runtime.dashboard_state.snapshot()
     totals_by_client = snapshot.get("totals_by_client", [])
+    full_router_config_snapshot = server.router_config.snapshot()
     return {
         "totals_by_client": totals_by_client,
         "client_quota_status": build_client_quota_status_map(
             totals_by_client,
             server.runtime,
+            server.router_config,
+        ),
+        "quota_group_rows": build_client_quota_group_rows(
+            snapshot,
+            server.runtime,
+            full_router_config_snapshot,
             server.router_config,
         ),
     }

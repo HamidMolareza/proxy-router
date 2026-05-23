@@ -726,6 +726,18 @@ def client_identity_from_username(username: str) -> str:
     return f"user:{normalized_username}" if normalized_username else ""
 
 
+def normalize_client_quota_group_id(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", normalized)
+    normalized = normalized.strip(".-")
+    return normalized[:80]
+
+
+def client_quota_group_identity(group_id: str | None) -> str:
+    normalized_group_id = normalize_client_quota_group_id(group_id)
+    return f"group:{normalized_group_id}" if normalized_group_id else ""
+
+
 def hash_client_auth_password(password: str) -> str:
     salt = secrets.token_bytes(CLIENT_AUTH_PBKDF2_SALT_BYTES)
     digest = hashlib.pbkdf2_hmac(
@@ -818,6 +830,9 @@ def normalize_client_limit_target(value: str) -> str:
     if not target:
         return ""
 
+    if target.lower().startswith("group:"):
+        return client_quota_group_identity(target.split(":", 1)[1])
+
     if target.lower().startswith("user:"):
         return client_identity_from_username(target)
 
@@ -835,6 +850,8 @@ def normalize_client_limit_target(value: str) -> str:
 def client_limit_target_specificity(target: str) -> int:
     if str(target).startswith("user:"):
         return 1000
+    if str(target).startswith("group:"):
+        return 900
     if "/" in target:
         return ipaddress.ip_network(target, strict=False).prefixlen
     return ipaddress.ip_address(target).max_prefixlen
@@ -842,6 +859,8 @@ def client_limit_target_specificity(target: str) -> int:
 
 def client_ip_matches_limit_target(client_ip: str, target: str) -> bool:
     if str(target).startswith("user:"):
+        return str(client_ip or "") == str(target)
+    if str(target).startswith("group:"):
         return str(client_ip or "") == str(target)
 
     try:
@@ -1243,6 +1262,7 @@ def default_router_config():
             "realm": DEFAULT_CLIENT_AUTH_REALM,
             "credentials": [],
         },
+        "client_quota_groups": [],
         "admin_api": {
             "enabled": False,
             "tokens": [],
@@ -1440,6 +1460,10 @@ def normalize_router_config(payload):
     if not isinstance(client_auth_payload, dict):
         raise ValueError("router client_auth must be an object")
 
+    client_quota_groups_payload = payload.get("client_quota_groups") or []
+    if not isinstance(client_quota_groups_payload, list):
+        raise ValueError("router client_quota_groups must be an array")
+
     admin_api_payload = payload.get("admin_api") or {}
     if admin_api_payload is None:
         admin_api_payload = {}
@@ -1611,6 +1635,54 @@ def normalize_router_config(payload):
                 "password_hash": password_hash,
                 "label": str(credential_payload.get("label", "")).strip(),
                 "enabled": bool(credential_payload.get("enabled", True)),
+            }
+        )
+
+    normalized_client_quota_groups = []
+    seen_quota_group_ids = set()
+    enabled_quota_group_members = {}
+    for index, group_payload in enumerate(client_quota_groups_payload, start=1):
+        if not isinstance(group_payload, dict):
+            raise ValueError(f"router client_quota_groups entry #{index} must be an object")
+        group_id = normalize_client_quota_group_id(group_payload.get("id"))
+        if not group_id:
+            continue
+        if group_id in seen_quota_group_ids:
+            raise ValueError(f"router client_quota_groups entry #{index} uses duplicate id '{group_id}'")
+        seen_quota_group_ids.add(group_id)
+
+        members_payload = group_payload.get("members") or []
+        if not isinstance(members_payload, list):
+            raise ValueError(f"router client_quota_groups entry #{index} members must be an array")
+        members = []
+        for member_index, member_payload in enumerate(members_payload, start=1):
+            member = normalize_client_limit_target(str(member_payload or ""))
+            if not member:
+                continue
+            if not member.startswith("user:"):
+                raise ValueError(
+                    f"router client_quota_groups entry #{index} member #{member_index} must be an authenticated user"
+                )
+            if member not in members:
+                members.append(member)
+
+        enabled = bool(group_payload.get("enabled", True))
+        if enabled:
+            for member in members:
+                existing_group_id = enabled_quota_group_members.get(member)
+                if existing_group_id is not None:
+                    raise ValueError(
+                        "router client_quota_groups cannot assign "
+                        f"'{member}' to multiple enabled groups ('{existing_group_id}' and '{group_id}')"
+                    )
+                enabled_quota_group_members[member] = group_id
+
+        normalized_client_quota_groups.append(
+            {
+                "id": group_id,
+                "label": str(group_payload.get("label") or group_id).strip() or group_id,
+                "enabled": enabled,
+                "members": members,
             }
         )
 
@@ -1814,6 +1886,7 @@ def normalize_router_config(payload):
             or DEFAULT_CLIENT_AUTH_REALM,
             "credentials": normalized_client_auth_credentials,
         },
+        "client_quota_groups": normalized_client_quota_groups,
         "admin_api": {
             "enabled": bool(admin_api_payload.get("enabled", default_config["admin_api"]["enabled"])),
             "tokens": normalized_admin_api_tokens,

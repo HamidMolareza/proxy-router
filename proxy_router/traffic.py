@@ -1518,11 +1518,24 @@ class TrafficQuotaManager:
                 self._prune_proxy_client_locked(proxy_id, client, now=event_time)
 
     def usage_for_client(self, client: str, now: datetime | None = None):
-        current_time = now or datetime.now().astimezone()
-        with self._lock:
-            self._prune_locked(client, now=current_time)
-            records = list(self._records_by_client.get(client, ()))
+        return self.usage_for_clients([client], now=now)
 
+    def usage_for_clients(self, clients, now: datetime | None = None):
+        current_time = now or datetime.now().astimezone()
+        normalized_clients = [
+            str(client or "").strip()
+            for client in clients
+            if str(client or "").strip()
+        ]
+        with self._lock:
+            records = []
+            for client in normalized_clients:
+                self._prune_locked(client, now=current_time)
+                records.extend(self._records_by_client.get(client, ()))
+
+        return self._client_usage_from_records(records, current_time)
+
+    def _client_usage_from_records(self, records, current_time: datetime):
         usage = {}
         for window_key, window_config in CLIENT_TRAFFIC_WINDOW_CONFIG.items():
             cutoff = current_time - window_config["window"]
@@ -1537,7 +1550,10 @@ class TrafficQuotaManager:
 
     def evaluate_client(self, client: str, router_config: RouterConfigManager):
         matched_limit = router_config.find_client_traffic_limit(client)
-        usage = self.usage_for_client(client)
+        usage_clients = [client]
+        if matched_limit and matched_limit.get("scope") == "group":
+            usage_clients = list(matched_limit.get("group_members") or []) or [client]
+        usage = self.usage_for_clients(usage_clients)
         evaluation = {
             "client": client,
             "limit": matched_limit,
@@ -1555,8 +1571,11 @@ class TrafficQuotaManager:
 
         retry_after_at = None
         with self._lock:
-            self._prune_locked(client, now=datetime.now().astimezone())
-            records = list(self._records_by_client.get(client, ()))
+            current_time = datetime.now().astimezone()
+            records = []
+            for usage_client in usage_clients:
+                self._prune_locked(usage_client, now=current_time)
+                records.extend(self._records_by_client.get(usage_client, ()))
 
         for window_key, window_config in CLIENT_TRAFFIC_WINDOW_CONFIG.items():
             limit_bytes = matched_limit.get(
@@ -1604,6 +1623,74 @@ class TrafficQuotaManager:
         for client in clients:
             snapshot[client] = self.evaluate_client(client, router_config)
         return snapshot
+
+    def evaluate_client_quota_group(self, group, router_config: RouterConfigManager):
+        group = group or {}
+        group_id = str(group.get("id") or "").strip()
+        members = [str(member or "").strip() for member in group.get("members") or [] if str(member or "").strip()]
+        matched_limit = router_config.find_client_quota_group_traffic_limit(group_id)
+        usage = self.usage_for_clients(members)
+        evaluation = {
+            "client": client_quota_group_identity(group_id),
+            "limit": matched_limit,
+            "usage": usage,
+            "allowed": True,
+            "exempt": False,
+            "exceeded_windows": [],
+            "retry_after_seconds": None,
+            "retry_after_at": None,
+        }
+        if matched_limit is None:
+            return evaluation
+
+        retry_after_at = None
+        with self._lock:
+            current_time = datetime.now().astimezone()
+            records = []
+            for member in members:
+                self._prune_locked(member, now=current_time)
+                records.extend(self._records_by_client.get(member, ()))
+
+        for window_key, window_config in CLIENT_TRAFFIC_WINDOW_CONFIG.items():
+            limit_bytes = matched_limit.get(
+                "max_past_hour_bytes" if window_key == "1h" else "max_past_3h_bytes"
+            )
+            if limit_bytes is None:
+                continue
+
+            total_bytes = usage[window_key]["total_bytes"]
+            if total_bytes < limit_bytes:
+                continue
+
+            blocked_until = self._estimate_unblock_at(
+                records=records,
+                now=datetime.now().astimezone(),
+                window=window_config["window"],
+                limit_bytes=limit_bytes,
+            )
+            evaluation["allowed"] = False
+            evaluation["exceeded_windows"].append(
+                {
+                    "key": window_key,
+                    "label": window_config["label"],
+                    "used_bytes": total_bytes,
+                    "limit_bytes": limit_bytes,
+                    "limit_mb": matched_limit.get(window_config["config_field"]),
+                    "retry_after_at": blocked_until.isoformat() if blocked_until is not None else None,
+                }
+            )
+            if blocked_until is not None and (retry_after_at is None or blocked_until > retry_after_at):
+                retry_after_at = blocked_until
+
+        if retry_after_at is not None:
+            retry_after_seconds = max(
+                1,
+                int((retry_after_at - datetime.now().astimezone()).total_seconds()),
+            )
+            evaluation["retry_after_seconds"] = retry_after_seconds
+            evaluation["retry_after_at"] = retry_after_at.isoformat()
+
+        return evaluation
 
     def usage_for_proxy(self, proxy_id: str, client: str | None = None, now: datetime | None = None):
         current_time = now or datetime.now().astimezone()

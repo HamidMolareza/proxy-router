@@ -4170,6 +4170,8 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
         limit_scope = "Default quota"
     elif limit.get("scope") == "default_authenticated":
         limit_scope = "Authenticated default quota"
+    elif limit.get("scope") == "group":
+        limit_scope = "Group quota"
     else:
         limit_scope = "Custom quota"
     portal_url = html.escape(f"http://{CLIENT_PORTAL_PRIMARY_HOST}/")
@@ -4680,6 +4682,8 @@ def render_client_portal_html(snapshot) -> str:
         limit_scope = "Default quota"
     elif limit.get("scope") == "default_authenticated":
         limit_scope = "Authenticated default quota"
+    elif limit.get("scope") == "group":
+        limit_scope = "Group quota"
     elif limit.get("scope") == "custom":
         limit_scope = "Custom quota"
     limit_scope = html.escape(limit_scope)
@@ -4914,6 +4918,7 @@ def render_client_portal_html(snapshot) -> str:
         if (quota && quota.exempt) return "Exempt device";
         if (limit.scope === "default") return "Default quota";
         if (limit.scope === "default_authenticated") return "Authenticated default quota";
+        if (limit.scope === "group") return "Group quota";
         if (limit.scope === "custom") return "Custom quota";
         return "No quota";
       }

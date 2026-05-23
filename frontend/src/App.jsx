@@ -256,6 +256,7 @@ function emptyDashboardSnapshot() {
     recent_failures: [],
     latest_request: null,
     totals_by_client: [],
+    quota_group_rows: [],
     known_clients: [],
     client_block_status: {},
     client_quota_status: {},
@@ -884,6 +885,34 @@ function normalizeClientAuthCredential(credential) {
   }
 }
 
+function normalizeClientQuotaGroupId(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+    .slice(0, 80)
+}
+
+function clientQuotaGroupTarget(groupId) {
+  const normalizedGroupId = normalizeClientQuotaGroupId(groupId)
+  return normalizedGroupId ? `group:${normalizedGroupId}` : ''
+}
+
+function normalizeClientQuotaGroup(group) {
+  const source = group && typeof group === 'object' ? group : {}
+  const id = normalizeClientQuotaGroupId(source.id)
+  const members = Array.isArray(source.members) ? source.members : []
+  return {
+    id,
+    label: String(source.label || id).trim() || id,
+    enabled: source.enabled !== false,
+    members: members
+      .map((member) => String(member || '').trim())
+      .filter((member, index, items) => member.startsWith('user:') && items.indexOf(member) === index),
+  }
+}
+
 function normalizeProxyTrafficLimit(limit) {
   const source = limit && typeof limit === 'object' ? limit : {}
   return {
@@ -1003,6 +1032,9 @@ function normalizeRouterConfig(config, options = {}) {
         (credential) => normalizeClientAuthCredential(credential),
       ),
     },
+    client_quota_groups: (Array.isArray(source.client_quota_groups) ? source.client_quota_groups : []).map((group) =>
+      normalizeClientQuotaGroup(group),
+    ),
     client_traffic_exemptions: (Array.isArray(source.client_traffic_exemptions)
       ? source.client_traffic_exemptions
       : []
@@ -1114,6 +1146,14 @@ function isPersistableClientAuthCredential(credential) {
   )
 }
 
+function isPersistableClientQuotaGroup(group) {
+  return Boolean(
+    normalizeClientQuotaGroupId(group && group.id) &&
+      Array.isArray(group && group.members) &&
+      group.members.some((member) => String(member || '').trim().startsWith('user:')),
+  )
+}
+
 function isPersistableClientTrafficExemption(exemption) {
   return Boolean(String((exemption && exemption.client) || '').trim()) && !isExemptionExpired(exemption)
 }
@@ -1138,6 +1178,7 @@ function buildPersistableRouterConfig(config) {
       credentials,
     },
     client_blocks: normalized.client_blocks.filter((block) => isPersistableClientBlock(block)),
+    client_quota_groups: normalized.client_quota_groups.filter((group) => isPersistableClientQuotaGroup(group)),
     client_traffic_limits: normalized.client_traffic_limits.filter((limit) => isPersistableClientTrafficLimit(limit)),
     proxies: normalized.proxies.filter((proxy) => isPersistableUpstreamProxy(proxy)),
     client_traffic_exemptions: normalized.client_traffic_exemptions.filter((exemption) =>
@@ -1184,6 +1225,7 @@ function countRouterDraftItems(config) {
   count += normalized.client_auth.credentials.filter(
     (credential) => !isPersistableClientAuthCredential(credential),
   ).length
+  count += normalized.client_quota_groups.filter((group) => !isPersistableClientQuotaGroup(group)).length
   count += normalized.client_blocks.filter((block) => !isPersistableClientBlock(block)).length
   count += normalized.client_traffic_limits.filter((limit) => !isPersistableClientTrafficLimit(limit)).length
   count += normalized.client_traffic_exemptions.filter((exemption) => !isPersistableClientTrafficExemption(exemption)).length
@@ -2889,8 +2931,12 @@ function App() {
         const limitScope =
           limit.scope === 'default'
             ? 'Default'
+            : limit.scope === 'default_authenticated'
+              ? 'Authenticated default'
             : limit.scope === 'custom'
               ? 'Custom'
+              : limit.scope === 'group'
+                ? 'Group'
               : limit.scope === 'exempt'
                 ? 'Exempt'
                 : ''
@@ -2917,6 +2963,34 @@ function App() {
         }
       }),
     [dashboardSnapshot.client_quota_status, dashboardSnapshot.totals_by_client, nowMs],
+  )
+  const quotaGroupRows = useMemo(
+    () =>
+      (dashboardSnapshot.quota_group_rows || []).map((group) => {
+        const quota = group.quota || {}
+        const usage = quota.usage || {}
+        const limit = quota.limit || {}
+        const used1h = Number((usage['1h'] || {}).total_bytes || 0)
+        const used3h = Number((usage['3h'] || {}).total_bytes || 0)
+        const activeConnections = Number(group.active_connections || 0)
+        const totalBytes = Number(group.total_bytes || 0)
+        const statusText = quota.limit
+          ? quota.allowed === false
+            ? `Blocked (Group) for ${formatDuration(quota.retry_after_seconds)}`
+            : 'Within Group limit'
+          : 'No group limit'
+        return {
+          activeConnections,
+          group,
+          limit,
+          quota,
+          statusText,
+          totalBytes,
+          used1h,
+          used3h,
+        }
+      }),
+    [dashboardSnapshot.quota_group_rows],
   )
   const sortedQuotaDeviceRows = useMemo(
     () =>
@@ -4034,6 +4108,54 @@ function App() {
       return
     }
     nextConfig.client_auth.credentials[index][field] = value
+    setLocalRouterConfig(nextConfig)
+  }
+
+  function addClientQuotaGroup(group = null) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    const nextIndex = nextConfig.client_quota_groups.length + 1
+    nextConfig.client_quota_groups.push(
+      normalizeClientQuotaGroup(
+        group || {
+          id: `group-${nextIndex}`,
+          label: `Group ${nextIndex}`,
+          enabled: true,
+          members: [],
+        },
+      ),
+    )
+    setLocalRouterConfig(nextConfig, {
+      activateTab: 'quotas',
+      message: 'Quota group draft added. It syncs automatically after you select at least one member.',
+    })
+  }
+
+  function updateClientQuotaGroupField(index, field, value) {
+    const nextConfig = cloneJson(currentRouterConfig)
+    if (!nextConfig.client_quota_groups[index]) {
+      return
+    }
+    nextConfig.client_quota_groups[index][field] = value
+    if (field === 'id') {
+      nextConfig.client_quota_groups[index].id = normalizeClientQuotaGroupId(value)
+    }
+    setLocalRouterConfig(nextConfig)
+  }
+
+  function updateClientQuotaGroupMember(index, member, checked) {
+    const normalizedMember = String(member || '').trim()
+    if (!normalizedMember.startsWith('user:')) {
+      return
+    }
+    const nextConfig = cloneJson(currentRouterConfig)
+    const group = nextConfig.client_quota_groups[index]
+    if (!group) {
+      return
+    }
+    const members = Array.isArray(group.members) ? group.members : []
+    group.members = checked
+      ? [...members, normalizedMember].filter((item, itemIndex, items) => items.indexOf(item) === itemIndex)
+      : members.filter((item) => item !== normalizedMember)
     setLocalRouterConfig(nextConfig)
   }
 
@@ -6919,6 +7041,135 @@ function App() {
 
               <div className={cx(panelHeaderClass, 'mt-5')}>
                 <div>
+                  <h3>Quota groups</h3>
+                  <div className={noteClass}>
+                    Group authenticated device identities into one shared client quota target.
+                  </div>
+                </div>
+                <button id="add-client-quota-group-button" type="button" onClick={() => addClientQuotaGroup()}>
+                  Add group
+                </button>
+              </div>
+              <div className={tableWrapClass}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Enabled</th>
+                      <th>Group ID</th>
+                      <th>Label</th>
+                      <th>Members</th>
+                      <th>Target</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentRouterConfig.client_quota_groups.length ? (
+                      currentRouterConfig.client_quota_groups.map((group, index) => {
+                        const groupTarget = clientQuotaGroupTarget(group.id)
+                        return (
+                          <tr key={`client-quota-group-${index}`}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={group.enabled}
+                                onChange={(event) =>
+                                  updateClientQuotaGroupField(index, 'enabled', event.target.checked)
+                                }
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={group.id}
+                                placeholder="ali"
+                                onChange={(event) => updateClientQuotaGroupField(index, 'id', event.target.value)}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={group.label}
+                                placeholder="Ali"
+                                onChange={(event) => updateClientQuotaGroupField(index, 'label', event.target.value)}
+                              />
+                            </td>
+                            <td>
+                              <div className="flex max-w-[28rem] flex-wrap gap-2">
+                                {currentRouterConfig.client_auth.credentials.length ? (
+                                  currentRouterConfig.client_auth.credentials.map((credential) => {
+                                    const member = credential.username ? `user:${credential.username}` : ''
+                                    if (!member) {
+                                      return null
+                                    }
+                                    return (
+                                      <label
+                                        className="inline-flex items-center gap-1 rounded-[8px] border border-[#d8d1c2] px-2 py-1 text-xs font-semibold"
+                                        key={`${group.id}-${member}`}
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={(group.members || []).includes(member)}
+                                          onChange={(event) =>
+                                            updateClientQuotaGroupMember(index, member, event.target.checked)
+                                          }
+                                        />
+                                        <span>{credential.label || member}</span>
+                                      </label>
+                                    )
+                                  })
+                                ) : (
+                                  <span className="text-[#6a6f73]">Add auth credentials first.</span>
+                                )}
+                              </div>
+                            </td>
+                            <td>
+                              <code>{groupTarget || 'group:<id>'}</code>
+                            </td>
+                            <td className={ruleActionsClass}>
+                              <button
+                                type="button"
+                                disabled={!groupTarget}
+                                onClick={() =>
+                                  addClientTrafficLimit({
+                                    enabled: true,
+                                    client: groupTarget,
+                                    max_past_hour_mb: null,
+                                    max_past_3h_mb: null,
+                                    note: group.label ? `${group.label} shared quota` : 'Shared quota',
+                                  })
+                                }
+                              >
+                                Add limit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const nextConfig = cloneJson(currentRouterConfig)
+                                  nextConfig.client_quota_groups.splice(index, 1)
+                                  setLocalRouterConfig(nextConfig, {
+                                    message: 'Quota group removed. Syncing automatically.',
+                                  })
+                                }}
+                              >
+                                Delete
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })
+                    ) : (
+                      <tr>
+                        <td colSpan="6" className="pt-2 text-[#6a6f73]">
+                          No quota groups yet.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className={cx(panelHeaderClass, 'mt-5')}>
+                <div>
                   <h3>Admin API tokens</h3>
                   <div className={noteClass}>
                     Bearer tokens protect admin writes from MCP clients and other local API callers.
@@ -7150,7 +7401,7 @@ function App() {
               </div>
 
               <div className={noteClass}>
-                Custom client identity, IP, or CIDR limits override defaults. Exemptions override all limits.
+                Custom client identity, group, IP, or CIDR limits override defaults. Exemptions override all limits.
               </div>
 
               <div className={cx(panelHeaderClass, 'mt-4')}>
@@ -7160,7 +7411,7 @@ function App() {
                 </button>
               </div>
               <div className={noteClass}>
-                Match one authenticated client identity, client IP, or CIDR and cap its traffic over the last hour and last 3 hours.
+                Match one authenticated client identity, quota group, client IP, or CIDR and cap its traffic over the last hour and last 3 hours.
               </div>
 
               <div className={tableWrapClass}>
@@ -7168,7 +7419,7 @@ function App() {
                   <thead>
                     <tr>
                       <th>Enabled</th>
-                      <th>Client identity / IP / CIDR</th>
+                      <th>Client identity / group / IP / CIDR</th>
                       <th>Last hour (MB)</th>
                       <th>Last 3h (MB)</th>
                       <th>Note</th>
@@ -7192,7 +7443,7 @@ function App() {
                             <input
                               type="text"
                               value={limit.client}
-                              placeholder="user:phone, 192.168.1.50, or 192.168.1.0/24"
+                              placeholder="user:phone, group:ali, 192.168.1.50, or 192.168.1.0/24"
                               onChange={(event) => updateClientTrafficLimitField(index, 'client', event.target.value)}
                             />
                           </td>
@@ -7358,6 +7609,61 @@ function App() {
                   </tbody>
                 </table>
               </div>
+            </section>
+
+            <section className={cx(panelClass, 'col-span-full')}>
+              <h2>By quota group</h2>
+              {quotaGroupRows.length ? (
+                <div className={tableWrapClass}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Group</th>
+                        <th>Members</th>
+                        <th>Active</th>
+                        <th>Handled</th>
+                        <th>Proxy types</th>
+                        <th>Last 1h</th>
+                        <th>Limit 1h</th>
+                        <th>Last 3h</th>
+                        <th>Limit 3h</th>
+                        <th>Status</th>
+                        <th>Total</th>
+                        <th>Last seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {quotaGroupRows.map((row) => {
+                        const { activeConnections, group, limit, statusText, used1h, used3h } = row
+                        const activeGroup = activeConnections > 0
+                        return (
+                          <tr className={cx(activeGroup && 'bg-[#eef8f3] text-[#115e59]')} key={group.id}>
+                            <td>
+                              <div className={ruleMetaClass}>
+                                <strong>{group.label || group.id}</strong>
+                                <small>{group.target}</small>
+                              </div>
+                            </td>
+                            <td>{(group.members || []).join(', ') || 'none'}</td>
+                            <td>{activeConnections}</td>
+                            <td>{group.count}</td>
+                            <td>{(group.proxy_types || []).join(', ') || 'none yet'}</td>
+                            <td>{formatMb(used1h)}</td>
+                            <td>{formatLimitMb(limit.max_past_hour_mb)}</td>
+                            <td>{formatMb(used3h)}</td>
+                            <td>{formatLimitMb(limit.max_past_3h_mb)}</td>
+                            <td>{statusText}</td>
+                            <td>{formatMb(group.total_bytes)}</td>
+                            <td>{group.last_seen_at || 'waiting for first request'}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="pt-2 text-[#6a6f73]">No quota groups are configured yet.</div>
+              )}
             </section>
 
             <section className={cx(panelClass, 'col-span-full')}>

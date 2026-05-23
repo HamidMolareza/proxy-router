@@ -170,7 +170,7 @@ The dashboard includes eight main areas:
 - `Routing`: rules, routing profiles, and auto-proxy controls
 - `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
 - `Users`: configured proxy-auth users plus observed client identities/IPs, with silent block/unblock controls
-- `Quotas`: optional proxy authentication, default client quota, per-client quota rules, exemptions
+- `Quotas`: optional proxy authentication, default client quota, quota groups, per-client quota rules, exemptions
 - `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
 Client self-service portal:
@@ -252,9 +252,10 @@ Diagnosis tips:
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
 - The `Users` tab merges configured auth users with client identities/IPs seen in recorded traffic or failures, so you can block the exact client from the same list.
 - The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
-- Client limit and exemption targets can be `user:<username>`, a single IP address, or a CIDR range.
+- Client limit and exemption targets can be `user:<username>`, `group:<id>`, a single IP address, or a CIDR range.
+- Quota groups live in `client_quota_groups` and let multiple authenticated device identities share one client quota bucket. For example, group `ali` can include `user:ali-phone` and `user:ali-laptop`, then a client limit for `group:ali` applies to their combined traffic.
 - The general default quota applies to anonymous clients and to authenticated clients unless a separate authenticated default quota is enabled.
-- Specific client limits override both default quotas.
+- Specific user/IP/CIDR client limits override group limits and both default quotas.
 - Exemptions override both custom and default limits.
 - Exemptions support permanent and timed entries such as `2h`.
 

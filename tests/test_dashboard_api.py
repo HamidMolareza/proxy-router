@@ -22,6 +22,19 @@ class DashboardApiScopeTests(unittest.TestCase):
                         }
                     ]
                 },
+                "client_quota_groups": [
+                    {
+                        "id": "family",
+                        "label": "Family",
+                        "members": ["user:phone"],
+                    }
+                ],
+                "client_traffic_limits": [
+                    {
+                        "client": "group:family",
+                        "max_past_hour_mb": 10,
+                    }
+                ],
                 "client_blocks": [
                     {
                         "client": "phone",
@@ -75,6 +88,13 @@ class DashboardApiScopeTests(unittest.TestCase):
             snapshot_for_clients=lambda clients, _router_config: {
                 client: {"client": client, "allowed": True, "usage": {}, "limit": None}
                 for client in clients
+            },
+            evaluate_client_quota_group=lambda group, _router_config: {
+                "client": f"group:{group['id']}",
+                "allowed": True,
+                "usage": {},
+                "limit": {"scope": "group", "target": f"group:{group['id']}"},
+                "exceeded_windows": [],
             },
             proxy_snapshot=lambda proxies, clients: {
                 proxy["id"]: {
@@ -131,6 +151,8 @@ class DashboardApiScopeTests(unittest.TestCase):
                 self.assertEqual(users["known_clients"][0]["client"], "user:phone")
                 self.assertIn("user:phone", users["client_block_status"])
                 self.assertIn("user:phone", quotas["client_quota_status"])
+                self.assertEqual(quotas["quota_group_rows"][0]["target"], "group:family")
+                self.assertEqual(quotas["quota_group_rows"][0]["total_bytes"], 100)
                 self.assertIn("main", proxies["proxy_quota_status"])
                 self.assertTrue(routing["rule_suggestions"][0]["include_current_conflicts"])
                 self.assertIn("https_interception_status", https_status["router_runtime"])
