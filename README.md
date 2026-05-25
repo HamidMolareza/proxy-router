@@ -38,6 +38,12 @@ More detail: [docs/architecture.md](docs/architecture.md)
 docker compose up -d --build
 ```
 
+Dashboard dependency downloads use the Liara npm mirror by default. Override the registry if another network path is faster or more reliable:
+
+```bash
+NPM_REGISTRY=https://registry.npmjs.org/ docker compose build proxy-router-dashboard
+```
+
 Open:
 
 - Dashboard: `http://127.0.0.1:8798`
