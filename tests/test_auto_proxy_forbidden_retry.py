@@ -1,7 +1,9 @@
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from proxy_router.config import RouterConfigManager
 from proxy_router.constants import AUTO_PROXY_PROBE_ROUTE_LABEL_PREFIX
@@ -50,6 +52,29 @@ class AutoProxyForbiddenRetryTests(unittest.TestCase):
                 manager.shutdown()
                 router_config.shutdown()
 
+    def test_https_403_probe_is_skipped_when_host_resolves_to_fake_dns(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            router_config, manager = self._build_manager(temp_dir)
+            try:
+                route_decision = router_config.decide("blocked.example.com")
+
+                with patch(
+                    "proxy_router.traffic.socket.getaddrinfo",
+                    return_value=[
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 0)),
+                    ],
+                ):
+                    probe_route = manager.status_probe_route(
+                        "blocked.example.com",
+                        route_decision,
+                        status_code=403,
+                    )
+
+                self.assertIsNone(probe_route)
+            finally:
+                manager.shutdown()
+                router_config.shutdown()
+
     def test_successful_403_probe_adds_auto_proxy_rule(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             router_config, manager = self._build_manager(temp_dir)
@@ -74,6 +99,35 @@ class AutoProxyForbiddenRetryTests(unittest.TestCase):
                         for rule in rules
                     )
                 )
+            finally:
+                manager.shutdown()
+                router_config.shutdown()
+
+    def test_fake_dns_probe_success_does_not_add_auto_proxy_rule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            router_config, manager = self._build_manager(temp_dir)
+            try:
+                route_decision = router_config.decide("blocked.example.com")
+                probe_route = manager.status_probe_route(
+                    "blocked.example.com",
+                    route_decision,
+                    status_code=403,
+                )
+
+                with patch(
+                    "proxy_router.traffic.socket.getaddrinfo",
+                    return_value=[
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 0)),
+                    ],
+                ):
+                    manager.record_success(
+                        "blocked.example.com",
+                        route_label=probe_route["route_label"],
+                        profile_id=probe_route["profile_id"],
+                    )
+
+                rules = router_config.snapshot()["rules"]
+                self.assertFalse(any(is_auto_proxy_rule(rule, "example.com") for rule in rules))
             finally:
                 manager.shutdown()
                 router_config.shutdown()

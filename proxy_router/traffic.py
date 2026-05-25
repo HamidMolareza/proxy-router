@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import socket
 import ssl
@@ -12,6 +13,34 @@ from .config import RouterConfigManager
 from .constants import *
 from .output import debug_exception, debug_log, log_event
 from .util import *
+
+FAKE_DNS_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in ("198.18.0.0/15",))
+
+
+def host_resolves_to_fake_dns(host: str | None) -> bool:
+    normalized_host = normalize_host(host or "")
+    if not normalized_host or is_ip_address_text(normalized_host):
+        return False
+    try:
+        infos = socket.getaddrinfo(
+            normalized_host,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False
+
+    for info in infos:
+        address = str(info[4][0])
+        try:
+            resolved_ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        if any(resolved_ip in network for network in FAKE_DNS_NETWORKS):
+            return True
+    return False
+
 
 class AutoProxyFailureManager:
     def __init__(self, router_config: RouterConfigManager):
@@ -120,6 +149,23 @@ class AutoProxyFailureManager:
         normalized_route_label = str(route_label or "direct")
         now = datetime.now().astimezone()
         resolved_profile_id = str(profile_id or DEFAULT_ROUTING_PROFILE_ID)
+        if is_auto_proxy_probe_route_label(normalized_route_label) and host_resolves_to_fake_dns(host):
+            with self._lock:
+                profile_domains = self._profile_domains_locked(resolved_profile_id)
+                state = profile_domains.get(pattern)
+                if state is not None:
+                    state["probe_pending"] = False
+                    state["probe_in_flight"] = False
+                    state["manual_review"] = False
+                    state["review_failure"] = None
+                    self._save_state_locked()
+            debug_log(
+                "system",
+                f"auto-proxy activation skipped for {pattern}: host resolves to route-aware fake DNS",
+                level="INFO",
+            )
+            self._wake_event.set()
+            return
         with self._lock:
             profile_domains = self._profile_domains_locked(resolved_profile_id, create=bool(is_auto_proxy_probe_route_label(normalized_route_label)))
             state = profile_domains.get(pattern)
@@ -196,6 +242,8 @@ class AutoProxyFailureManager:
         upstream = route_decision.get("upstream")
         if upstream is None:
             return None
+        if host_resolves_to_fake_dns(host):
+            return None
 
         profile_id = str(route_decision.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID)
         evaluation = self.router_config.auto_proxy_evaluation(host, profile_id=profile_id)
@@ -229,6 +277,8 @@ class AutoProxyFailureManager:
             return None
         upstream = route_decision.get("upstream")
         if upstream is None:
+            return None
+        if host_resolves_to_fake_dns(host):
             return None
 
         profile_id = str(route_decision.get("profile_id") or DEFAULT_ROUTING_PROFILE_ID)
@@ -891,6 +941,8 @@ class HttpsDiscoveryManager:
         if not normalized_host or not pattern or is_ip_address_text(pattern):
             return None
         if route_decision.get("action") != "direct" or route_decision.get("matched_rule") is not None:
+            return None
+        if host_resolves_to_fake_dns(normalized_host):
             return None
         if route_decision.get("auto_proxy_probe"):
             return None

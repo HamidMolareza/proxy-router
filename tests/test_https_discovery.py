@@ -1,7 +1,9 @@
 import json
+import socket
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from proxy_router.config import RouterConfigManager
 from proxy_router.constants import DEFAULT_ROUTING_PROFILE_ID
@@ -43,6 +45,31 @@ class HttpsDiscoveryTests(unittest.TestCase):
                 rules = router_config.snapshot()["rules"]
                 self.assertTrue(any(is_auto_proxy_rule(rule, "example.com") for rule in rules))
                 self.assertEqual(discovery.snapshot()["proxy_recommended"], 1)
+            finally:
+                discovery.shutdown()
+                auto_proxy.shutdown()
+                router_config.shutdown()
+
+    def test_fake_dns_host_does_not_start_auto_proxy_discovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            router_config, auto_proxy, discovery = self._build_managers(temp_dir)
+            try:
+                discovery._probe_tls_direct = lambda *_args: {"ok": False, "error": "direct blocked"}
+                discovery._probe_tls_via_upstream = lambda *_args: {"ok": True, "error": ""}
+                route = router_config.decide("api.blocked.example.com")
+
+                with patch(
+                    "proxy_router.traffic.socket.getaddrinfo",
+                    return_value=[
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 0)),
+                    ],
+                ):
+                    result = discovery.probe_now("api.blocked.example.com", 443, route)
+
+                self.assertIsNone(result)
+                rules = router_config.snapshot()["rules"]
+                self.assertFalse(any(is_auto_proxy_rule(rule, "example.com") for rule in rules))
+                self.assertEqual(discovery.snapshot()["total_domains"], 0)
             finally:
                 discovery.shutdown()
                 auto_proxy.shutdown()
