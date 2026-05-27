@@ -147,10 +147,11 @@ scripts/deploy-proxy-router-offline arvan
 ```
 
 The script builds the dashboard locally, downloads Python wheels into a staged
-wheelhouse, uploads the staged source to the VPS, replaces only
-`/opt/arvan-vps-gateway/src/proxy-router`, and recreates the
-`proxy-router` and `proxy-router-dashboard` Compose services. Runtime state under
-`/opt/arvan-vps-gateway/data/proxy-router` is preserved.
+wheelhouse, uploads both the backend source/package and the frontend `dist`
+bundle to the VPS, replaces only `/opt/arvan-vps-gateway/src/proxy-router`, and
+recreates the `proxy-router` backend service plus the `proxy-router-dashboard`
+frontend service. Runtime state under `/opt/arvan-vps-gateway/data/proxy-router`
+is preserved.
 
 Defaults can be overridden with environment variables:
 

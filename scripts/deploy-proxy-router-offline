@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SSH_HOST="${1:-arvan}"
+APP_ROOT="${APP_ROOT:-/opt/arvan-vps-gateway}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAGE_DIR="${STAGE_DIR:-$ROOT_DIR/.cache/proxy-router-offline}"
+REMOTE_STAGE="${REMOTE_STAGE:-/tmp/proxy-router-offline}"
+NPM_REGISTRY="${NPM_REGISTRY:-https://package-mirror.liara.ir/repository/npm/}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://package-mirror.liara.ir/repository/pypi/simple}"
+PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:-https://pypi.org/simple}"
+
+SSH_OPTS=(-o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+
+log() {
+  printf '[%(%H:%M:%S)T] %s\n' -1 "$*"
+}
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+quote() {
+  printf '%q' "$1"
+}
+
+dir_size() {
+  du -sh "$1" | awk '{print $1}'
+}
+
+remote() {
+  ssh "${SSH_OPTS[@]}" "$SSH_HOST" "$@"
+}
+
+patch_staged_dockerfile() {
+  local dockerfile="$1"
+  python3 - "$dockerfile" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+pattern = re.compile(
+    r"COPY requirements\.txt /app/requirements\.txt\n\n"
+    r"RUN pip install --no-cache-dir \\\n"
+    r"(?:    [^\\\n]+ \\\n)*"
+    r"    -r /app/requirements\.txt",
+)
+replacement = (
+    "COPY requirements.txt /app/requirements.txt\n"
+    "COPY wheelhouse /app/wheelhouse\n\n"
+    "RUN pip install --no-cache-dir --no-index --find-links /app/wheelhouse "
+    "-r /app/requirements.txt"
+)
+text, count = pattern.subn(replacement, text, count=1)
+if count != 1:
+    raise SystemExit(f"Could not patch pip install block in {path}")
+path.write_text(text)
+PY
+}
+
+wait_for_url() {
+  local url="$1"
+  remote "set -eu
+for attempt in \$(seq 1 45); do
+  if curl -fsS $(quote "$url") >/dev/null; then
+    exit 0
+  fi
+  sleep 2
+done
+echo 'Timed out waiting for $(quote "$url")' >&2
+exit 1"
+}
+
+require_command python3
+require_command npm
+require_command rsync
+require_command ssh
+
+[[ -f "$ROOT_DIR/proxy-router" ]] || die "proxy-router executable not found under $ROOT_DIR"
+[[ -f "$ROOT_DIR/compose.yaml" ]] || die "compose.yaml not found under $ROOT_DIR"
+[[ -f "$ROOT_DIR/frontend/package.json" ]] || die "frontend package.json not found under $ROOT_DIR"
+
+log "Validating local proxy-router Python entrypoint"
+python3 -m py_compile "$ROOT_DIR/proxy-router" "$ROOT_DIR"/proxy_router/*.py
+python3 "$ROOT_DIR/proxy-router" --help >/dev/null
+
+if command -v docker >/dev/null 2>&1; then
+  log "Validating local Compose file"
+  docker compose -f "$ROOT_DIR/compose.yaml" config >/dev/null
+else
+  log "Skipping local docker compose config validation; docker is not installed locally"
+fi
+
+log "Building dashboard frontend"
+npm --prefix "$ROOT_DIR/frontend" ci --registry "$NPM_REGISTRY"
+npm --prefix "$ROOT_DIR/frontend" run build
+[[ -f "$ROOT_DIR/frontend/dist/index.html" ]] || die "Frontend build did not produce frontend/dist/index.html"
+[[ -d "$ROOT_DIR/frontend/dist/assets" ]] || die "Frontend build did not produce frontend/dist/assets"
+
+log "Preparing offline stage at $STAGE_DIR"
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR/src"
+rsync -a --delete \
+  --exclude '/.git/' \
+  --exclude '/.cache/' \
+  --exclude '/__pycache__/' \
+  --exclude '/.pytest_cache/' \
+  --exclude '/data/' \
+  --exclude '/frontend/node_modules/' \
+  --exclude '/frontend/dist/' \
+  --exclude '/proxy-router-admin-*.png' \
+  --exclude '*.pyc' \
+  --exclude '*.log' \
+  --exclude '.env' \
+  "$ROOT_DIR/" \
+  "$STAGE_DIR/src/"
+mkdir -p "$STAGE_DIR/src/frontend/dist"
+rsync -a --delete "$ROOT_DIR/frontend/dist/" "$STAGE_DIR/src/frontend/dist/"
+[[ -x "$STAGE_DIR/src/proxy-router" ]] || die "Staged backend executable is missing"
+[[ -d "$STAGE_DIR/src/proxy_router" ]] || die "Staged backend package is missing"
+[[ -f "$STAGE_DIR/src/Dockerfile" ]] || die "Staged backend Dockerfile is missing"
+[[ -f "$STAGE_DIR/src/frontend/dist/index.html" ]] || die "Staged frontend index.html is missing"
+[[ -d "$STAGE_DIR/src/frontend/dist/assets" ]] || die "Staged frontend assets are missing"
+
+log "Downloading Python wheels for offline container install"
+python3 -m pip download \
+  --dest "$STAGE_DIR/src/wheelhouse" \
+  --only-binary=:all: \
+  --index-url "$PIP_INDEX_URL" \
+  --extra-index-url "$PIP_EXTRA_INDEX_URL" \
+  -r "$ROOT_DIR/requirements.txt"
+patch_staged_dockerfile "$STAGE_DIR/src/Dockerfile"
+[[ -d "$STAGE_DIR/src/wheelhouse" ]] || die "Staged Python wheelhouse is missing"
+log "Staged backend package size: $(dir_size "$STAGE_DIR/src/proxy_router")"
+log "Staged frontend bundle size: $(dir_size "$STAGE_DIR/src/frontend/dist")"
+log "Offline stage size: $(dir_size "$STAGE_DIR")"
+
+log "Checking VPS deploy target $SSH_HOST:$APP_ROOT"
+remote "set -eu
+test -d $(quote "$APP_ROOT")
+test -f $(quote "$APP_ROOT/compose.yaml")
+test -d $(quote "$APP_ROOT/data/proxy-router")
+command -v docker >/dev/null
+docker compose version >/dev/null
+docker compose -f $(quote "$APP_ROOT/compose.yaml") config --services | grep -qx proxy-router
+docker compose -f $(quote "$APP_ROOT/compose.yaml") config --services | grep -qx proxy-router-dashboard"
+
+remote_enable_gh_proxy="$(remote "sudo awk -F= '/^ENABLE_GH_PROXY=/{print \$2; exit}' /etc/arvan-vps-gateway/server.env 2>/dev/null || true")"
+if [[ -n "$remote_enable_gh_proxy" ]]; then
+  log "Remote ENABLE_GH_PROXY is $remote_enable_gh_proxy; selected-service deploy will preserve existing gh-proxy containers"
+fi
+
+log "Uploading offline stage to $SSH_HOST:$REMOTE_STAGE"
+remote "rm -rf $(quote "$REMOTE_STAGE") && mkdir -p $(quote "$REMOTE_STAGE")"
+rsync -az --delete --human-readable --info=progress2,stats2 \
+  -e "ssh ${SSH_OPTS[*]}" \
+  "$STAGE_DIR/src/" \
+  "$SSH_HOST:$REMOTE_STAGE/"
+
+log "Installing uploaded source into $APP_ROOT/src/proxy-router"
+remote "set -eu
+sudo rm -rf $(quote "$APP_ROOT/src/proxy-router")
+sudo mkdir -p $(quote "$APP_ROOT/src/proxy-router")
+sudo rsync -a --delete --human-readable --info=progress2,stats2 $(quote "$REMOTE_STAGE")/ $(quote "$APP_ROOT/src/proxy-router")/
+sudo chown -R root:root $(quote "$APP_ROOT/src/proxy-router")
+test -x $(quote "$APP_ROOT/src/proxy-router/proxy-router")
+test -d $(quote "$APP_ROOT/src/proxy-router/proxy_router")
+test -f $(quote "$APP_ROOT/src/proxy-router/Dockerfile")
+test -d $(quote "$APP_ROOT/src/proxy-router/wheelhouse")
+test -f $(quote "$APP_ROOT/src/proxy-router/frontend/dist/index.html")
+test -d $(quote "$APP_ROOT/src/proxy-router/frontend/dist/assets")"
+
+log "Rebuilding backend and recreating backend/frontend services"
+remote "set -eu
+cd $(quote "$APP_ROOT")
+docker compose -f $(quote "$APP_ROOT/compose.yaml") up -d --build --no-deps --force-recreate proxy-router proxy-router-dashboard"
+
+log "Waiting for backend dashboard API"
+wait_for_url "http://127.0.0.1:18798/api/dashboard"
+
+dashboard_url="$(remote "sudo awk -F= '
+  /^WG_DNS=/{wg=\$2}
+  /^PROXY_ROUTER_DASHBOARD_PORT=/{port=\$2}
+  END {
+    if (wg == \"\") wg=\"127.0.0.1\"
+    if (port == \"\") port=\"8798\"
+    print \"http://\" wg \":\" port \"/\"
+  }
+' /etc/arvan-vps-gateway/server.env 2>/dev/null || printf 'http://127.0.0.1:8798/\n'")"
+log "Waiting for dashboard frontend at $dashboard_url"
+wait_for_url "$dashboard_url"
+
+log "Current proxy-router service state"
+remote "docker compose -f $(quote "$APP_ROOT/compose.yaml") ps proxy-router proxy-router-dashboard"
+
+log "proxy-router deployment complete"
