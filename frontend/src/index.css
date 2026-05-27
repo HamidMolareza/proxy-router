@@ -17,6 +17,7 @@
   --pr-text: #1f2a30;
   --pr-muted: #6a6f73;
   --pr-accent: #116466;
+  --pr-accent-contrast: #ffffff;
   --pr-accent-soft: #d9ece8;
   --pr-accent-border: #b9d7d8;
   --pr-warning: #9b6b00;
@@ -57,6 +58,7 @@
   --pr-text: #e5edf5;
   --pr-muted: #a8b3c2;
   --pr-accent: #4fd1c5;
+  --pr-accent-contrast: #062a2d;
   --pr-accent-soft: #123f44;
   --pr-accent-border: #25666d;
   --pr-warning: #f6c96f;
@@ -82,6 +84,16 @@
 
 .theme-root a {
   color: var(--pr-accent);
+}
+
+.theme-root .theme-choice-button {
+  color: var(--pr-muted) !important;
+}
+
+.theme-root .theme-choice-button[aria-pressed='true'] {
+  background-color: var(--pr-accent) !important;
+  color: var(--pr-accent-contrast) !important;
+  border-color: var(--pr-accent) !important;
 }
 
 .theme-root input::placeholder,

@@ -56,18 +56,19 @@ class RuleSuggestionTests(unittest.TestCase):
                         requester_identity=requester(),
                         requester_ip="192.168.1.20",
                         profile={"id": "default", "name": "Shared"},
-                        rule_payload={"pattern": "api.example.com", "match": "exact", "action": "block"},
+                        rule_payload={"pattern": "api", "match": "contains", "action": "block"},
                         request_note="API should be blocked",
                     )
 
-                self.assertEqual(raised.exception.rule["pattern"], "api.example.com")
+                self.assertEqual(raised.exception.rule["pattern"], "api")
                 self.assertEqual(raised.exception.conflicts[0]["type"], "conflict")
+                self.assertIn("Disable one rule", raised.exception.conflicts[0]["hint"])
 
                 suggestion = manager.submit(
                     requester_identity=requester(),
                     requester_ip="192.168.1.20",
                     profile={"id": "default", "name": "Shared"},
-                    rule_payload={"pattern": "api.example.com", "match": "exact", "action": "block"},
+                    rule_payload={"pattern": "api", "match": "contains", "action": "block"},
                     request_note="API should be blocked",
                     confirm_conflicts=True,
                 )
@@ -94,7 +95,7 @@ class RuleSuggestionTests(unittest.TestCase):
                     requester_identity=requester(),
                     requester_ip="192.168.1.20",
                     profile={"id": "default", "name": "Shared"},
-                    rule_payload={"pattern": "api.example.com", "match": "exact", "action": "block"},
+                    rule_payload={"pattern": "api", "match": "contains", "action": "block"},
                     request_note="",
                     confirm_conflicts=True,
                 )

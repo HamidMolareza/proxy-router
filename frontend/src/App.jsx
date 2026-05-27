@@ -9,15 +9,28 @@ const HISTORY_RANGE_OPTIONS = [
   { value: 'all', label: 'All time' },
 ]
 const TAB_DEFINITIONS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'history', label: 'History' },
-  { id: 'proxies', label: 'Proxies' },
+  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'traffic', label: 'Traffic' },
   { id: 'routing', label: 'Routing' },
+  { id: 'proxies', label: 'Proxies' },
+  { id: 'access', label: 'Access' },
   { id: 'https', label: 'HTTPS' },
-  { id: 'users', label: 'Users' },
-  { id: 'quotas', label: 'Quotas' },
-  { id: 'failures', label: 'Failures' },
 ]
+const TAB_HASH_ALIASES = {
+  overview: 'dashboard',
+  history: 'traffic',
+  failures: 'traffic',
+  users: 'access',
+  quotas: 'access',
+}
+const WORKFLOW_DESCRIPTIONS = {
+  dashboard: 'Live session summary, recent traffic, and the latest completed request.',
+  traffic: 'History, trends, top destinations, failures, and traffic maintenance.',
+  routing: 'Profiles, routing rules, rule suggestions, and automatic proxy policy.',
+  proxies: 'Upstream proxy health, connection settings, access policy, and proxy quotas.',
+  access: 'Known clients, client blocks, traffic quotas, and admin API tokens.',
+  https: 'HTTPS interception status, certificate setup, and captured HTTPS traffic.',
+}
 const HTTPS_TRAFFIC_SORT_OPTIONS = ['timestamp', 'status_code', 'method', 'host', 'client', 'total_bytes', 'duration_ms']
 const COMMON_SECOND_LEVEL_DOMAIN_LABELS = new Set([
   'ac',
@@ -148,7 +161,7 @@ const autoRulePillClass = '!border-[var(--pr-accent-border)] !bg-[var(--pr-accen
 const ruleMetaClass = 'flex flex-col gap-1 text-sm'
 const sortableHeaderButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !text-left !text-xs !font-semibold !tracking-[0.05em] !text-[var(--pr-muted)] !uppercase'
 const themeSwitchClass = 'flex rounded-[10px] border border-[var(--pr-control-border)] bg-[var(--pr-segment-bg)] p-1'
-const themeButtonClass = '!min-h-0 !border-0 !bg-transparent !px-2 !py-1 !text-xs sm:!px-3'
+const themeButtonClass = 'theme-choice-button !min-h-0 !border-0 !px-2 !py-1 !text-xs sm:!px-3'
 
 function compareNumbers(left, right, direction) {
   const leftValue = Number(left || 0)
@@ -210,7 +223,8 @@ function getQuotaClientSortValue(row, key) {
 
 function getTabFromHash() {
   const tabId = window.location.hash.replace(/^#/, '').trim()
-  return TAB_DEFINITIONS.some((item) => item.id === tabId) ? tabId : 'overview'
+  const canonicalTabId = TAB_HASH_ALIASES[tabId] || tabId
+  return TAB_DEFINITIONS.some((item) => item.id === canonicalTabId) ? canonicalTabId : 'dashboard'
 }
 
 function clamp(value, min, max) {
@@ -356,29 +370,26 @@ function mergeDashboardSnapshot(existingSnapshot, patch) {
   }
 }
 
-function dashboardScopeForTab(tab) {
+function dashboardScopesForTab(tab) {
   if (tab === 'proxies') {
-    return 'proxies'
+    return ['proxies']
   }
   if (tab === 'routing') {
-    return 'routing'
+    return ['routing']
   }
   if (tab === 'https') {
-    return 'https-status'
+    return ['https-status']
   }
-  if (tab === 'users') {
-    return 'users'
+  if (tab === 'access') {
+    return ['users', 'quotas']
   }
-  if (tab === 'quotas') {
-    return 'quotas'
+  if (tab === 'traffic') {
+    return ['failures']
   }
-  if (tab === 'failures') {
-    return 'failures'
-  }
-  return ''
+  return []
 }
 
-const HEAVY_DASHBOARD_SCOPES = new Set(['failures', 'proxies', 'quotas', 'routing', 'users'])
+const HEAVY_DASHBOARD_SCOPES = new Set(['failures', 'https-status', 'proxies', 'quotas', 'routing', 'users'])
 
 function dashboardScopeMinRefreshMs(scope) {
   return HEAVY_DASHBOARD_SCOPES.has(scope) ? 5000 : 1000
@@ -1342,6 +1353,37 @@ function rulePatternsOverlap(leftRule, rightRule) {
   return false
 }
 
+function isSpecificRuleOverride(leftRule, rightRule) {
+  const left = ruleIdentity(leftRule)
+  const right = ruleIdentity(rightRule)
+  if (!left.pattern || !right.pattern || right.match !== 'suffix') {
+    return false
+  }
+  if (left.match === 'exact') {
+    return left.pattern === right.pattern || left.pattern.endsWith(`.${right.pattern}`)
+  }
+  if (left.match === 'suffix') {
+    return left.pattern !== right.pattern && left.pattern.endsWith(`.${right.pattern}`)
+  }
+  return false
+}
+
+function ruleConflictHint(leftEntry, rightEntry) {
+  const leftRule = leftEntry.rule || {}
+  const rightRule = rightEntry.rule || {}
+  if (isSpecificRuleOverride(rightRule, leftRule)) {
+    return `${normalizeRulePattern(rightRule.pattern)} is more specific than ${normalizeRulePattern(
+      leftRule.pattern,
+    )}. Move the specific rule above the broader suffix rule, disable one rule, or use the same action.`
+  }
+  if (isSpecificRuleOverride(leftRule, rightRule)) {
+    return `${normalizeRulePattern(leftRule.pattern)} is a specific exception for ${normalizeRulePattern(
+      rightRule.pattern,
+    )} and must stay above the broader suffix rule.`
+  }
+  return 'Disable one rule, make the actions match, or narrow the match so only one rule can apply.'
+}
+
 function ruleIssueRef(entry) {
   const rule = entry.rule || {}
   return {
@@ -1401,6 +1443,9 @@ function findRuleIssuesForEntries(entries, contextId, contextLabel) {
       if (!rulePatternsOverlap(leftRule, rightRule)) {
         return
       }
+      if (isSpecificRuleOverride(leftRule, rightRule)) {
+        return
+      }
       issues.push({
         type: 'conflict',
         context_id: contextId,
@@ -1408,6 +1453,7 @@ function findRuleIssuesForEntries(entries, contextId, contextLabel) {
         message: `Conflicting actions for ${normalizeRulePattern(leftRule.pattern)} and ${normalizeRulePattern(
           rightRule.pattern,
         )} in ${contextLabel}.`,
+        hint: ruleConflictHint(leftEntry, rightEntry),
         left: ruleIssueRef(leftEntry),
         right: ruleIssueRef(rightEntry),
       })
@@ -2751,7 +2797,8 @@ function App() {
   const routerConfigAuthBlockedText =
     'Admin API token required for config changes · paste a token to resume autosave'
   const routerConfigInputsDisabled = routerConfigWriteAuthBlocked
-  const activeDashboardScope = dashboardScopeForTab(activeTab)
+  const activeDashboardScopes = useMemo(() => dashboardScopesForTab(activeTab), [activeTab])
+  const activeDashboardScope = activeDashboardScopes[0] || ''
 
   const safeEditorProfileId = useMemo(
     () =>
@@ -3795,7 +3842,7 @@ function App() {
           })
         }
 
-        if (payload.history_changed && activeTabRef.current === 'history') {
+        if (payload.history_changed && activeTabRef.current === 'traffic') {
           scheduleHistoryRefresh()
         }
         if (payload.https_traffic_changed && activeTabRef.current === 'https') {
@@ -3865,8 +3912,7 @@ function App() {
   }, [activeDashboardScope])
 
   useEffect(() => {
-    const scope = dashboardScopeForTab(activeTab)
-    if (!scope) {
+    if (!activeDashboardScopes.length) {
       return
     }
     const timeoutId = window.setTimeout(() => {
@@ -3878,20 +3924,22 @@ function App() {
       if (!refresh) {
         return
       }
-      refresh(scope, { force: true }).catch((error) => {
-        setStatus({
-          text: `Dashboard ${scope} refresh paused: ${error.message}`,
-          warning: true,
+      activeDashboardScopes.forEach((scope) => {
+        refresh(scope, { force: true }).catch((error) => {
+          setStatus({
+            text: `Dashboard ${scope} refresh paused: ${error.message}`,
+            warning: true,
+          })
         })
       })
     }, 1000)
     return () => {
       window.clearTimeout(timeoutId)
     }
-  }, [activeTab])
+  }, [activeDashboardScopes])
 
   useEffect(() => {
-    if (activeTab !== 'history') {
+    if (activeTab !== 'traffic') {
       return
     }
     const timeoutId = window.setTimeout(() => {
@@ -4007,7 +4055,7 @@ function App() {
       const firstIssue = nextBlockingRuleIssues[0]
       setRouterSaveError('')
       setRouterStatusOverride({
-        text: `Rule change not applied: ${firstIssue.message}`,
+        text: `Rule change not applied: ${firstIssue.message}${firstIssue.hint ? ` ${firstIssue.hint}` : ''}`,
         warning: true,
       })
       return
@@ -4022,7 +4070,7 @@ function App() {
       setCurrentRulesPage(1)
     }
     if (options.activateTab) {
-      setActiveTab(options.activateTab)
+      setActiveTab(TAB_HASH_ALIASES[options.activateTab] || options.activateTab)
     }
     if (options.message) {
       setRouterStatusOverride({
@@ -4807,20 +4855,22 @@ function App() {
     }
   }
 
+  const activeWorkflow = TAB_DEFINITIONS.find((tab) => tab.id === activeTab) || TAB_DEFINITIONS[0]
+
   return (
     <main className={pageClass} data-theme={resolvedTheme} style={{ colorScheme: resolvedTheme }}>
       <div className={shellClass}>
       <section className={heroClass}>
         <div>
           <h1>proxy-router dashboard</h1>
-          <p>Current session view for traffic totals, per-device usage, and the latest completed request.</p>
+          <p>{WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}</p>
         </div>
         <div className="flex w-full flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end sm:flex-wrap">
           <div className={themeSwitchClass} aria-label="Theme">
             {THEME_OPTIONS.map((item) => (
               <button
                 key={item.value}
-                className={cx(themeButtonClass, themePreference === item.value && primaryButtonClass)}
+                className={themeButtonClass}
                 type="button"
                 aria-pressed={themePreference === item.value ? 'true' : 'false'}
                 onClick={() => setThemePreference(item.value)}
@@ -4829,30 +4879,28 @@ function App() {
               </button>
             ))}
           </div>
-          <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
         </div>
       </section>
 
-      <section className={cx(panelClass, 'mb-4')}>
-        <div className={panelHeaderClass}>
-          <div>
-            <h2>Configuration</h2>
-            <div className={noteClass}>Routing profiles, rules, users, quotas, and exemptions sync automatically.</div>
+      <section className={cx(panelClass, 'mb-3')} aria-live="polite">
+        <div className="grid grid-cols-1 gap-3 min-[860px]:grid-cols-[1fr_1fr_auto] min-[860px]:items-center">
+          <div className="min-w-0">
+            <div className="text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">Autosave</div>
+            <div className={cx(pillClass, 'mt-1', routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
           </div>
-          <div className="flex w-full flex-col items-stretch gap-3 sm:w-auto sm:flex-row sm:items-center sm:flex-wrap">
-            <div className={cx(pillClass, routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
-            {adminApiStatus.requires_auth ? (
-              <label className={cx(fieldClass, 'min-w-[18rem] flex-1 sm:max-w-[24rem]')}>
-                <span>Admin API token</span>
-                <input
-                  type="password"
-                  value={adminApiToken}
-                  onChange={(event) => updateAdminApiToken(event.target.value)}
-                  placeholder="Paste token to enable autosave"
-                  autoComplete="off"
-                />
-              </label>
-            ) : null}
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={cx('inline-block h-3 w-3 shrink-0 rounded-full', proxyConnectionStatus.dotClassName)}
+                aria-hidden="true"
+              />
+              <span className="text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">Proxy</span>
+              <span className={proxyConnectionStatus.pillClassName}>{proxyConnectionStatus.label}</span>
+            </div>
+            <div className="mt-1 text-sm leading-relaxed text-[var(--pr-muted)]">{proxyConnectionStatus.message}</div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 min-[860px]:justify-end">
+            <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
             <button
               type="button"
               disabled={isSavingRouter}
@@ -4865,55 +4913,57 @@ function App() {
                 })
               }}
             >
-              Reload from disk
+              Reload
+            </button>
+            <button
+              type="button"
+              onClick={() => triggerAllProxyChecks()}
+              disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
+            >
+              {isCheckingProxies ? 'Checking...' : 'Check proxies'}
             </button>
           </div>
         </div>
-      </section>
-
-      <section
-        className={cx(panelClass, 'mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between')}
-        aria-live="polite"
-      >
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={cx('inline-block h-3 w-3 shrink-0 rounded-full', proxyConnectionStatus.dotClassName)}
-              aria-hidden="true"
+        {adminApiStatus.requires_auth ? (
+          <label className={cx(fieldClass, 'mt-3 max-w-[28rem]')}>
+            <span>Admin API token</span>
+            <input
+              type="password"
+              value={adminApiToken}
+              onChange={(event) => updateAdminApiToken(event.target.value)}
+              placeholder="Paste token to enable autosave"
+              autoComplete="off"
             />
-            <h2>Proxy connection</h2>
-            <span className={proxyConnectionStatus.pillClassName}>{proxyConnectionStatus.label}</span>
-          </div>
-          <div className={noteClass}>{proxyConnectionStatus.message}</div>
+          </label>
+        ) : null}
+      </section>
+
+      <section className="sticky top-0 z-20 -mx-2 mb-3 border-y border-[var(--pr-panel-border)] bg-[var(--pr-page-to)] px-2 py-2 sm:static sm:-mx-0 sm:mb-4 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
+        <div className="flex gap-2 overflow-x-auto pb-1 [-webkit-overflow-scrolling:touch]" aria-label="Admin workflows">
+          {TAB_DEFINITIONS.map((tab) => (
+            <button
+              key={tab.id}
+              className={cx(
+                'shrink-0 rounded-full px-3 py-2 text-sm whitespace-nowrap sm:px-4',
+                activeTab === tab.id && primaryButtonClass,
+              )}
+              type="button"
+              aria-current={activeTab === tab.id ? 'page' : undefined}
+              aria-pressed={activeTab === tab.id ? 'true' : 'false'}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
-        <button
-          className="w-full sm:w-auto"
-          type="button"
-          onClick={() => triggerAllProxyChecks()}
-          disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
-        >
-          {isCheckingProxies ? 'Checking proxies…' : 'Check proxies'}
-        </button>
       </section>
 
-      <section className="mb-4 grid grid-cols-2 gap-2 min-[361px]:grid-cols-3 sm:flex sm:flex-wrap" aria-label="Dashboard tabs">
-        {TAB_DEFINITIONS.map((tab) => (
-          <button
-            key={tab.id}
-            className={cx(
-              'w-full rounded-[10px] px-2 py-2 text-sm sm:w-auto sm:rounded-full sm:px-4',
-              activeTab === tab.id && primaryButtonClass,
-            )}
-            type="button"
-            aria-pressed={activeTab === tab.id ? 'true' : 'false'}
-            onClick={() => setActiveTab(tab.id)}
-          >
-            {tab.label}
-          </button>
-        ))}
+      <section className="mb-3">
+        <h2>{activeWorkflow.label}</h2>
+        <div className={noteClass}>{WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}</div>
       </section>
 
-      {activeTab === 'overview' ? (
+      {activeTab === 'dashboard' ? (
         <section className="block">
           <section className={gridClass}>
             <div className={cardGridClass} id="summary-cards">
@@ -5105,7 +5155,7 @@ function App() {
         </section>
       ) : null}
 
-      {activeTab === 'history' ? (
+      {activeTab === 'traffic' ? (
         <section className="block">
           <section className={gridClass}>
             <section className={cx(panelClass, 'col-span-full')}>
@@ -5353,7 +5403,210 @@ function App() {
                   </button>
                 </div>
               </div>
-              <div className={cx(tableWrapClass, '[&_td]:align-middle [&_input]:text-sm [&_select]:text-sm')}>
+              <div className="mt-3 grid grid-cols-1 gap-3 lg:hidden">
+                {currentRouterConfig.proxies.length ? (
+                  currentRouterConfig.proxies.map((proxy, index) => {
+                    const quota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
+                    const summary =
+                      (dashboardSnapshot.totals_by_upstream_proxy || {})[proxy.id] || emptyUsageSummary()
+                    const checkStatus = buildProxyCheckStatus(proxyCheckResults[proxy.id])
+                    return (
+                      <article className={cardClass} key={`proxy-card-${proxy.id}-${index}`}>
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <h3 className="[overflow-wrap:anywhere]">{proxy.name || proxy.id || 'New proxy'}</h3>
+                            <div className={noteClass}>{`${proxy.type.toUpperCase()} · ${proxy.host || 'host'}:${proxy.port || 'port'}`}</div>
+                          </div>
+                          <span className={checkStatus.pillClassName}>{checkStatus.label}</span>
+                        </div>
+                        <div className={fieldGridClass}>
+                          <label className="flex items-center gap-2 text-sm text-[var(--pr-muted)]">
+                            <input
+                              type="checkbox"
+                              checked={proxy.enabled}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'enabled', event.target.checked)}
+                            />
+                            <span>Enabled</span>
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Priority</span>
+                            <input
+                              type="number"
+                              min="1"
+                              value={proxy.priority}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) =>
+                                updateUpstreamProxyField(index, 'priority', event.target.value.trim())
+                              }
+                            />
+                          </label>
+                          <label className={fieldClass}>
+                            <span>ID</span>
+                            <input
+                              type="text"
+                              value={proxy.id}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'id', event.target.value)}
+                            />
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Name</span>
+                            <input
+                              type="text"
+                              value={proxy.name}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'name', event.target.value)}
+                            />
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Type</span>
+                            <select
+                              value={proxy.type}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'type', event.target.value)}
+                            >
+                              <option value="http">HTTP</option>
+                              <option value="socks5">SOCKS5</option>
+                            </select>
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Host</span>
+                            <input
+                              type="text"
+                              value={proxy.host}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'host', event.target.value.trim())}
+                            />
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Port</span>
+                            <input
+                              type="number"
+                              min="1"
+                              max="65535"
+                              value={proxy.port}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'port', event.target.value.trim())}
+                            />
+                          </label>
+                          <label className={fieldClass}>
+                            <span>Access</span>
+                            <select
+                              value={proxy.access_mode}
+                              disabled={routerConfigInputsDisabled}
+                              onChange={(event) => updateUpstreamProxyField(index, 'access_mode', event.target.value)}
+                            >
+                              <option value="public">Public</option>
+                              <option value="authenticated">Authenticated</option>
+                              <option value="private">Private</option>
+                            </select>
+                          </label>
+                          <label className={cx(fieldClass, 'min-[361px]:col-span-2')}>
+                            <span>Allowed clients</span>
+                            <input
+                              type="text"
+                              value={proxy.allowed_clients.join(', ')}
+                              disabled={routerConfigInputsDisabled}
+                              placeholder={
+                                proxy.access_mode === 'private'
+                                  ? 'remote clients only; localhost is automatic'
+                                  : 'user:phone, 192.168.1.50'
+                              }
+                              onChange={(event) =>
+                                updateUpstreamProxyField(
+                                  index,
+                                  'allowed_clients',
+                                  event.target.value
+                                    .split(',')
+                                    .map((item) => item.trim())
+                                    .filter(Boolean),
+                                )
+                              }
+                            />
+                          </label>
+                        </div>
+                        <details className="mt-3">
+                          <summary className="cursor-pointer text-sm font-semibold text-[var(--pr-text)]">
+                            Quota limits
+                          </summary>
+                          <div className="mt-3 grid grid-cols-1 gap-3">
+                            {['traffic_limit', 'per_client_traffic_limit'].map((limitKey) => {
+                              const limit = proxy[limitKey] || normalizeProxyTrafficLimit({})
+                              const title = limitKey === 'traffic_limit' ? 'Global limits MB' : 'Per-user limits MB'
+                              return (
+                                <div key={`mobile-${limitKey}`}>
+                                  <label className="flex items-center gap-2 text-sm text-[var(--pr-muted)]">
+                                    <input
+                                      type="checkbox"
+                                      checked={limit.enabled}
+                                      disabled={routerConfigInputsDisabled}
+                                      onChange={(event) =>
+                                        updateUpstreamProxyLimit(index, limitKey, 'enabled', event.target.checked)
+                                      }
+                                    />
+                                    <span>{title}</span>
+                                  </label>
+                                  <div className="mt-2 grid grid-cols-3 gap-2">
+                                    {[
+                                      ['1h', 'max_past_hour_mb'],
+                                      ['3h', 'max_past_3h_mb'],
+                                      ['7d', 'max_past_week_mb'],
+                                    ].map(([label, field]) => (
+                                      <label className={cx(fieldClass, 'min-w-0 text-xs')} key={`mobile-${limitKey}-${field}`}>
+                                        <span>{label}</span>
+                                        <input
+                                          type="number"
+                                          min="1"
+                                          value={limit[field] ?? ''}
+                                          disabled={routerConfigInputsDisabled}
+                                          onChange={(event) =>
+                                            updateUpstreamProxyLimit(
+                                              index,
+                                              limitKey,
+                                              field,
+                                              normalizeOptionalLimitMb(event.target.value),
+                                            )
+                                          }
+                                        />
+                                      </label>
+                                    ))}
+                                  </div>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </details>
+                        <div className="mt-3 grid grid-cols-1 gap-2 text-sm text-[var(--pr-muted)] min-[361px]:grid-cols-2">
+                          <div>
+                            <strong className="text-[var(--pr-text)]">{formatPanelTraffic(summary.total_bytes || 0)}</strong>
+                            <div>{quota.allowed === false ? 'Quota reached' : `${summary.count || 0} requests`}</div>
+                          </div>
+                          <div>{checkStatus.message}</div>
+                        </div>
+                        <div className={buttonRowClass}>
+                          <button
+                            type="button"
+                            disabled={routerConfigInputsDisabled}
+                            onClick={() => {
+                              const nextConfig = cloneJson(currentRouterConfig)
+                              nextConfig.proxies.splice(index, 1)
+                              setLocalRouterConfig(nextConfig, {
+                                message: 'Proxy removed. Syncing automatically.',
+                              })
+                            }}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </article>
+                    )
+                  })
+                ) : (
+                  <div className="pt-2 text-[var(--pr-muted)]">No upstream proxies yet.</div>
+                )}
+              </div>
+              <div className={cx(tableWrapClass, 'max-lg:hidden [&_td]:align-middle [&_input]:text-sm [&_select]:text-sm')}>
                 <table className="min-w-[128rem] table-fixed">
                   <colgroup>
                     <col className="w-[5.5rem]" />
@@ -6273,6 +6526,7 @@ function App() {
                             key={ruleIssueKey(issue)}
                           >
                             <div className="font-semibold">{issue.message}</div>
+                            {issue.hint ? <div className={cx(noteClass, '!mt-1')}>{issue.hint}</div> : null}
                             <div className="mt-2 grid grid-cols-1 gap-2 lg:grid-cols-2">
                               {[issue.left, issue.right].map((ref) => (
                                 <div
@@ -6908,7 +7162,7 @@ function App() {
         </section>
       ) : null}
 
-      {activeTab === 'users' ? (
+      {activeTab === 'access' ? (
         <section className="block">
           <section className={gridClass}>
             <section className={cx(panelClass, 'col-span-full')}>
@@ -7075,7 +7329,7 @@ function App() {
         </section>
       ) : null}
 
-      {activeTab === 'quotas' ? (
+      {activeTab === 'access' ? (
         <section className="block">
           <section className={gridClass}>
             <section className={cx(panelClass, 'col-span-full')}>
@@ -7941,7 +8195,7 @@ function App() {
         </section>
       ) : null}
 
-      {activeTab === 'failures' ? (
+      {activeTab === 'traffic' ? (
         <section className="block">
           <section className={gridClass}>
             <section className={cx(panelClass, 'col-span-full')}>

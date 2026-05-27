@@ -7,7 +7,7 @@ It is designed for cases where a phone or another device on the same network sho
 ## Highlights
 
 - Mixed HTTP + SOCKS5 listener on one port for simple device setup
-- React dashboard for overview, history, HTTPS analysis, proxies, routing, users, quotas, and failures
+- React dashboard for live status, traffic analysis, routing, proxies, access controls, quotas, and HTTPS analysis
 - Shared and per-network routing profiles
 - Ordered HTTP/SOCKS5 upstream proxy fallback with public, authenticated-only, or private per-client access
 - Automatic direct-failure probing before assigning failing domains to a working upstream proxy
@@ -138,6 +138,29 @@ Build files:
 - [Dockerfile](Dockerfile) for the Python proxy/API container
 - [frontend/Dockerfile](frontend/Dockerfile) for the static React dashboard container
 
+### Arvan VPS deployment
+
+Use the offline deploy helper to update the existing Arvan gateway stack:
+
+```bash
+scripts/deploy-proxy-router-offline arvan
+```
+
+The script builds the dashboard locally, downloads Python wheels into a staged
+wheelhouse, uploads the staged source to the VPS, replaces only
+`/opt/arvan-vps-gateway/src/proxy-router`, and recreates the
+`proxy-router` and `proxy-router-dashboard` Compose services. Runtime state under
+`/opt/arvan-vps-gateway/data/proxy-router` is preserved.
+
+Defaults can be overridden with environment variables:
+
+```bash
+APP_ROOT=/opt/arvan-vps-gateway \
+NPM_REGISTRY=https://package-mirror.liara.ir/repository/npm/ \
+PIP_INDEX_URL=https://package-mirror.liara.ir/repository/pypi/simple \
+scripts/deploy-proxy-router-offline arvan
+```
+
 Upstream proxy note:
 
 - In the Compose deployment, the backend uses host networking, so a host-side upstream proxy can use `127.0.0.1`.
@@ -157,6 +180,8 @@ HTTPS interception note:
 - Saved routing profiles add network-specific rules on top of `Shared`.
 - Profile-specific rules win over shared rules.
 - Auto-proxy state is tracked per effective profile.
+- Rules are evaluated in order. Put a specific exception above a broader suffix rule, for example `sample.ir` as `Proxy` before `ir` as `Direct`.
+- Specific `exact` or narrower `suffix` exceptions are allowed above broader suffix rules. Duplicates, ambiguous `contains` overlaps, and broader-before-specific conflicting rules are still rejected with a conflict hint.
 - `action: proxy` rules can optionally pin a `proxy_id`; otherwise the router tries allowed proxies by priority.
 - Private proxy `allowed_clients` entries can be authenticated identities such as `user:phone`, plain usernames such as `phone`, single IPs such as `127.0.0.1`, or CIDR ranges such as `127.0.0.0/8`.
 - Auto-proxy rules created after direct failures keep the working proxy id, so later requests for the same domain reuse that proxy unless the rule is changed.
@@ -168,16 +193,14 @@ Typical setup:
 
 ## Dashboard
 
-The dashboard includes eight main areas:
+The dashboard is organized around six admin workflows. Old direct hashes such as `#overview`, `#history`, `#users`, `#quotas`, and `#failures` continue to land on their matching workflow:
 
-- `Overview`: current activity, totals, recent traffic, active clients
-- `History`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, and top destinations filtered by range, proxy type, client, and upstream proxy
-- `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, check-all connectivity results, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
-- `Routing`: rules, routing profiles, and auto-proxy controls
+- `Dashboard`: current activity, totals, recent traffic, active clients
+- `Traffic`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, top destinations, recent failures, grouped review, ignore and rule-creation workflows
+- `Routing`: rules, routing profiles, rule suggestions, and auto-proxy controls
+- `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, mobile-friendly proxy cards, check-all connectivity results, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
+- `Access`: configured proxy-auth users, observed client identities/IPs, silent block/unblock controls, optional proxy authentication, default client quota, quota groups, per-client quota rules, exemptions, and admin API tokens
 - `HTTPS`: CA status, adaptive sniffing config, and filterable captured HTTPS request/response analysis
-- `Users`: configured proxy-auth users plus observed client identities/IPs, with silent block/unblock controls
-- `Quotas`: optional proxy authentication, default client quota, quota groups, per-client quota rules, exemptions
-- `Failures`: recent failures, grouped review, ignore and rule-creation workflows
 
 Client self-service portal:
 
@@ -203,11 +226,11 @@ Current dashboard behaviors:
 - The dashboard theme switch supports `System`, `Light`, and `Dark`; the choice is stored per browser and `System` follows the OS color-scheme preference.
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
 - Admin clients can query request-history rows through `/api/history/requests` with client, host, route, upstream proxy, status, search, sort, and paging filters
-- Overview and active-tab dashboard state are pushed over a lightweight scoped WebSocket snapshot instead of frequent scoped HTTP polling; scoped dashboard endpoints remain available for direct API use and socket fallback
-- Overview, History, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
+- Dashboard and active-workflow state are pushed over a lightweight scoped WebSocket snapshot instead of frequent scoped HTTP polling; scoped dashboard endpoints remain available for direct API use and socket fallback
+- Dashboard, Traffic, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
-- A proxy connection status strip above the dashboard tabs summarizes whether at least one enabled upstream proxy is reachable. It updates from real proxied traffic successes, repeated proxied traffic failures, and the same check-all probe used by the `Proxies` tab.
+- The top status strip combines autosave state, live socket state, admin-token entry when needed, active proxy health, reload, and proxy checks.
 - Proxy definitions live in the `Proxies` tab; the `Routing` tab uses those proxies through default actions, rule `proxy_id` pins, priority, and access policy.
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.
@@ -217,12 +240,12 @@ Current dashboard behaviors:
 - The `HTTPS` tab lists intercepted HTTPS requests in a scrollable table with client, method, status, host, size, duration, sorting, and filters. Selecting a request shows copyable redacted request/response headers and body previews, with raw/beauty tabs for JSON and XML bodies.
 - Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried through allowed upstream proxies when auto-proxy is available; a proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
-- The `Users` tab can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
+- The `Access` workflow can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests. The retry policy also controls the setup timeout used while opening each destination or upstream connection.
-- The dashboard rejects rule edits that introduce duplicates or enabled overlapping rules with different actions before autosync; backend validation rejects invalid rulesets from API writes and skips automatic auto-proxy additions that would create the same issues.
-- Admin API tokens protect dashboard/API write endpoints after the first token is created. When a token is required, the dashboard shows a token field in the top Configuration panel and disables config editors until a token is present. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
+- The dashboard rejects rule edits that introduce duplicates or unresolved enabled overlaps before autosync; backend validation rejects the same invalid rulesets from API writes and skips automatic auto-proxy additions that would create those issues.
+- Admin API tokens protect dashboard/API write endpoints after the first token is created. When a token is required, the dashboard shows a token field in the top status strip and disables config editors until a token is present. The dashboard stores the current token in browser local storage; MCP clients should receive it through `PROXY_ROUTER_MCP_PAT`.
 - The Routing tab shows authenticated client rule suggestions with requester details, conflicts, approval, and rejection with an optional admin message.
 - Approving a suggestion keeps the same rule validation as manual edits, so still-conflicting suggestions must be resolved before approval succeeds.
 - `Check conflicts` scans existing enabled rulesets for duplicate rules and conflicting actions.
@@ -254,10 +277,10 @@ Diagnosis tips:
 
 ## Quotas
 
-- Client auth credentials can be managed from the `Quotas` tab. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally; SOCKS5 clients that offer both no-auth and username/password are accepted as anonymous. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
+- Client auth credentials can be managed from the `Access` workflow. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally; SOCKS5 clients that offer both no-auth and username/password are accepted as anonymous. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
 - Authenticated clients use stable `user:<username>` identities for logs, dashboard totals, limits, and exemptions. Usage records also keep the source client IP for troubleshooting.
-- The `Users` tab merges configured auth users with client identities/IPs seen in recorded traffic or failures, so you can block the exact client from the same list.
-- The Quotas `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
+- The `Access` workflow merges configured auth users with client identities/IPs seen in recorded traffic or failures, so you can block the exact client from the same list.
+- The Access `By client` table is identity-based: authenticated traffic appears under `user:<username>` instead of a separate source IP row.
 - Client limit and exemption targets can be `user:<username>`, `group:<id>`, a single IP address, or a CIDR range.
 - Quota groups live in `client_quota_groups` and let multiple authenticated device identities share one client quota bucket. For example, group `ali` can include `user:ali-phone` and `user:ali-laptop`, then a client limit for `group:ali` applies to their combined traffic.
 - The general default quota applies to anonymous clients and to authenticated clients unless a separate authenticated default quota is enabled.
@@ -279,7 +302,7 @@ Response behavior:
 - SOCKS5 traffic still uses standard SOCKS5 rejection codes without a text body
 - Devices can still open the self-service portal at `http://proxy.router/` even while quota-blocked, because that page is served locally by the proxy
 
-When a client is blocked from the `Users` tab:
+When a client is blocked from the `Access` workflow:
 
 - future HTTP, CONNECT, and SOCKS5 sessions are dropped silently instead of receiving the quota page
 - timed blocks expire automatically

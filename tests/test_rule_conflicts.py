@@ -72,7 +72,7 @@ class RuleConflictTests(unittest.TestCase):
         config = normalize_router_config(
             {
                 "rules": [
-                    {"pattern": "example.com", "match": "suffix", "action": "direct"},
+                    {"pattern": "api.example.com", "match": "exact", "action": "block"},
                 ],
                 "routing_profiles": [
                     {
@@ -81,7 +81,7 @@ class RuleConflictTests(unittest.TestCase):
                         "enabled": True,
                         "signature": profile_signature(),
                         "rules": [
-                            {"pattern": "api.example.com", "match": "exact", "action": "block"},
+                            {"pattern": "example.com", "match": "suffix", "action": "direct"},
                         ],
                     }
                 ],
@@ -92,8 +92,88 @@ class RuleConflictTests(unittest.TestCase):
 
         self.assertEqual(len(issues), 1)
         self.assertEqual(issues[0]["type"], "conflict")
+        self.assertIn("Move the specific rule above", issues[0]["hint"])
         with self.assertRaisesRegex(ValueError, "conflicting actions"):
             validate_router_rule_issues(config)
+
+    def test_specific_exact_rule_before_broader_suffix_is_allowed_and_wins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "rules": [
+                            {"pattern": "sample.ir", "match": "exact", "action": "proxy"},
+                            {"pattern": "ir", "match": "suffix", "action": "direct"},
+                        ]
+                    }
+                )
+
+                snapshot = manager.snapshot()
+                self.assertEqual(find_router_rule_issues(snapshot), [])
+                self.assertEqual(manager.decide("sample.ir")["action"], "proxy")
+                self.assertEqual(manager.decide("www.sample.ir")["action"], "direct")
+                self.assertEqual(manager.decide("other.ir")["action"], "direct")
+            finally:
+                manager.shutdown()
+
+    def test_specific_suffix_rule_before_broader_suffix_is_allowed_and_wins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update(
+                    {
+                        "rules": [
+                            {"pattern": "sample.ir", "match": "suffix", "action": "proxy"},
+                            {"pattern": "ir", "match": "suffix", "action": "direct"},
+                        ]
+                    }
+                )
+
+                snapshot = manager.snapshot()
+                self.assertEqual(find_router_rule_issues(snapshot), [])
+                self.assertEqual(manager.decide("sample.ir")["action"], "proxy")
+                self.assertEqual(manager.decide("www.sample.ir")["action"], "proxy")
+                self.assertEqual(manager.decide("other.ir")["action"], "direct")
+            finally:
+                manager.shutdown()
+
+    def test_specific_rule_after_broader_suffix_is_blocking_with_hint(self):
+        config = normalize_router_config(
+            {
+                "rules": [
+                    {"pattern": "ir", "match": "suffix", "action": "direct"},
+                    {"pattern": "sample.ir", "match": "exact", "action": "proxy"},
+                ]
+            }
+        )
+
+        issues = find_router_rule_issues(config)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["type"], "conflict")
+        self.assertIn("Move the specific rule above", issues[0]["hint"])
+        with self.assertRaisesRegex(ValueError, "conflicting actions"):
+            validate_router_rule_issues(config)
+
+    def test_add_manual_rule_inserts_specific_exception_before_broader_rule(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = RouterConfigManager(Path(temp_dir) / "router.json")
+            try:
+                manager.update({"rules": [{"pattern": "ir", "match": "suffix", "action": "direct"}]})
+
+                manager.add_manual_rule(
+                    None,
+                    {"pattern": "sample.ir", "match": "exact", "action": "proxy"},
+                )
+
+                snapshot = manager.snapshot()
+                self.assertEqual(snapshot["rules"][0]["pattern"], "sample.ir")
+                self.assertEqual(find_router_rule_issues(snapshot), [])
+                self.assertEqual(manager.decide("sample.ir")["action"], "proxy")
+                self.assertEqual(manager.decide("other.ir")["action"], "direct")
+            finally:
+                manager.shutdown()
 
     def test_same_action_overlap_is_allowed_unless_duplicate(self):
         config = normalize_router_config(
@@ -145,7 +225,7 @@ class RuleConflictTests(unittest.TestCase):
                         {
                             "rules": [
                                 {"pattern": "example.com", "match": "suffix", "action": "direct"},
-                                {"pattern": "api.example.com", "match": "exact", "action": "block"},
+                                {"pattern": "api", "match": "contains", "action": "block"},
                             ]
                         }
                     )

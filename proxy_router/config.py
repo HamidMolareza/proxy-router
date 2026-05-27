@@ -996,7 +996,7 @@ class RouterConfigManager:
             target_profile = self._find_mutable_profile_locked(config, profile_id)
             if target_profile is None:
                 raise ValueError("routing profile for rule suggestion was not found")
-            target_profile.setdefault("rules", []).append(candidate_rule)
+            target_profile.setdefault("rules", []).insert(0, candidate_rule)
             normalized = normalize_router_config(config)
         return find_router_rule_issues(normalized)
 
@@ -1009,7 +1009,7 @@ class RouterConfigManager:
             target_profile = self._find_mutable_profile_locked(config, profile_id)
             if target_profile is None:
                 raise ValueError("routing profile for rule suggestion was not found")
-            target_profile.setdefault("rules", []).append(candidate_rule)
+            target_profile.setdefault("rules", []).insert(0, candidate_rule)
             normalized = normalize_router_config(config)
             validate_router_rule_issues(normalized)
             self._write_config_locked(normalized)

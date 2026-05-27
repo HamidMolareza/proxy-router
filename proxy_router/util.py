@@ -174,6 +174,34 @@ def rule_patterns_overlap(left_rule, right_rule) -> bool:
     return False
 
 
+def is_specific_rule_override(left_rule, right_rule) -> bool:
+    left_pattern, left_match = router_rule_identity(left_rule)
+    right_pattern, right_match = router_rule_identity(right_rule)
+    if not left_pattern or not right_pattern or right_match != "suffix":
+        return False
+    if left_match == "exact":
+        return left_pattern == right_pattern or left_pattern.endswith(f".{right_pattern}")
+    if left_match == "suffix":
+        return left_pattern != right_pattern and left_pattern.endswith(f".{right_pattern}")
+    return False
+
+
+def rule_conflict_hint(left_entry, right_entry) -> str:
+    left_rule = left_entry["rule"]
+    right_rule = right_entry["rule"]
+    if is_specific_rule_override(right_rule, left_rule):
+        return (
+            f"{right_rule.get('pattern')} is more specific than {left_rule.get('pattern')}. "
+            f"Move the specific rule above the broader suffix rule, disable one rule, or use the same action."
+        )
+    if is_specific_rule_override(left_rule, right_rule):
+        return (
+            f"{left_rule.get('pattern')} is a specific exception for {right_rule.get('pattern')} "
+            f"and must stay above the broader suffix rule."
+        )
+    return "Disable one rule, make the actions match, or narrow the match so only one rule can apply."
+
+
 def router_rule_issue_ref(entry) -> dict:
     rule = entry["rule"]
     return {
@@ -225,6 +253,8 @@ def find_rule_issues_for_entries(entries, *, context_id: str, context_label: str
                 continue
             if not rule_patterns_overlap(left_rule, right_rule):
                 continue
+            if is_specific_rule_override(left_rule, right_rule):
+                continue
             issues.append(
                 {
                     "type": "conflict",
@@ -235,6 +265,7 @@ def find_rule_issues_for_entries(entries, *, context_id: str, context_label: str
                         f"{left_rule.get('pattern')} and {right_rule.get('pattern')} "
                         f"in {context_label}"
                     ),
+                    "hint": rule_conflict_hint(left_entry, right_entry),
                     "left": router_rule_issue_ref(left_entry),
                     "right": router_rule_issue_ref(right_entry),
                 }
