@@ -63,6 +63,12 @@ Purpose:
 8. Usage, failure, and intercepted HTTPS analyzer events are written to persisted log files.
 9. Runtime dashboard state is updated in memory.
 
+On the Arvan VPS gateway, route labels are interpreted inside the surrounding
+gateway policy. `direct` means the VPS company/direct egress path, while
+`proxy:*` means a configured upstream such as `gh-proxy`. The gateway firewall
+is responsible for preventing WireGuard client traffic from falling back to
+public `eth0` when the company/direct path is unavailable.
+
 ### Dashboard traffic
 
 1. A browser opens the dashboard frontend.
@@ -112,9 +118,15 @@ The traffic path records observability at request or tunnel boundaries instead o
 Expected overhead:
 
 - raw CONNECT and SOCKS5 stay as socket relay paths and only record aggregate timing at completion
+- the socket relay tolerates retryable nonblocking send/recv states and half-closes each direction only after buffered data is drained
 - normal HTTP may buffer request bodies when required by existing forwarding behavior
 - HTTPS interception adds TLS termination and bounded body-preview capture only for matched hosts
 - upstream retries can intentionally add latency before a final success or failure
+
+The relay path protects proxy-router from premature local tunnel teardown, but
+it cannot make an unreliable upstream transport suitable for bulk downloads.
+When a selected upstream proxy truncates or stalls large responses, route that
+domain direct if the network policy allows it.
 
 ## Docker Layout
 
@@ -198,6 +210,9 @@ Common defaults:
 - Optional proxy authentication supports HTTP Basic `Proxy-Authorization` and SOCKS5 username/password. Anonymous access can remain enabled, and authenticated traffic is logged, limited, and exempted as `user:<username>` while retaining the source IP metadata.
 - Upstream proxies are configured in ordered `proxies[]` entries. Access modes are `public`, `authenticated`, and `private`; private proxies match explicit client identities/IPs/CIDRs, and proxy rules can pin a `proxy_id`. Legacy single-`upstream` config is normalized into one proxy entry for compatibility.
 - Automatic direct-failure and HTTPS-discovery proxy assignments persist the selected working proxy id so later requests for that domain reuse the same upstream unless the rule is edited or removed.
+- Arvan VPS deployments disable automatic direct-failure proxy assignment and
+  rely on explicit synced rules. This prevents a direct failure from silently
+  changing fail-closed routing behavior.
 - HTTPS interception uses adaptive fallback: successful TLS handshakes mark a client as CA-trusted, while TLS trust failures temporarily bypass MITM for that client or host and use raw CONNECT.
 - Intercepted HTTPS analyzer records are append-only JSONL with a stable request id, route metadata, redacted headers, byte totals, and bounded decoded text body previews so a UI or external AI agent can inspect captured traffic without scraping the dashboard.
 - HTTPS discovery watches unmanaged direct HTTPS `CONNECT` traffic and probes direct TLS versus upstream TLS in the background. If direct TLS fails and upstream TLS succeeds, it activates the existing temporary auto-proxy rule flow. Raw tunnel completion alone is not treated as proof that the website worked.

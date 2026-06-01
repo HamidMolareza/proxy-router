@@ -379,6 +379,14 @@ def tunnel_bidirectional(left_socket, right_socket):
         left_socket: bytearray(),
         right_socket: bytearray(),
     }
+    read_closed = {
+        left_socket: False,
+        right_socket: False,
+    }
+    write_shutdown = {
+        left_socket: False,
+        right_socket: False,
+    }
     stats = {
         "left_to_right_bytes": 0,
         "right_to_left_bytes": 0,
@@ -387,39 +395,96 @@ def tunnel_bidirectional(left_socket, right_socket):
     def peer_for(sock):
         return right_socket if sock is left_socket else left_socket
 
+    def is_retryable_socket_error(exc: OSError) -> bool:
+        return isinstance(exc, (BlockingIOError, InterruptedError)) or exc.errno in {
+            errno.EAGAIN,
+            errno.EWOULDBLOCK,
+            errno.EINTR,
+        }
+
+    def shutdown_write(sock):
+        if write_shutdown[sock]:
+            return
+        write_shutdown[sock] = True
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def shutdown_peer_when_drained(sock):
+        peer = peer_for(sock)
+        if read_closed[peer] and not buffers[sock]:
+            shutdown_write(sock)
+
+    def unregister(sock):
+        try:
+            selector.unregister(sock)
+        except (KeyError, ValueError):
+            pass
+
     def update_interest(sock):
+        if read_closed[sock] and (not buffers[sock] or write_shutdown[sock]):
+            unregister(sock)
+            return
+
         events = 0
         peer = peer_for(sock)
-        if len(buffers[peer]) < MAX_TUNNEL_PENDING_BYTES:
+        if not read_closed[sock] and len(buffers[peer]) < MAX_TUNNEL_PENDING_BYTES:
             events |= selectors.EVENT_READ
-        if buffers[sock]:
+        if buffers[sock] and not write_shutdown[sock]:
             events |= selectors.EVENT_WRITE
         if not events:
-            try:
-                selector.unregister(sock)
-            except KeyError:
-                pass
+            unregister(sock)
             return
         try:
             selector.modify(sock, events)
         except KeyError:
-            selector.register(sock, events)
+            try:
+                selector.register(sock, events)
+            except ValueError:
+                read_closed[sock] = True
+                write_shutdown[sock] = True
+        except ValueError:
+            read_closed[sock] = True
+            write_shutdown[sock] = True
 
     update_interest(left_socket)
     update_interest(right_socket)
 
     try:
         while True:
-            for key, events in selector.select(timeout=1.0):
+            if read_closed[left_socket] and read_closed[right_socket] and not buffers[left_socket] and not buffers[right_socket]:
+                return stats
+            if not selector.get_map():
+                return stats
+
+            selected = selector.select(timeout=1.0)
+            if not selected:
+                update_interest(left_socket)
+                update_interest(right_socket)
+                continue
+
+            for key, events in selected:
                 current = key.fileobj
                 if events & selectors.EVENT_READ:
                     try:
                         data = current.recv(BUFFER_SIZE)
-                    except OSError:
-                        return stats
+                    except OSError as exc:
+                        if is_retryable_socket_error(exc):
+                            update_interest(current)
+                            continue
+                        read_closed[current] = True
+                        shutdown_peer_when_drained(peer_for(current))
+                        update_interest(current)
+                        update_interest(peer_for(current))
+                        continue
 
                     if not data:
-                        return stats
+                        read_closed[current] = True
+                        shutdown_peer_when_drained(peer_for(current))
+                        update_interest(current)
+                        update_interest(peer_for(current))
+                        continue
 
                     target = peer_for(current)
                     buffers[target].extend(data)
@@ -433,11 +498,15 @@ def tunnel_bidirectional(left_socket, right_socket):
                 if events & selectors.EVENT_WRITE and buffers[current]:
                     try:
                         sent = current.send(buffers[current])
-                    except OSError:
+                    except OSError as exc:
+                        if is_retryable_socket_error(exc):
+                            update_interest(current)
+                            continue
                         return stats
                     if sent <= 0:
                         return stats
                     del buffers[current][:sent]
+                    shutdown_peer_when_drained(current)
                     update_interest(current)
                     update_interest(peer_for(current))
     finally:
@@ -4046,16 +4115,16 @@ def render_panel_theme_css() -> str:
     return """
     html[data-theme="dark"] {
       color-scheme: dark;
-      --bg: #0b1120;
-      --panel: #182232;
+      --bg: #08111f;
+      --panel: #111827;
       --ink: #e5edf5;
-      --muted: #a8b3c2;
-      --accent: #4fd1c5;
-      --accent-dark: #38bdb2;
-      --accent-soft: #123f44;
-      --warn: #f6c96f;
-      --warn-soft: #3f2f11;
-      --border: #334155;
+      --muted: #a7b3c5;
+      --accent: #5eead4;
+      --accent-dark: #2dd4bf;
+      --accent-soft: #123d3a;
+      --warn: #facc15;
+      --warn-soft: #3a2c08;
+      --border: #263449;
       --shadow: rgba(0, 0, 0, 0.34);
     }
     .theme-toolbar {
@@ -4068,14 +4137,14 @@ def render_panel_theme_css() -> str:
       gap: 4px;
       padding: 4px;
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 10px;
       background: var(--panel);
       box-shadow: 0 8px 24px var(--shadow);
     }
     .theme-switch button {
       min-height: 34px;
       border: 0;
-      border-radius: 9px;
+      border-radius: 8px;
       padding: 7px 10px;
       background: transparent;
       color: var(--muted);
@@ -4091,7 +4160,7 @@ def render_panel_theme_css() -> str:
       color: var(--accent);
     }
     html[data-theme="dark"] body {
-      background: linear-gradient(180deg, #111827 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #0f172a 0%, var(--bg) 100%);
     }
     html[data-theme="dark"] .button.secondary,
     html[data-theme="dark"] .install-button.secondary,
@@ -4108,7 +4177,7 @@ def render_panel_theme_css() -> str:
     html[data-theme="dark"] .steps,
     html[data-theme="dark"] code {
       background: var(--accent-soft);
-      border-color: #25666d;
+      border-color: #1f766e;
       color: var(--ink);
     }
     html[data-theme="dark"] .guide-card,
@@ -4128,7 +4197,7 @@ def render_panel_theme_css() -> str:
     html[data-theme="dark"] .quota-banner,
     html[data-theme="dark"] .note {
       background: var(--accent-soft);
-      border-color: #25666d;
+      border-color: #1f766e;
       color: var(--ink);
     }
     @media (max-width: 575.98px) {
@@ -4185,12 +4254,13 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
   <style>
     :root {{
       color-scheme: light dark;
-      --bg: #f5efe4;
-      --panel: #fffdf8;
-      --ink: #1f2937;
-      --muted: #6b7280;
-      --accent: #b45309;
-      --border: #ead8be;
+      --bg: #eef2f7;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #64748b;
+      --accent: #a16207;
+      --border: #d8e0ea;
+      --shadow: rgba(15, 23, 42, 0.10);
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -4200,18 +4270,16 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
       place-items: center;
       padding: 24px;
       font-family: "Segoe UI", Tahoma, sans-serif;
-      background:
-        radial-gradient(circle at top, rgba(234, 179, 8, 0.18), transparent 38%),
-        linear-gradient(180deg, #f9f5ed 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
       color: var(--ink);
     }}
     .card {{
       width: min(720px, 100%);
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 22px;
+      border-radius: 12px;
       padding: 28px;
-      box-shadow: 0 24px 80px rgba(120, 53, 15, 0.12);
+      box-shadow: 0 20px 50px var(--shadow);
     }}
     h1 {{
       margin: 0 0 10px;
@@ -4232,7 +4300,7 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
       margin: 20px 0;
     }}
     .pill {{
-      background: #fff7ed;
+      background: #f8fafc;
       border: 1px solid var(--border);
       border-radius: 999px;
       padding: 10px 14px;
@@ -4256,8 +4324,8 @@ def render_client_traffic_limit_html(*, client_ip: str, evaluation, destination:
     .note {{
       margin-top: 16px;
       padding: 14px 16px;
-      border-radius: 16px;
-      background: #fffbeb;
+      border-radius: 10px;
+      background: #fef3c7;
       border: 1px solid var(--border);
     }}
 {render_panel_theme_css()}
@@ -4321,10 +4389,10 @@ def render_ca_install_html(snapshot) -> str:
       --bg: #f6f8fb;
       --panel: #ffffff;
       --ink: #172033;
-      --muted: #667085;
+      --muted: #64748b;
       --accent: #0f766e;
       --accent-dark: #0b5f58;
-      --border: #dfe6ef;
+      --border: #d8e0ea;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -4334,16 +4402,16 @@ def render_ca_install_html(snapshot) -> str:
       place-items: center;
       padding: 24px;
       font-family: "Segoe UI", Roboto, Arial, sans-serif;
-      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
       color: var(--ink);
     }}
     main {{
       width: min(980px, 100%);
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 18px;
+      border-radius: 12px;
       padding: 26px;
-      box-shadow: 0 18px 50px rgba(23, 32, 51, 0.10);
+      box-shadow: 0 18px 44px rgba(23, 32, 51, 0.08);
     }}
     h1 {{
       margin: 0 0 10px;
@@ -4386,7 +4454,7 @@ def render_ca_install_html(snapshot) -> str:
     }}
     .pill {{
       padding: 10px 12px;
-      border-radius: 12px;
+      border-radius: 8px;
       background: #eef7f5;
       border: 1px solid #c8e9e4;
       overflow-wrap: anywhere;
@@ -4394,7 +4462,7 @@ def render_ca_install_html(snapshot) -> str:
     .steps {{
       margin-top: 18px;
       padding: 16px;
-      border-radius: 14px;
+      border-radius: 10px;
       background: #fbfcfe;
       border: 1px solid var(--border);
     }}
@@ -4407,7 +4475,7 @@ def render_ca_install_html(snapshot) -> str:
     .guide-card {{
       min-width: 0;
       padding: 14px;
-      border-radius: 14px;
+      border-radius: 8px;
       background: #ffffff;
       border: 1px solid var(--border);
     }}
@@ -4559,9 +4627,9 @@ def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
       --bg: #f6f8fb;
       --panel: #ffffff;
       --ink: #172033;
-      --muted: #667085;
+      --muted: #64748b;
       --accent: #0f766e;
-      --border: #dfe6ef;
+      --border: #d8e0ea;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -4571,16 +4639,16 @@ def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
       place-items: center;
       padding: 24px;
       font-family: "Segoe UI", Roboto, Arial, sans-serif;
-      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
       color: var(--ink);
     }}
     main {{
       width: min(700px, 100%);
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 18px;
+      border-radius: 12px;
       padding: 26px;
-      box-shadow: 0 18px 50px rgba(23, 32, 51, 0.10);
+      box-shadow: 0 18px 44px rgba(23, 32, 51, 0.08);
     }}
     h1 {{
       margin: 0 0 10px;
@@ -4612,7 +4680,7 @@ def render_ca_trust_check_html(snapshot, *, trusted: bool) -> str:
     }}
     .pill {{
       padding: 10px 12px;
-      border-radius: 12px;
+      border-radius: 8px;
       background: #eef7f5;
       border: 1px solid #c8e9e4;
       overflow-wrap: anywhere;
@@ -5396,12 +5464,12 @@ def render_client_portal_html(snapshot) -> str:
       --bg: #f7f8fb;
       --panel: #ffffff;
       --ink: #172033;
-      --muted: #667085;
+      --muted: #64748b;
       --accent: #0f766e;
       --accent-soft: #dff7f2;
       --warn: #b45309;
       --warn-soft: #fff4e5;
-      --border: #e3e7ef;
+      --border: #d8e0ea;
       --shadow: rgba(20, 33, 61, 0.10);
     }}
     *,
@@ -5412,7 +5480,7 @@ def render_client_portal_html(snapshot) -> str:
     body {{
       margin: 0;
       font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
-      background: linear-gradient(180deg, #ffffff 0%, var(--bg) 100%);
+      background: linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
       color: var(--ink);
     }}
     .portal-shell {{
@@ -5451,17 +5519,18 @@ def render_client_portal_html(snapshot) -> str:
       vertical-align: middle;
     }}
     .hero {{
-      background: linear-gradient(135deg, rgba(15, 118, 110, 0.95), rgba(20, 33, 61, 0.92));
-      color: #f8fafc;
-      border-radius: 22px;
-      padding: 28px;
-      box-shadow: 0 26px 60px var(--shadow);
+      background: var(--panel);
+      color: var(--ink);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 20px 50px rgba(20, 33, 61, 0.08);
     }}
     .eyebrow {{
       text-transform: uppercase;
       letter-spacing: 0.12em;
       font-size: 0.78rem;
-      opacity: 0.8;
+      color: var(--muted);
       margin-bottom: 10px;
     }}
     h1 {{
@@ -5473,7 +5542,7 @@ def render_client_portal_html(snapshot) -> str:
       margin: 14px 0 0;
       max-width: 58rem;
       line-height: 1.6;
-      color: rgba(248, 250, 252, 0.9);
+      color: var(--muted);
       overflow-wrap: anywhere;
     }}
     .hero-meta {{
@@ -5488,7 +5557,8 @@ def render_client_portal_html(snapshot) -> str:
       font-size: 0.95rem;
       font-weight: 600;
       background: rgba(255, 255, 255, 0.14);
-      border: 1px solid rgba(255, 255, 255, 0.18);
+      border: 1px solid var(--border);
+      color: var(--ink);
       overflow-wrap: anywhere;
     }}
     .layout {{
@@ -5497,8 +5567,8 @@ def render_client_portal_html(snapshot) -> str:
     .metric-card, .portal-card {{
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: 0 16px 40px rgba(20, 33, 61, 0.06);
+      border-radius: 10px;
+      box-shadow: 0 12px 28px rgba(20, 33, 61, 0.05);
     }}
     .metric-card {{
       padding: 18px 18px 16px;
@@ -5583,7 +5653,7 @@ def render_client_portal_html(snapshot) -> str:
       min-height: 42px;
       width: 100%;
       border: 1px solid var(--border);
-      border-radius: 10px;
+      border-radius: 8px;
       padding: 9px 11px;
       color: var(--ink);
       background: #ffffff;
@@ -5640,7 +5710,7 @@ def render_client_portal_html(snapshot) -> str:
     .quota-banner {{
       margin-bottom: 14px;
       padding: 14px 16px;
-      border-radius: 18px;
+      border-radius: 10px;
       background: { '#fff4e5' if not quota.get('allowed', True) and limit else '#edf7f6' };
       border: 1px solid { '#f1c48a' if not quota.get('allowed', True) and limit else '#c8e9e4' };
       color: { '#9a3412' if not quota.get('allowed', True) and limit else '#115e59' };
@@ -5651,7 +5721,7 @@ def render_client_portal_html(snapshot) -> str:
       margin-top: 18px;
       background: #eef7f5;
       border: 1px solid #c8e9e4;
-      border-radius: 18px;
+      border-radius: 10px;
       padding: 20px;
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -5678,7 +5748,7 @@ def render_client_portal_html(snapshot) -> str:
       justify-content: center;
       min-height: 44px;
       padding: 10px 14px;
-      border-radius: 10px;
+      border-radius: 8px;
       text-decoration: none;
       font-weight: 700;
       border: 1px solid var(--accent);
@@ -5693,7 +5763,7 @@ def render_client_portal_html(snapshot) -> str:
       width: 100%;
       max-width: 100%;
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: 8px;
       overflow-x: auto;
       -webkit-overflow-scrolling: touch;
     }}
@@ -5732,7 +5802,7 @@ def render_client_portal_html(snapshot) -> str:
     }}
     .live-status {{
       margin-top: 12px;
-      color: rgba(248, 250, 252, 0.86);
+      color: var(--muted);
       font-size: 0.95rem;
       font-weight: 600;
     }}

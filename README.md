@@ -166,6 +166,16 @@ Upstream proxy note:
 
 - In the Compose deployment, the backend uses host networking, so a host-side upstream proxy can use `127.0.0.1`.
 - `router-config.json` supports `proxies`, an ordered list of upstream HTTP/SOCKS5 proxies. Existing single-`upstream` configs are normalized into one `upstream-default` proxy for compatibility.
+- On the Arvan gateway, `default_action: direct` means VPS company/direct egress
+  under the gateway firewall policy, not an uncontrolled public fallback. The
+  firewall blocks WireGuard client forwarding to public `eth0`; client egress is
+  expected to leave through the company VPN path.
+- Explicit `proxy` rules are pinned to the local `gh-proxy` upstream on
+  `127.0.0.1:8910`. If that Codespaces-backed upstream is down, the request
+  should fail instead of falling back to another route.
+- VPS deployments keep `auto_proxy_failures.enabled` disabled so temporary
+  direct-failure learning cannot create unexpected proxy routes outside the
+  synced local policy.
 
 HTTPS interception note:
 
@@ -191,6 +201,15 @@ Typical setup:
 
 - `Company VPN` profile: mark selected domains as `Direct`
 - `Home` profile: leave them unmanaged so repeated direct failures can trigger auto-proxy assignment to the first working allowed proxy
+
+Arvan VPS setup:
+
+- the synced `Home+Company` effective profile is the source of explicit proxy
+  rules;
+- existing VPS rules are preserved and missing proxy rules are pinned to
+  `gh-proxy`;
+- company CIDR rules stay direct, and VPS-side auto-proxy creation stays off to
+  avoid fail-open route changes.
 
 ## Dashboard
 
@@ -223,6 +242,7 @@ Client self-service portal:
 
 Current dashboard behaviors:
 
+- The admin dashboard uses a quiet operational layout with desktop side navigation, a compact mobile workflow switcher, unified live/autosave/proxy status cards, and responsive proxy editor cards instead of a wide-only proxy edit table.
 - Router, profile, quota, and exemption changes sync automatically without a Save button
 - The dashboard theme switch supports `System`, `Light`, and `Dark`; the choice is stored per browser and `System` follows the OS color-scheme preference.
 - History can be filtered by client identity or IP, so authenticated clients such as `user:phone` can be reviewed separately from anonymous IP-based clients
@@ -231,7 +251,7 @@ Current dashboard behaviors:
 - Dashboard, Traffic, and recent request tables show timing and throughput from completed requests, including duration, upstream setup time, relay time, upstream retries, and weighted throughput where timing samples exist.
 - Client self-service portal state updates live through WebSocket, with JSON polling only as a fallback if a socket cannot be opened
 - Proxy settings sync automatically. Proxied requests try allowed proxies in priority order and skip proxies that are unavailable, inaccessible to the client, or over quota.
-- The top status strip combines autosave state, live socket state, admin-token entry when needed, active proxy health, reload, and proxy checks.
+- The top status area combines autosave state, live socket state, admin-token entry when needed, active proxy health, reload, and proxy checks.
 - Proxy definitions live in the `Proxies` tab; the `Routing` tab uses those proxies through default actions, rule `proxy_id` pins, priority, and access policy.
 - The `Proxies` tab shows each upstream proxy's rolling global quota state plus per-client rolling usage for the one-hour, three-hour, and seven-day windows.
 - The `Proxies` tab can run a check against every configured proxy and shows the TCP/SOCKS5 result for each row.
@@ -256,7 +276,7 @@ Current dashboard behaviors:
 
 ## Performance Observability
 
-Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time. Usage, failure, and HTTPS analysis JSONL records are queued through a bounded background writer so request threads do not flush every log line synchronously. Dashboard history summaries are cached briefly by filter set and time bucket, while detailed request-history queries remain filterable and bounded.
+Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. The relay handles retryable nonblocking socket states and drains buffered data before half-closing the peer direction, which avoids treating transient backpressure as a completed tunnel. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time. Usage, failure, and HTTPS analysis JSONL records are queued through a bounded background writer so request threads do not flush every log line synchronously. Dashboard history summaries are cached briefly by filter set and time bucket, while detailed request-history queries remain filterable and bounded.
 
 Use these fields when investigating slow traffic:
 
@@ -273,6 +293,7 @@ Diagnosis tips:
 - Compare `direct` and `proxy:*` route rows in the dashboard. If only proxied rows are slow, inspect the upstream proxy/VPN and retry settings first.
 - High `upstream_setup_ms` with low relay time usually points to DNS/connect/TLS/upstream latency.
 - Long `relay_ms` or low `throughput_bps` points to transfer speed, client Wi-Fi, upstream bandwidth, or a long-lived tunnel.
+- Relay fixes in proxy-router do not guarantee large-download reliability when the selected upstream proxy transport truncates or stalls; route large-download domains direct when the upstream is the bottleneck.
 - HTTPS interception can add TLS and body-preview work for matched hosts; use HTTPS throughput mode or an allowlist-only setup when raw CONNECT/SOCKS5 speed matters.
 - `python3 ./proxy-router usage-analyze /tmp/proxy-router-usage.log` prints timing samples from the same JSONL data for offline review.
 

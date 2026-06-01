@@ -1,4 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Activity,
+  BarChart3,
+  CheckCircle2,
+  CircleAlert,
+  Gauge,
+  KeyRound,
+  LockKeyhole,
+  MonitorCog,
+  Moon,
+  Network,
+  Palette,
+  RadioTower,
+  RefreshCcw,
+  Route,
+  ServerCog,
+  ShieldCheck,
+  Sun,
+  Wifi,
+} from 'lucide-react'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
 const ROUTE_TYPES = ['direct', 'proxy', 'self', 'rejected']
@@ -9,12 +29,12 @@ const HISTORY_RANGE_OPTIONS = [
   { value: 'all', label: 'All time' },
 ]
 const TAB_DEFINITIONS = [
-  { id: 'dashboard', label: 'Dashboard' },
-  { id: 'traffic', label: 'Traffic' },
-  { id: 'routing', label: 'Routing' },
-  { id: 'proxies', label: 'Proxies' },
-  { id: 'access', label: 'Access' },
-  { id: 'https', label: 'HTTPS' },
+  { id: 'dashboard', label: 'Dashboard', shortLabel: 'Home', icon: Gauge },
+  { id: 'traffic', label: 'Traffic', shortLabel: 'Traffic', icon: BarChart3 },
+  { id: 'routing', label: 'Routing', shortLabel: 'Routes', icon: Route },
+  { id: 'proxies', label: 'Proxies', shortLabel: 'Proxies', icon: ServerCog },
+  { id: 'access', label: 'Access', shortLabel: 'Access', icon: ShieldCheck },
+  { id: 'https', label: 'HTTPS', shortLabel: 'HTTPS', icon: LockKeyhole },
 ]
 const TAB_HASH_ALIASES = {
   overview: 'dashboard',
@@ -24,12 +44,12 @@ const TAB_HASH_ALIASES = {
   quotas: 'access',
 }
 const WORKFLOW_DESCRIPTIONS = {
-  dashboard: 'Live session summary, recent traffic, and the latest completed request.',
-  traffic: 'History, trends, top destinations, failures, and traffic maintenance.',
-  routing: 'Profiles, routing rules, rule suggestions, and automatic proxy policy.',
-  proxies: 'Upstream proxy health, connection settings, access policy, and proxy quotas.',
-  access: 'Known clients, client blocks, traffic quotas, and admin API tokens.',
-  https: 'HTTPS interception status, certificate setup, and captured HTTPS traffic.',
+  dashboard: 'Live operating view for traffic, routes, clients, and the latest completed request.',
+  traffic: 'History, filters, top destinations, timing, throughput, and failed request review.',
+  routing: 'Profiles, host rules, suggestions, conflicts, retry behavior, and automatic proxy policy.',
+  proxies: 'Upstream proxy health, connection settings, access policy, quotas, and per-client usage.',
+  access: 'Known clients, blocks, proxy authentication, traffic quotas, exemptions, and admin tokens.',
+  https: 'Interception status, certificate setup, adaptive fallback, discovery, and captured traffic.',
 }
 const HTTPS_TRAFFIC_SORT_OPTIONS = ['timestamp', 'status_code', 'method', 'host', 'client', 'total_bytes', 'duration_ms']
 const COMMON_SECOND_LEVEL_DOMAIN_LABELS = new Set([
@@ -71,13 +91,22 @@ const MB_IN_GB = 1024
 const ADMIN_API_TOKEN_STORAGE_KEY = 'proxy-router-admin-api-token'
 const THEME_STORAGE_KEY = 'proxy-router-theme'
 const THEME_OPTIONS = [
-  { value: 'system', label: 'System' },
-  { value: 'light', label: 'Light' },
-  { value: 'dark', label: 'Dark' },
+  { value: 'system', label: 'System', icon: MonitorCog },
+  { value: 'light', label: 'Light', icon: Sun },
+  { value: 'dark', label: 'Dark', icon: Moon },
 ]
 
 function cx(...classes) {
   return classes.filter(Boolean).join(' ')
+}
+
+function IconText({ icon: Icon, children, className }) {
+  return (
+    <span className={cx('inline-flex min-w-0 items-center gap-2', className)}>
+      {Icon ? <Icon aria-hidden="true" className="size-4 shrink-0" strokeWidth={1.9} /> : null}
+      <span className="min-w-0 truncate">{children}</span>
+    </span>
+  )
 }
 
 function getSystemTheme() {
@@ -105,42 +134,43 @@ function getStoredThemePreference() {
 }
 
 const pageClass = [
-  'theme-root min-h-screen bg-[linear-gradient(180deg,var(--pr-page-from)_0%,var(--pr-page-to)_100%)] text-[var(--pr-text)]',
+  'theme-root min-h-screen bg-[radial-gradient(circle_at_16%_-10%,var(--pr-page-glow)_0%,transparent_34%),linear-gradient(180deg,var(--pr-page-from)_0%,var(--pr-page-to)_100%)] text-[var(--pr-text)]',
   "font-['IBM_Plex_Sans','Noto_Sans',sans-serif]",
-  '[&_h1]:text-2xl [&_h1]:leading-tight [&_h1]:font-bold sm:[&_h1]:text-3xl',
+  '[&_h1]:text-2xl [&_h1]:leading-tight [&_h1]:font-semibold sm:[&_h1]:text-3xl',
   '[&_h2]:text-lg [&_h2]:leading-snug [&_h2]:font-bold sm:[&_h2]:text-xl',
   '[&_h3]:text-base [&_h3]:leading-snug [&_h3]:font-bold',
-  '[&_button]:min-h-10 [&_button]:cursor-pointer [&_button]:rounded-[10px] [&_button]:border [&_button]:border-[var(--pr-control-border)] [&_button]:bg-[var(--pr-control-bg)] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[var(--pr-text)]',
+  '[&_button]:min-h-9 [&_button]:cursor-pointer [&_button]:rounded-[8px] [&_button]:border [&_button]:border-[var(--pr-control-border)] [&_button]:bg-[var(--pr-control-bg)] [&_button]:px-3 [&_button]:py-2 [&_button]:text-[var(--pr-text)] [&_button]:shadow-[var(--pr-control-shadow)] [&_button]:transition-colors',
   '[&_button:disabled]:cursor-default [&_button:disabled]:opacity-55',
-  "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[10px] [&_input[type='number']]:border [&_input[type='number']]:border-[var(--pr-input-border)] [&_input[type='number']]:bg-[var(--pr-control-bg)] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2 [&_input[type='number']]:text-[var(--pr-text)]",
-  "[&_input[type='password']]:w-full [&_input[type='password']]:rounded-[10px] [&_input[type='password']]:border [&_input[type='password']]:border-[var(--pr-input-border)] [&_input[type='password']]:bg-[var(--pr-control-bg)] [&_input[type='password']]:px-3 [&_input[type='password']]:py-2 [&_input[type='password']]:text-[var(--pr-text)]",
-  "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[10px] [&_input[type='search']]:border [&_input[type='search']]:border-[var(--pr-input-border)] [&_input[type='search']]:bg-[var(--pr-control-bg)] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2 [&_input[type='search']]:text-[var(--pr-text)]",
-  "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[10px] [&_input[type='text']]:border [&_input[type='text']]:border-[var(--pr-input-border)] [&_input[type='text']]:bg-[var(--pr-control-bg)] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2 [&_input[type='text']]:text-[var(--pr-text)]",
-  '[&_select]:w-full [&_select]:rounded-[10px] [&_select]:border [&_select]:border-[var(--pr-input-border)] [&_select]:bg-[var(--pr-control-bg)] [&_select]:px-3 [&_select]:py-2 [&_select]:text-[var(--pr-text)]',
+  "[&_input[type='number']]:w-full [&_input[type='number']]:rounded-[8px] [&_input[type='number']]:border [&_input[type='number']]:border-[var(--pr-input-border)] [&_input[type='number']]:bg-[var(--pr-control-bg)] [&_input[type='number']]:px-3 [&_input[type='number']]:py-2 [&_input[type='number']]:text-[var(--pr-text)]",
+  "[&_input[type='password']]:w-full [&_input[type='password']]:rounded-[8px] [&_input[type='password']]:border [&_input[type='password']]:border-[var(--pr-input-border)] [&_input[type='password']]:bg-[var(--pr-control-bg)] [&_input[type='password']]:px-3 [&_input[type='password']]:py-2 [&_input[type='password']]:text-[var(--pr-text)]",
+  "[&_input[type='search']]:w-full [&_input[type='search']]:rounded-[8px] [&_input[type='search']]:border [&_input[type='search']]:border-[var(--pr-input-border)] [&_input[type='search']]:bg-[var(--pr-control-bg)] [&_input[type='search']]:px-3 [&_input[type='search']]:py-2 [&_input[type='search']]:text-[var(--pr-text)]",
+  "[&_input[type='text']]:w-full [&_input[type='text']]:rounded-[8px] [&_input[type='text']]:border [&_input[type='text']]:border-[var(--pr-input-border)] [&_input[type='text']]:bg-[var(--pr-control-bg)] [&_input[type='text']]:px-3 [&_input[type='text']]:py-2 [&_input[type='text']]:text-[var(--pr-text)]",
+  '[&_select]:w-full [&_select]:rounded-[8px] [&_select]:border [&_select]:border-[var(--pr-input-border)] [&_select]:bg-[var(--pr-control-bg)] [&_select]:px-3 [&_select]:py-2 [&_select]:text-[var(--pr-text)]',
   '[&_input:disabled]:cursor-not-allowed [&_input:disabled]:opacity-55 [&_select:disabled]:cursor-not-allowed [&_select:disabled]:opacity-55',
 ].join(' ')
-const shellClass = 'mx-auto w-full max-w-[1200px] px-2 py-3 sm:px-4 sm:py-6'
-const heroClass = 'mb-3 flex flex-col items-start gap-2 sm:mb-4 min-[901px]:flex-row min-[901px]:items-end min-[901px]:justify-between'
-const panelClass = 'min-w-0 rounded-xl border border-[var(--pr-panel-border)] bg-[var(--pr-panel)] p-3 shadow-[var(--pr-panel-shadow)] sm:rounded-[18px] sm:p-4'
-const subpanelClass = 'min-w-0 overflow-x-auto rounded-xl border border-[var(--pr-card-border)] bg-[linear-gradient(180deg,var(--pr-surface-strong)_0%,var(--pr-surface-muted)_100%)] p-3 sm:rounded-[14px] sm:p-4'
+const shellClass = 'mx-auto grid w-full max-w-[1440px] grid-cols-1 gap-4 px-3 py-3 sm:px-4 sm:py-5 lg:grid-cols-[270px_minmax(0,1fr)] xl:px-6'
+const heroClass = 'rounded-[10px] border border-[var(--pr-panel-border)] bg-[var(--pr-shell)] p-3 shadow-[var(--pr-panel-shadow)] sm:p-4'
+const panelClass = 'min-w-0 rounded-[10px] border border-[var(--pr-panel-border)] bg-[var(--pr-panel)] p-3 shadow-[var(--pr-panel-shadow)] sm:p-4'
+const subpanelClass = 'min-w-0 overflow-x-auto rounded-[8px] border border-[var(--pr-card-border)] bg-[var(--pr-surface-strong)] p-3 sm:p-4'
 const panelHeaderClass = 'flex flex-wrap items-stretch justify-between gap-3 sm:items-center sm:gap-4'
 const noteClass = 'mt-2 text-sm leading-relaxed text-[var(--pr-muted)]'
 const statusPillClass = 'mt-3 rounded-[8px] border px-3 py-2 text-sm'
 const mutedClass = 'text-[var(--pr-muted)]'
-const pillClass = 'inline-block max-w-full [overflow-wrap:anywhere] rounded-full bg-[var(--pr-accent-soft)] px-3 py-1.5 font-semibold text-[var(--pr-accent)]'
+const pillClass = 'inline-flex max-w-full items-center gap-1.5 [overflow-wrap:anywhere] rounded-full border border-transparent bg-[var(--pr-accent-soft)] px-3 py-1.5 text-sm font-semibold text-[var(--pr-accent)]'
 const warningPillClass = '!bg-[var(--pr-warning-soft)] !text-[var(--pr-warning)]'
 const errorPillClass = '!bg-[var(--pr-error-soft)] !text-[var(--pr-error)]'
 const mutedPillClass = '!bg-[var(--pr-muted-soft)] !text-[var(--pr-muted)]'
-const gridClass = 'grid grid-cols-12 gap-4'
-const cardGridClass = 'col-span-full grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(150px,1fr))] sm:gap-3'
-const cardClass = 'min-w-0 rounded-[10px] border border-[var(--pr-card-border)] bg-[linear-gradient(180deg,var(--pr-surface-strong)_0%,var(--pr-surface-muted)_100%)] p-3 sm:rounded-[14px] sm:p-4'
-const cardLabelClass = 'text-xs text-[var(--pr-muted)] sm:text-sm'
-const cardValueClass = 'mt-1 [overflow-wrap:anywhere] text-base leading-tight font-bold sm:text-xl'
+const gridClass = 'grid grid-cols-12 gap-3 sm:gap-4'
+const cardGridClass = 'col-span-full grid grid-cols-1 gap-2 min-[361px]:grid-cols-2 sm:grid-cols-[repeat(auto-fit,minmax(145px,1fr))] sm:gap-3'
+const cardClass = 'min-w-0 rounded-[8px] border border-[var(--pr-card-border)] bg-[var(--pr-surface-strong)] p-3 shadow-[var(--pr-card-shadow)]'
+const cardLabelClass = 'text-xs font-medium text-[var(--pr-muted)] sm:text-sm'
+const cardValueClass = 'mt-1 [overflow-wrap:anywhere] text-base leading-tight font-semibold sm:text-lg'
 const tableWrapClass = [
-  '-mx-1 w-full overflow-x-auto px-1 pb-1 [-webkit-overflow-scrolling:touch]',
+  'w-full overflow-x-auto rounded-[8px] border border-[var(--pr-table-border)] bg-[var(--pr-table-bg)] [-webkit-overflow-scrolling:touch]',
   '[&_table]:w-full [&_table]:border-collapse [&_table]:text-sm max-sm:[&_table]:min-w-[42rem] sm:[&_table]:text-[0.95rem]',
-  '[&_th]:border-b [&_th]:border-[var(--pr-table-border)] [&_th]:px-2 [&_th]:py-2 [&_th]:text-left [&_th]:align-top [&_th]:text-xs [&_th]:font-semibold [&_th]:tracking-[0.05em] [&_th]:text-[var(--pr-muted)] [&_th]:uppercase',
-  '[&_td]:border-b [&_td]:border-[var(--pr-table-border)] [&_td]:px-2 [&_td]:py-2 [&_td]:align-top',
+  '[&_th]:border-b [&_th]:border-[var(--pr-table-border)] [&_th]:bg-[var(--pr-table-head)] [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:align-top [&_th]:text-[0.72rem] [&_th]:font-semibold [&_th]:tracking-[0.05em] [&_th]:text-[var(--pr-muted)] [&_th]:uppercase',
+  '[&_td]:border-b [&_td]:border-[var(--pr-table-border)] [&_td]:px-3 [&_td]:py-2.5 [&_td]:align-top',
+  '[&_tbody_tr:last-child_td]:border-b-0',
 ].join(' ')
 const controlClass = 'flex min-w-0 flex-col gap-1 text-sm text-[var(--pr-muted)] sm:min-w-36'
 const controlsClass = 'mt-3 mb-1 grid grid-cols-1 gap-3 sm:flex sm:flex-wrap'
@@ -153,15 +183,15 @@ const primaryButtonClass = '!border-[var(--pr-accent)] !bg-[var(--pr-accent)] !t
 const dirtyInputClass = '!border-[var(--pr-accent)] shadow-[0_0_0_3px_var(--pr-focus-ring)]'
 const readOnlyInputClass = 'opacity-70'
 const chipListClass = 'mt-3 flex flex-wrap gap-2'
-const chipClass = 'inline-flex max-w-full items-center gap-2 [overflow-wrap:anywhere] rounded-full border border-[var(--pr-chip-border)] bg-[var(--pr-surface-strong)] px-3 py-1.5 text-sm'
+const chipClass = 'inline-flex max-w-full items-center gap-2 [overflow-wrap:anywhere] rounded-full border border-[var(--pr-chip-border)] bg-[var(--pr-chip-bg)] px-3 py-1.5 text-sm'
 const chipButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !font-bold !text-[var(--pr-warning)]'
 const ruleActionsClass = 'flex flex-wrap gap-2 max-sm:flex-col max-sm:items-stretch max-sm:[&_button]:w-full max-sm:[&_button]:whitespace-nowrap'
 const rulePillClass = 'inline-flex items-center rounded-full border border-[var(--pr-rule-border)] bg-[var(--pr-rule-bg)] px-2 py-1 text-xs font-bold text-[var(--pr-rule-text)]'
 const autoRulePillClass = '!border-[var(--pr-accent-border)] !bg-[var(--pr-accent-soft)] !text-[var(--pr-accent)]'
 const ruleMetaClass = 'flex flex-col gap-1 text-sm'
 const sortableHeaderButtonClass = '!min-h-0 !border-0 !bg-transparent !p-0 !text-left !text-xs !font-semibold !tracking-[0.05em] !text-[var(--pr-muted)] !uppercase'
-const themeSwitchClass = 'flex rounded-[10px] border border-[var(--pr-control-border)] bg-[var(--pr-segment-bg)] p-1'
-const themeButtonClass = 'theme-choice-button !min-h-0 !border-0 !px-2 !py-1 !text-xs sm:!px-3'
+const themeSwitchClass = 'grid grid-cols-3 rounded-[8px] border border-[var(--pr-control-border)] bg-[var(--pr-segment-bg)] p-1'
+const themeButtonClass = 'theme-choice-button !min-h-0 !border-0 !px-2 !py-1.5 !text-xs !shadow-none sm:!px-3'
 
 function compareNumbers(left, right, direction) {
   const leftValue = Number(left || 0)
@@ -1956,7 +1986,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
       label: 'No proxies configured',
       message: 'Add an upstream proxy before routed traffic can use one.',
       pillClassName: cx(pillClass, mutedPillClass),
-      dotClassName: 'bg-[#8b8173]',
+      dotClassName: 'bg-[var(--pr-muted)]',
     }
   }
 
@@ -1965,7 +1995,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
       label: 'No proxies enabled',
       message: `${proxies.length} upstream proxy definition${proxies.length === 1 ? '' : 's'} configured, all disabled.`,
       pillClassName: cx(pillClass, warningPillClass),
-      dotClassName: 'bg-[#9b6b00]',
+      dotClassName: 'bg-[var(--pr-warning)]',
     }
   }
 
@@ -1974,7 +2004,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
       label: 'Checking proxy connections',
       message: `Testing ${configuredProxies.length} enabled upstream prox${configuredProxies.length === 1 ? 'y' : 'ies'}.`,
       pillClassName: cx(pillClass, warningPillClass),
-      dotClassName: 'bg-[#9b6b00]',
+      dotClassName: 'bg-[var(--pr-warning)]',
     }
   }
 
@@ -2004,7 +2034,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
         messageParts.concat(reachableNames ? [`Reachable: ${reachableNames}`] : []).join(' · ') ||
         'At least one enabled upstream proxy is reachable.',
       pillClassName: pillClass,
-      dotClassName: 'bg-[#116466]',
+      dotClassName: 'bg-[var(--pr-success-text)]',
     }
   }
 
@@ -2015,7 +2045,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
         messageParts.concat(`${failedResults.length} checked prox${failedResults.length === 1 ? 'y' : 'ies'} failed`).join(' · ') ||
         'The latest proxy check did not find a reachable enabled upstream proxy.',
       pillClassName: cx(pillClass, errorPillClass),
-      dotClassName: 'bg-[#a33a2c]',
+      dotClassName: 'bg-[var(--pr-error)]',
     }
   }
 
@@ -2025,7 +2055,7 @@ function buildProxyConnectionStatus(config, proxyCheckResults, isChecking, proxy
       messageParts.join(' · ') ||
       `Check ${configuredProxies.length} enabled upstream prox${configuredProxies.length === 1 ? 'y' : 'ies'} to confirm connectivity.`,
     pillClassName: cx(pillClass, proxyCheckError ? warningPillClass : mutedPillClass),
-    dotClassName: proxyCheckError ? 'bg-[#9b6b00]' : 'bg-[#8b8173]',
+    dotClassName: proxyCheckError ? 'bg-[var(--pr-warning)]' : 'bg-[var(--pr-muted)]',
   }
 }
 
@@ -2925,6 +2955,29 @@ function App() {
     )
   }, [currentRouterConfig, dashboardSnapshot, proxyCheckResults, isCheckingProxies, proxyCheckError])
   const httpsInterceptionStatus = currentHttpsInterceptionStatus(dashboardSnapshot)
+  const activeWorkflow = TAB_DEFINITIONS.find((tab) => tab.id === activeTab) || TAB_DEFINITIONS[0]
+  const SummaryIcon = activeWorkflow.icon || Gauge
+  const statusCards = [
+    {
+      label: 'Autosave',
+      value: routerStatus.text,
+      icon: routerStatus.warning ? CircleAlert : CheckCircle2,
+      warning: routerStatus.warning,
+    },
+    {
+      label: 'Proxy health',
+      value: proxyConnectionStatus.label,
+      detail: proxyConnectionStatus.message,
+      icon: Network,
+      warning: proxyConnectionStatus.pillClassName.includes('warning') || proxyConnectionStatus.label.includes('No '),
+    },
+    {
+      label: 'Live state',
+      value: status.text,
+      icon: status.warning ? CircleAlert : RadioTower,
+      warning: status.warning,
+    },
+  ]
   const routerSummaryItems = useMemo(
     () =>
       buildRouterSummaryItems(
@@ -4855,113 +4908,180 @@ function App() {
     }
   }
 
-  const activeWorkflow = TAB_DEFINITIONS.find((tab) => tab.id === activeTab) || TAB_DEFINITIONS[0]
-
   return (
     <main className={pageClass} data-theme={resolvedTheme} style={{ colorScheme: resolvedTheme }}>
       <div className={shellClass}>
-      <section className={heroClass}>
-        <div>
-          <h1>proxy-router dashboard</h1>
-          <p>{WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}</p>
-        </div>
-        <div className="flex w-full flex-col items-stretch gap-2 sm:w-auto sm:flex-row sm:items-center sm:justify-end sm:flex-wrap">
-          <div className={themeSwitchClass} aria-label="Theme">
-            {THEME_OPTIONS.map((item) => (
+        <aside className="hidden min-h-[calc(100vh-2.5rem)] self-start rounded-[10px] border border-[var(--pr-panel-border)] bg-[var(--pr-shell)] p-3 shadow-[var(--pr-panel-shadow)] lg:sticky lg:top-5 lg:block">
+          <div className="flex items-center gap-3 border-b border-[var(--pr-panel-border)] pb-4">
+            <div className="flex size-10 items-center justify-center rounded-[8px] bg-[var(--pr-accent-soft)] text-[var(--pr-accent)]">
+              <Network aria-hidden="true" className="size-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-semibold tracking-[0.08em] text-[var(--pr-muted)] uppercase">proxy-router</div>
+              <div className="truncate text-sm font-semibold">Control plane</div>
+            </div>
+          </div>
+          <nav className="mt-4 grid gap-1" aria-label="Admin workflows">
+            {TAB_DEFINITIONS.map((tab) => (
               <button
-                key={item.value}
-                className={themeButtonClass}
+                key={tab.id}
+                className={cx(
+                  '!justify-start !border-transparent !bg-transparent !shadow-none hover:!bg-[var(--pr-surface-muted)]',
+                  activeTab === tab.id && '!border-[var(--pr-accent-border)] !bg-[var(--pr-accent-soft)] !text-[var(--pr-accent)]',
+                )}
                 type="button"
-                aria-pressed={themePreference === item.value ? 'true' : 'false'}
-                onClick={() => setThemePreference(item.value)}
+                aria-current={activeTab === tab.id ? 'page' : undefined}
+                aria-pressed={activeTab === tab.id ? 'true' : 'false'}
+                onClick={() => setActiveTab(tab.id)}
               >
-                {item.label}
+                <IconText icon={tab.icon}>{tab.label}</IconText>
               </button>
             ))}
-          </div>
-        </div>
-      </section>
-
-      <section className={cx(panelClass, 'mb-3')} aria-live="polite">
-        <div className="grid grid-cols-1 gap-3 min-[860px]:grid-cols-[1fr_1fr_auto] min-[860px]:items-center">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">Autosave</div>
-            <div className={cx(pillClass, 'mt-1', routerStatus.warning && warningPillClass)}>{routerStatus.text}</div>
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <span
-                className={cx('inline-block h-3 w-3 shrink-0 rounded-full', proxyConnectionStatus.dotClassName)}
-                aria-hidden="true"
-              />
-              <span className="text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">Proxy</span>
-              <span className={proxyConnectionStatus.pillClassName}>{proxyConnectionStatus.label}</span>
+          </nav>
+          <div className="mt-5 border-t border-[var(--pr-panel-border)] pt-4">
+            <div className="mb-2 flex items-center gap-2 text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">
+              <Palette aria-hidden="true" className="size-3.5" />
+              Theme
             </div>
-            <div className="mt-1 text-sm leading-relaxed text-[var(--pr-muted)]">{proxyConnectionStatus.message}</div>
+            <div className={themeSwitchClass} aria-label="Theme">
+              {THEME_OPTIONS.map((item) => (
+                <button
+                  key={item.value}
+                  className={themeButtonClass}
+                  type="button"
+                  aria-pressed={themePreference === item.value ? 'true' : 'false'}
+                  title={item.label}
+                  onClick={() => setThemePreference(item.value)}
+                >
+                  <IconText icon={item.icon}>{item.label}</IconText>
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2 min-[860px]:justify-end">
-            <div className={cx(pillClass, status.warning && warningPillClass)}>{status.text}</div>
-            <button
-              type="button"
-              disabled={isSavingRouter}
-              onClick={() => {
-                loadRouterConfig({ showStatus: true }).catch((error) => {
-                  setRouterStatusOverride({
-                    text: `Reload failed: ${error.message}`,
-                    warning: true,
-                  })
-                })
-              }}
-            >
-              Reload
-            </button>
-            <button
-              type="button"
-              onClick={() => triggerAllProxyChecks()}
-              disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
-            >
-              {isCheckingProxies ? 'Checking...' : 'Check proxies'}
-            </button>
-          </div>
-        </div>
-        {adminApiStatus.requires_auth ? (
-          <label className={cx(fieldClass, 'mt-3 max-w-[28rem]')}>
-            <span>Admin API token</span>
-            <input
-              type="password"
-              value={adminApiToken}
-              onChange={(event) => updateAdminApiToken(event.target.value)}
-              placeholder="Paste token to enable autosave"
-              autoComplete="off"
-            />
-          </label>
-        ) : null}
-      </section>
+        </aside>
 
-      <section className="sticky top-0 z-20 -mx-2 mb-3 border-y border-[var(--pr-panel-border)] bg-[var(--pr-page-to)] px-2 py-2 sm:static sm:-mx-0 sm:mb-4 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
-        <div className="flex gap-2 overflow-x-auto pb-1 [-webkit-overflow-scrolling:touch]" aria-label="Admin workflows">
-          {TAB_DEFINITIONS.map((tab) => (
-            <button
-              key={tab.id}
-              className={cx(
-                'shrink-0 rounded-full px-3 py-2 text-sm whitespace-nowrap sm:px-4',
-                activeTab === tab.id && primaryButtonClass,
-              )}
-              type="button"
-              aria-current={activeTab === tab.id ? 'page' : undefined}
-              aria-pressed={activeTab === tab.id ? 'true' : 'false'}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      </section>
+        <div className="min-w-0">
+          <section className={heroClass}>
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+              <div className="min-w-0">
+                <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-[var(--pr-muted-soft)] px-3 py-1 text-xs font-semibold tracking-[0.08em] text-[var(--pr-muted)] uppercase">
+                  <Activity aria-hidden="true" className="size-3.5" />
+                  Operations dashboard
+                </div>
+                <h1>proxy-router dashboard</h1>
+                <p className="mt-1 max-w-3xl text-sm leading-relaxed text-[var(--pr-muted)] sm:text-base">
+                  {WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}
+                </p>
+              </div>
+              <div className="grid w-full gap-2 sm:grid-cols-[1fr_auto_auto] xl:w-auto xl:min-w-[34rem]">
+                <div className={cx(pillClass, status.warning && warningPillClass)}>
+                  <IconText icon={status.warning ? CircleAlert : RadioTower}>{status.text}</IconText>
+                </div>
+                <button
+                  type="button"
+                  disabled={isSavingRouter}
+                  onClick={() => {
+                    loadRouterConfig({ showStatus: true }).catch((error) => {
+                      setRouterStatusOverride({
+                        text: `Reload failed: ${error.message}`,
+                        warning: true,
+                      })
+                    })
+                  }}
+                >
+                  <IconText icon={RefreshCcw}>Reload</IconText>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => triggerAllProxyChecks()}
+                  disabled={isCheckingProxies || !currentRouterConfig.proxies.length}
+                >
+                  <IconText icon={Wifi}>{isCheckingProxies ? 'Checking...' : 'Check proxies'}</IconText>
+                </button>
+              </div>
+            </div>
 
-      <section className="mb-3">
-        <h2>{activeWorkflow.label}</h2>
-        <div className={noteClass}>{WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}</div>
-      </section>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3" aria-live="polite">
+              {statusCards.map((item) => (
+                <div
+                  className={cx(
+                    'min-w-0 rounded-[8px] border border-[var(--pr-card-border)] bg-[var(--pr-surface-strong)] p-3',
+                    item.warning && 'border-[var(--pr-warning-border)] bg-[var(--pr-warning-soft)]',
+                  )}
+                  key={item.label}
+                >
+                  <div className="text-xs font-semibold tracking-[0.05em] text-[var(--pr-muted)] uppercase">
+                    <IconText icon={item.icon}>{item.label}</IconText>
+                  </div>
+                  <div className="mt-1 break-words text-sm font-semibold">{item.value}</div>
+                  {item.detail ? <div className="mt-1 text-xs leading-relaxed text-[var(--pr-muted)]">{item.detail}</div> : null}
+                </div>
+              ))}
+            </div>
+
+            {adminApiStatus.requires_auth ? (
+              <label className={cx(fieldClass, 'mt-3 max-w-[34rem]')}>
+                <span>Admin API token</span>
+                <div className="grid gap-2 sm:grid-cols-[1fr_auto] sm:items-center">
+                  <input
+                    type="password"
+                    value={adminApiToken}
+                    onChange={(event) => updateAdminApiToken(event.target.value)}
+                    placeholder="Paste token to enable autosave"
+                    autoComplete="off"
+                  />
+                  <span className={cx(pillClass, warningPillClass)}>
+                    <IconText icon={KeyRound}>Token required</IconText>
+                  </span>
+                </div>
+              </label>
+            ) : null}
+          </section>
+
+          <section className="sticky top-0 z-20 -mx-3 mt-3 border-y border-[var(--pr-panel-border)] bg-[var(--pr-page-to)] px-3 py-2 lg:hidden">
+            <div className="grid grid-cols-3 gap-2 min-[460px]:grid-cols-6" aria-label="Admin workflows">
+              {TAB_DEFINITIONS.map((tab) => (
+                <button
+                  key={tab.id}
+                  className={cx(
+                    '!min-h-11 !px-2 !text-sm',
+                    activeTab === tab.id && primaryButtonClass,
+                  )}
+                  type="button"
+                  aria-current={activeTab === tab.id ? 'page' : undefined}
+                  aria-pressed={activeTab === tab.id ? 'true' : 'false'}
+                  onClick={() => setActiveTab(tab.id)}
+                >
+                  <IconText icon={tab.icon} className="justify-center">{tab.shortLabel || tab.label}</IconText>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="mt-3 mb-3 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <div className="mb-2 inline-flex size-9 items-center justify-center rounded-[8px] bg-[var(--pr-accent-soft)] text-[var(--pr-accent)]">
+                <SummaryIcon aria-hidden="true" className="size-5" />
+              </div>
+              <h2>{activeWorkflow.label}</h2>
+              <div className={noteClass}>{WORKFLOW_DESCRIPTIONS[activeTab] || WORKFLOW_DESCRIPTIONS.dashboard}</div>
+            </div>
+            <div className="lg:hidden">
+              <div className={themeSwitchClass} aria-label="Theme">
+                {THEME_OPTIONS.map((item) => (
+                  <button
+                    key={item.value}
+                    className={themeButtonClass}
+                    type="button"
+                    aria-pressed={themePreference === item.value ? 'true' : 'false'}
+                    onClick={() => setThemePreference(item.value)}
+                  >
+                    <IconText icon={item.icon}>{item.label}</IconText>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
 
       {activeTab === 'dashboard' ? (
         <section className="block">
@@ -5403,7 +5523,7 @@ function App() {
                   </button>
                 </div>
               </div>
-              <div className="mt-3 grid grid-cols-1 gap-3 lg:hidden">
+              <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-2">
                 {currentRouterConfig.proxies.length ? (
                   currentRouterConfig.proxies.map((proxy, index) => {
                     const quota = (dashboardSnapshot.proxy_quota_status || {})[proxy.id] || {}
@@ -5606,7 +5726,7 @@ function App() {
                   <div className="pt-2 text-[var(--pr-muted)]">No upstream proxies yet.</div>
                 )}
               </div>
-              <div className={cx(tableWrapClass, 'max-lg:hidden [&_td]:align-middle [&_input]:text-sm [&_select]:text-sm')}>
+              <div className={cx(tableWrapClass, 'hidden [&_td]:align-middle [&_input]:text-sm [&_select]:text-sm')}>
                 <table className="min-w-[128rem] table-fixed">
                   <colgroup>
                     <col className="w-[5.5rem]" />
@@ -8361,6 +8481,7 @@ function App() {
           </section>
         </section>
       ) : null}
+        </div>
       </div>
     </main>
   )

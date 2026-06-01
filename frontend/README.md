@@ -14,6 +14,10 @@ npm run dev
 The Vite dev server proxies `/api/*` to `http://127.0.0.1:8798` by default.
 It also proxies the dashboard WebSocket on `/api/live`.
 
+The dashboard is an operational control surface: desktop uses side navigation,
+mobile uses a compact workflow switcher, and status cards stay focused on live
+state, autosave, proxy health, and route checks.
+
 Override the backend origin if needed:
 
 ```bash
