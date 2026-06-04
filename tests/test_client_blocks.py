@@ -105,6 +105,46 @@ class ClientBlockTests(unittest.TestCase):
         self.assertEqual(clients["user:phone"]["source_ips"], ["192.168.1.20"])
         self.assertEqual(clients["user:phone"]["active_connections"], 1)
 
+    def test_build_known_clients_merges_vpn_presence_for_configured_users(self):
+        snapshot = {
+            "totals_by_client": [],
+            "active_by_client": {},
+            "identity_by_client_ip": {},
+            "recent_requests": [],
+            "recent_failures": [],
+        }
+        router_config_snapshot = normalize_router_config(
+            {
+                "client_auth": {
+                    "credentials": [
+                        {"username": "phone", "password": "secret", "label": "Android phone"},
+                    ]
+                }
+            }
+        )
+        presence = {
+            "clients": {
+                "user:phone": {
+                    "state": "offline",
+                    "vpn_ip": "10.77.0.4",
+                    "last_activity_at": "2026-06-05T09:00:00+00:00",
+                    "last_handshake_at": "2026-06-05T08:58:00+00:00",
+                    "active_gateway_sessions": 0,
+                    "terminated_session_count": 2,
+                    "offline_reason": "wireguard_inactive",
+                }
+            }
+        }
+
+        rows = build_known_client_rows(snapshot, router_config_snapshot, presence)
+        phone = {row["client"]: row for row in rows}["user:phone"]
+
+        self.assertEqual(phone["presence_state"], "offline")
+        self.assertEqual(phone["presence_vpn_ip"], "10.77.0.4")
+        self.assertEqual(phone["source_ips"], ["10.77.0.4"])
+        self.assertEqual(phone["terminated_gateway_sessions"], 2)
+        self.assertEqual(phone["presence_offline_reason"], "wireguard_inactive")
+
     def test_build_known_clients_excludes_historical_users_not_in_current_credentials(self):
         snapshot = {
             "totals_by_client": [

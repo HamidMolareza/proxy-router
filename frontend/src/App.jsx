@@ -1731,15 +1731,34 @@ function formatUserLastSeen(value, nowMs, activeConnections) {
   const parsed = parseDateText(value)
   if (!parsed) {
     return {
-      primary: Number(activeConnections || 0) > 0 ? 'Online now' : 'Waiting for first activity',
+      primary: Number(activeConnections || 0) > 0 ? 'Active request open' : 'Waiting for first activity',
       secondary: '',
     }
   }
   const elapsedSeconds = Math.max(0, Math.floor((nowMs - parsed.getTime()) / 1000))
   return {
-    primary: Number(activeConnections || 0) > 0 ? 'Online now' : formatRelativeElapsed(elapsedSeconds),
+    primary: Number(activeConnections || 0) > 0 ? 'Active request open' : formatRelativeElapsed(elapsedSeconds),
     secondary: parsed.toLocaleString(),
   }
+}
+
+function formatVpnPresence(row) {
+  const state = String(row.presence_state || '').trim().toLowerCase()
+  if (!state) {
+    return ''
+  }
+  if (state === 'online') {
+    return row.presence_last_activity_at
+      ? `VPN online since ${formatStatusDateTime(row.presence_last_activity_at)}`
+      : 'VPN online'
+  }
+  if (state === 'offline') {
+    const reason = row.presence_offline_reason ? `: ${String(row.presence_offline_reason).replaceAll('_', ' ')}` : ''
+    return row.presence_last_activity_at
+      ? `VPN offline${reason}; last activity ${formatStatusDateTime(row.presence_last_activity_at)}`
+      : `VPN offline${reason}`
+  }
+  return 'VPN status unknown'
 }
 
 function formatDurationMs(value) {
@@ -7351,7 +7370,8 @@ function App() {
                         <tbody>
                           {usersTableRows.map((item) => {
                             const { activeConnections, blockDuration, blockStatus, kindLabel, row } = item
-                            const activeClient = activeConnections > 0
+                            const vpnPresence = formatVpnPresence(row)
+                            const activeClient = activeConnections > 0 || row.presence_state === 'online'
                             const lastSeen = formatUserLastSeen(row.last_seen_at, nowMs, activeConnections)
                             return (
                               <tr className={cx(activeClient && 'bg-[#eef8f3] text-[#115e59]')} key={row.client}>
@@ -7370,6 +7390,10 @@ function App() {
                                     ) : null}
                                     {Array.isArray(row.proxy_types) && row.proxy_types.length ? (
                                       <small>{`proxy types: ${row.proxy_types.join(', ')}`}</small>
+                                    ) : null}
+                                    {vpnPresence ? <small>{vpnPresence}</small> : null}
+                                    {Number(row.active_gateway_sessions || 0) > 0 ? (
+                                      <small>{`gateway sessions: ${row.active_gateway_sessions}`}</small>
                                     ) : null}
                                     {row.configured ? (
                                       <small>

@@ -218,6 +218,10 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help=f"Router config file path used by the dashboard API. Default: {DEFAULT_ROUTER_CONFIG_PATH}",
     )
     parser.add_argument(
+        "--client-presence-file",
+        help="Optional JSON file with external VPN/client presence state for dashboard Access rows.",
+    )
+    parser.add_argument(
         "--dashboard-bind",
         default=DASHBOARD_DEFAULT_BIND,
         help=f"Bind address for the dashboard API server. Default: {DASHBOARD_DEFAULT_BIND}",
@@ -634,6 +638,7 @@ def main():
     https_traffic_log_path = resolve_https_traffic_log_path(args.https_traffic_log_file)
     error_log_path = resolve_error_log_path(args.error_log_file)
     router_config_path = resolve_router_config_path(args.router_config_file)
+    client_presence_path = Path(args.client_presence_file).expanduser() if args.client_presence_file else None
     https_intercept_ca_cert_path = resolve_https_intercept_ca_cert_path(args.https_intercept_ca_cert_file)
     https_intercept_ca_key_path = resolve_https_intercept_ca_key_path(args.https_intercept_ca_key_file)
     https_intercept_cert_cache_dir = resolve_https_intercept_cert_cache_dir(args.https_intercept_cert_cache_dir)
@@ -689,6 +694,7 @@ def main():
         raise SystemExit(f"Error: could not open HTTPS traffic log file '{https_traffic_log_path}': {exc}") from exc
 
     runtime.configure_traffic_quota_manager(usage_log_path)
+    runtime.configure_client_presence_file(client_presence_path)
     runtime.rehydrate_dashboard_state()
 
     try:

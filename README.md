@@ -153,6 +153,12 @@ recreates the `proxy-router` backend service plus the `proxy-router-dashboard`
 frontend service. Runtime state under `/opt/arvan-vps-gateway/data/proxy-router`
 is preserved.
 
+The Arvan transparent gateway can write WireGuard client presence to
+`/data/vpn-client-presence.json`, which proxy-router reads with
+`--client-presence-file`. The Access workflow then shows VPN presence separately
+from active proxy requests, and stale gateway sessions can be closed when a peer
+goes inactive.
+
 Defaults can be overridden with environment variables:
 
 ```bash
@@ -262,6 +268,7 @@ Current dashboard behaviors:
 - Intercepted HTTPS `403 Forbidden` responses on otherwise direct, unmanaged hosts are retried through allowed upstream proxies when auto-proxy is available; a proxy rule is added only if that retry succeeds
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The `Access` workflow can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
+- When a gateway supplies `--client-presence-file`, the `Access` workflow shows VPN online/offline state separately from active proxy request counts.
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests. The retry policy also controls the setup timeout used while opening each destination or upstream connection.

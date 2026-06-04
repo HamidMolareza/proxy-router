@@ -333,6 +333,57 @@ class DashboardState:
         return build_failure_snapshot_from_records(recent_failures, router_config_snapshot)
 
 
+class ClientPresenceStore:
+    def __init__(self):
+        self._path: Path | None = None
+
+    def configure(self, presence_file: Path | None):
+        self._path = presence_file
+
+    def snapshot(self):
+        if self._path is None:
+            return {}
+        def safe_int(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        clients = payload.get("clients")
+        if not isinstance(clients, dict):
+            return {}
+        normalized_clients = {}
+        for raw_client, raw_state in clients.items():
+            client = str(raw_client or "").strip()
+            if not client or not isinstance(raw_state, dict):
+                continue
+            state = str(raw_state.get("state") or "unknown").strip().lower()
+            if state not in {"online", "offline", "unknown"}:
+                state = "unknown"
+            normalized_clients[client] = {
+                "state": state,
+                "vpn_ip": str(raw_state.get("vpn_ip") or "").strip(),
+                "last_activity_at": str(raw_state.get("last_activity_at") or "").strip() or None,
+                "last_handshake_at": str(raw_state.get("last_handshake_at") or "").strip() or None,
+                "active_gateway_sessions": safe_int(raw_state.get("active_gateway_sessions")),
+                "terminated_session_count": safe_int(raw_state.get("terminated_session_count")),
+                "offline_reason": str(raw_state.get("offline_reason") or "").strip() or None,
+            }
+        return {
+            "version": safe_int(payload.get("version")) or 1,
+            "generated_at": str(payload.get("generated_at") or "").strip() or None,
+            "source": str(payload.get("source") or "").strip() or None,
+            "clients": normalized_clients,
+        }
+
+
 class DashboardLiveUpdateHub:
     def __init__(self):
         self._lock = threading.Lock()
@@ -1275,6 +1326,7 @@ class SelfEndpoints:
 class AppRuntime:
     def __init__(self):
         self.dashboard_state = DashboardState()
+        self.client_presence = ClientPresenceStore()
         self.live_updates = DashboardLiveUpdateHub()
         self.usage_log_path: Path | None = None
         self.failure_log_path: Path | None = None
@@ -1310,6 +1362,9 @@ class AppRuntime:
         self.https_traffic_logger.close()
         self.https_traffic_log_path = log_file
         self.https_traffic_logger = HttpsTrafficLogger(log_file)
+
+    def configure_client_presence_file(self, presence_file: Path | None):
+        self.client_presence.configure(presence_file)
 
     def configure_traffic_quota_manager(self, log_file: Path | None):
         self.traffic_quota_manager = TrafficQuotaManager()

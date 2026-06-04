@@ -94,8 +94,20 @@ def build_client_quota_group_rows(snapshot, runtime, router_config_snapshot, rou
     return rows
 
 
-def build_known_client_rows(snapshot, router_config_snapshot):
+def build_known_client_rows(snapshot, router_config_snapshot, client_presence_snapshot=None):
     rows_by_client = {}
+    presence_by_client = (
+        (client_presence_snapshot or {}).get("clients", {})
+        if isinstance(client_presence_snapshot, dict)
+        else {}
+    )
+
+    def safe_int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     configured_user_ids = {
         client_identity_from_username(credential.get("username"))
         for credential in (router_config_snapshot.get("client_auth") or {}).get("credentials", [])
@@ -131,6 +143,13 @@ def build_known_client_rows(snapshot, router_config_snapshot):
                 "uploaded_bytes": 0,
                 "downloaded_bytes": 0,
                 "last_seen_at": None,
+                "presence_state": None,
+                "presence_vpn_ip": "",
+                "presence_last_activity_at": None,
+                "presence_last_handshake_at": None,
+                "presence_offline_reason": None,
+                "active_gateway_sessions": 0,
+                "terminated_gateway_sessions": 0,
             }
             rows_by_client[normalized_client] = row
         return row
@@ -177,6 +196,20 @@ def build_known_client_rows(snapshot, router_config_snapshot):
         row = ensure_row(mapped_client)
         if row is not None and client_ip and client_ip != mapped_client:
             row["source_ips"].add(str(client_ip))
+
+    for client, presence in presence_by_client.items():
+        row = ensure_row(client)
+        if row is None or not isinstance(presence, dict):
+            continue
+        row["presence_state"] = presence.get("state")
+        row["presence_vpn_ip"] = str(presence.get("vpn_ip") or "").strip()
+        row["presence_last_activity_at"] = presence.get("last_activity_at")
+        row["presence_last_handshake_at"] = presence.get("last_handshake_at")
+        row["presence_offline_reason"] = presence.get("offline_reason")
+        row["active_gateway_sessions"] = safe_int(presence.get("active_gateway_sessions"))
+        row["terminated_gateway_sessions"] = safe_int(presence.get("terminated_session_count"))
+        if row["presence_vpn_ip"] and row["presence_vpn_ip"] != row["client"]:
+            row["source_ips"].add(row["presence_vpn_ip"])
 
     for record in [*(snapshot.get("recent_requests") or []), *(snapshot.get("recent_failures") or [])]:
         row = ensure_row(record.get("client"))
@@ -271,9 +304,16 @@ def build_dashboard_failures_snapshot(server):
 def build_dashboard_users_snapshot(server):
     snapshot = server.runtime.dashboard_state.snapshot()
     full_router_config_snapshot = server.router_config.snapshot()
-    known_clients = build_known_client_rows(snapshot, full_router_config_snapshot)
+    client_presence = getattr(server.runtime, "client_presence", None)
+    client_presence_snapshot = client_presence.snapshot() if client_presence is not None else {}
+    known_clients = build_known_client_rows(
+        snapshot,
+        full_router_config_snapshot,
+        client_presence_snapshot,
+    )
     return {
         "known_clients": known_clients,
+        "client_presence": client_presence_snapshot,
         "client_block_status": build_client_block_status_map(
             known_clients,
             server.router_config,
