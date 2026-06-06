@@ -182,8 +182,19 @@ remote "set -eu
 cd $(quote "$APP_ROOT")
 docker compose -f $(quote "$APP_ROOT/compose.yaml") up -d --build --no-deps --force-recreate proxy-router proxy-router-dashboard"
 
-log "Waiting for backend dashboard API"
-wait_for_url "http://127.0.0.1:18798/api/dashboard"
+dashboard_api_url="$(remote "sudo awk -F= '
+  /^WG_DNS=/{wg=\$2}
+  /^PROXY_ROUTER_ADMIN_API_BIND=/{bind=\$2}
+  /^PROXY_ROUTER_ADMIN_API_PORT=/{port=\$2}
+  END {
+    if (bind == \"\") bind=wg
+    if (bind == \"\") bind=\"127.0.0.1\"
+    if (port == \"\") port=\"18798\"
+    print \"http://\" bind \":\" port \"/api/dashboard\"
+  }
+' /etc/arvan-vps-gateway/server.env 2>/dev/null || printf 'http://127.0.0.1:18798/api/dashboard\n'")"
+log "Waiting for backend dashboard API at $dashboard_api_url"
+wait_for_url "$dashboard_api_url"
 
 dashboard_url="$(remote "sudo awk -F= '
   /^WG_DNS=/{wg=\$2}
