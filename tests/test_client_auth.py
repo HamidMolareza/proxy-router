@@ -14,7 +14,12 @@ from proxy_router.constants import (
     SOCKS_VERSION,
 )
 from proxy_router.config import RouterConfigManager
-from proxy_router.proxy_server import ProxyRequestHandler, Socks5RequestHandler, is_loopback_client_ip
+from proxy_router.proxy_server import (
+    ProxyRequestHandler,
+    Socks5RequestHandler,
+    https_interception_client_key,
+    is_loopback_client_ip,
+)
 from proxy_router.traffic import TrafficQuotaManager
 from proxy_router.util import (
     authenticate_client_auth_credentials,
@@ -698,6 +703,43 @@ class ClientAuthTests(unittest.TestCase):
         self.assertTrue(is_loopback_client_ip("127.42.0.9"))
         self.assertTrue(is_loopback_client_ip("::1"))
         self.assertFalse(is_loopback_client_ip("192.168.1.23"))
+
+    def test_https_interception_key_prefers_authenticated_identity(self):
+        self.assertEqual(
+            https_interception_client_key({"id": "user:phone"}, "127.0.0.1"),
+            "user:phone",
+        )
+        self.assertEqual(
+            https_interception_client_key({"id": "127.0.0.1"}, "127.0.0.1"),
+            "127.0.0.1",
+        )
+
+    def test_optional_http_identity_preserves_current_authenticated_connect_identity(self):
+        handler = ProxyRequestHandler.__new__(ProxyRequestHandler)
+        identity = {
+            "id": "user:phone",
+            "ip": "127.0.0.1",
+            "auth_type": "basic",
+            "username": "phone",
+            "label": "",
+        }
+        handler.client_address = ("127.0.0.1", 50000)
+        handler.headers = {}
+        handler._proxy_client_identity = identity
+        handler._dashboard_client_id = "user:phone"
+        handler.server = SimpleNamespace(
+            router_config=SimpleNamespace(
+                client_auth_settings=lambda: {
+                    "enabled": True,
+                    "allow_anonymous": False,
+                    "credentials": [],
+                }
+            )
+        )
+
+        handler._apply_optional_http_client_identity()
+
+        self.assertIs(handler._client_identity(), identity)
 
     def _build_password_portal_handler(self, manager, *, body, identity=None, identity_by_client_ip=None):
         responses = []

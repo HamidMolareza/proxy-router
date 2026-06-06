@@ -72,6 +72,13 @@ def resolve_client_portal_user_identity(server, client: str | None, client_ip: s
     return client_id if client_id.startswith("user:") else ""
 
 
+def https_interception_client_key(identity, client_ip: str | None) -> str:
+    client_id = str((identity or {}).get("id") or "").strip()
+    if client_id.startswith("user:"):
+        return client_id
+    return str(client_ip or client_id or "").strip()
+
+
 def is_retryable_upstream_error(exc: Exception) -> bool:
     if isinstance(exc, UpstreamRequestSetupError):
         return is_retryable_upstream_error(exc.original)
@@ -755,6 +762,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _https_interception_client_key(self) -> str:
+        return https_interception_client_key(self._client_identity(), self.client_address[0])
+
     def _set_client_identity(self, identity):
         self._proxy_client_identity = identity
         previous_client = getattr(self, "_dashboard_client_id", self.client_address[0])
@@ -810,9 +820,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self._set_client_identity(identity)
 
     def _inherited_authenticated_http_identity(self):
-        inherited_identity = getattr(self.server, "client_identity", None)
-        if str((inherited_identity or {}).get("id") or "").startswith("user:"):
-            return inherited_identity
+        for inherited_identity in (
+            getattr(self, "_proxy_client_identity", None),
+            getattr(self.server, "client_identity", None),
+        ):
+            if str((inherited_identity or {}).get("id") or "").startswith("user:"):
+                return inherited_identity
         return None
 
     def _send_proxy_auth_required(self, settings, *, error: str | None = None):
@@ -917,7 +930,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             adaptive_bypass = None
             if intercept_https:
                 adaptive_bypass = self.server.runtime.https_interception_adaptive_bypass(
-                    self.client_address[0],
+                    self._https_interception_client_key(),
                     host,
                     https_interception_settings,
                 )
@@ -1167,6 +1180,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         return int(port) == 443
 
     def _handle_client_portal_connect_request(self, host: str, port: int):
+        self._apply_optional_http_client_identity()
         self._debug(f"CONNECT client portal tunnel target={host}:{port}")
         self.send_response(200, "Connection Established")
         self.end_headers()
@@ -1198,6 +1212,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _handle_client_portal_https_request(self, host: str, port: int, *, request_started: float):
+        self._apply_optional_http_client_identity()
         try:
             tls_context = self.server.runtime.https_interception.server_ssl_context(host or CLIENT_PORTAL_PRIMARY_HOST)
         except Exception as exc:
@@ -1224,7 +1239,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 message = f"HTTPS CA trust check TLS handshake failed: {exc}"
                 self._debug(message, level="WARNING")
                 self.server.runtime.record_https_interception_failure(
-                    self.client_address[0],
+                    self._https_interception_client_key(),
                     host,
                     error=message,
                     context="HTTPS CA trust check",
@@ -1250,7 +1265,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self.server.runtime.record_https_interception_success(
-                self.client_address[0],
+                self._https_interception_client_key(),
                 host,
                 source="trust-check",
             )
@@ -1293,7 +1308,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 message = f"HTTPS interception TLS handshake failed: {exc}"
                 self._debug(message, level="WARNING")
                 self.server.runtime.record_https_interception_failure(
-                    self.client_address[0],
+                    self._https_interception_client_key(),
                     host,
                     error=message,
                     context="HTTPS interception TLS handshake",
@@ -1319,7 +1334,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self.server.runtime.record_https_interception_success(
-                self.client_address[0],
+                self._https_interception_client_key(),
                 host,
                 source="intercept",
             )
@@ -3224,6 +3239,9 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _https_interception_client_key(self) -> str:
+        return https_interception_client_key(self._client_identity(), self.client_address[0])
+
     def _set_client_identity(self, identity):
         self._proxy_client_identity = identity
         previous_client = getattr(self, "_dashboard_client_id", self.client_address[0])
@@ -3431,7 +3449,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 message = f"HTTPS CA trust check TLS handshake failed: {exc}"
                 self._debug(message, level="WARNING")
                 self.server.runtime.record_https_interception_failure(
-                    self.client_address[0],
+                    self._https_interception_client_key(),
                     host,
                     error=message,
                     context="HTTPS CA trust check",
@@ -3457,7 +3475,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 return
 
             self.server.runtime.record_https_interception_success(
-                self.client_address[0],
+                self._https_interception_client_key(),
                 host,
                 source="trust-check",
             )

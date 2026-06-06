@@ -130,7 +130,7 @@ The Compose stack publishes:
 
 On Linux, Compose runs both services with host networking so the backend can observe the real host route and VPN changes for routing profiles.
 
-The backend dashboard API binds only to `127.0.0.1:18798` on the host and is reverse-proxied by the dashboard container at `/api/*`.
+By default, the backend dashboard API binds only to `127.0.0.1:18798` on the host and is reverse-proxied by the dashboard container at `/api/*`. Gateway deployments can bind this API to a private VPN address instead, but it must not be exposed on a public interface.
 
 The backend container requests a `nofile` limit of `65536` and also raises its soft open-file limit at startup when the OS allows it. This keeps many concurrent CONNECT, SOCKS5, and HTTPS interception sockets from exhausting the default Docker soft limit.
 
@@ -153,6 +153,11 @@ bundle to the VPS, replaces only `/opt/arvan-vps-gateway/src/proxy-router`, and
 recreates the `proxy-router` backend service plus the `proxy-router-dashboard`
 frontend service. Runtime state under `/opt/arvan-vps-gateway/data/proxy-router`
 is preserved.
+
+On the Arvan gateway, the dashboard frontend stays at `http://10.77.0.1:8798`
+for admin VPN users and the backend admin API binds to `10.77.0.1:18798` for
+dashboard and MCP access. Firewall rules keep `18798` admin-VPN-only; do not
+publish it on the public VPS IP.
 
 The Arvan transparent gateway can write WireGuard client presence to
 `/data/vpn-client-presence.json`, which proxy-router reads with
