@@ -378,7 +378,12 @@ def build_websocket_upgrade_request(method: str, target_path: str, headers, host
     return "\r\n".join(request_lines).encode("iso-8859-1", errors="replace")
 
 
-def tunnel_bidirectional(left_socket, right_socket):
+def tunnel_bidirectional(
+    left_socket,
+    right_socket,
+    *,
+    half_close_drain_seconds=TUNNEL_HALF_CLOSE_DRAIN_SECONDS,
+):
     left_socket.setblocking(False)
     right_socket.setblocking(False)
     selector = selectors.DefaultSelector()
@@ -397,7 +402,9 @@ def tunnel_bidirectional(left_socket, right_socket):
     stats = {
         "left_to_right_bytes": 0,
         "right_to_left_bytes": 0,
+        "close_reason": "completed",
     }
+    half_close_deadline = None
 
     def peer_for(sock):
         return right_socket if sock is left_socket else left_socket
@@ -410,6 +417,7 @@ def tunnel_bidirectional(left_socket, right_socket):
         }
 
     def shutdown_write(sock):
+        nonlocal half_close_deadline
         if write_shutdown[sock]:
             return
         write_shutdown[sock] = True
@@ -417,6 +425,8 @@ def tunnel_bidirectional(left_socket, right_socket):
             sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+        if half_close_deadline is None:
+            half_close_deadline = time.monotonic() + max(0.0, float(half_close_drain_seconds))
 
     def shutdown_peer_when_drained(sock):
         peer = peer_for(sock)
@@ -465,7 +475,15 @@ def tunnel_bidirectional(left_socket, right_socket):
             if not selector.get_map():
                 return stats
 
-            selected = selector.select(timeout=1.0)
+            select_timeout = 1.0
+            if half_close_deadline is not None:
+                remaining_drain_seconds = half_close_deadline - time.monotonic()
+                if remaining_drain_seconds <= 0:
+                    stats["close_reason"] = "half_close_timeout"
+                    return stats
+                select_timeout = min(select_timeout, remaining_drain_seconds)
+
+            selected = selector.select(timeout=select_timeout)
             if not selected:
                 update_interest(left_socket)
                 update_interest(right_socket)
@@ -509,8 +527,10 @@ def tunnel_bidirectional(left_socket, right_socket):
                         if is_retryable_socket_error(exc):
                             update_interest(current)
                             continue
+                        stats["close_reason"] = "socket_error"
                         return stats
                     if sent <= 0:
+                        stats["close_reason"] = "socket_error"
                         return stats
                     del buffers[current][:sent]
                     shutdown_peer_when_drained(current)
@@ -1024,6 +1044,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
                     "CONNECT tunnel closed "
+                    f"close_reason={stats.get('close_reason', 'completed')} "
                     f"duration_ms={duration_ms} "
                     f"client_to_upstream_bytes={stats['left_to_right_bytes']} "
                     f"upstream_to_client_bytes={stats['right_to_left_bytes']}"
@@ -2585,6 +2606,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             stats = tunnel_bidirectional(self.connection, upstream)
             uploaded_bytes += stats["left_to_right_bytes"]
             downloaded_bytes += stats["right_to_left_bytes"]
+            self._debug(f"WebSocket tunnel closed close_reason={stats.get('close_reason', 'completed')}")
         finally:
             duration_ms = int((time.monotonic() - request_started) * 1000)
             relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
@@ -3723,6 +3745,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
                     "tunnel closed "
+                    f"close_reason={stats.get('close_reason', 'completed')} "
                     f"client_to_upstream_bytes={stats['left_to_right_bytes']} "
                     f"upstream_to_client_bytes={stats['right_to_left_bytes']}"
                 )

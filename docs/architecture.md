@@ -120,7 +120,7 @@ The traffic path records observability at request or tunnel boundaries instead o
 Expected overhead:
 
 - raw CONNECT and SOCKS5 stay as socket relay paths and only record aggregate timing at completion
-- the socket relay tolerates retryable nonblocking send/recv states and half-closes each direction only after buffered data is drained
+- the socket relay tolerates retryable nonblocking send/recv states, half-closes each direction only after buffered data is drained, and limits the remaining peer drain to five seconds
 - normal HTTP may buffer request bodies when required by existing forwarding behavior
 - HTTPS interception adds TLS termination and bounded body-preview capture only for matched hosts
 - upstream retries can intentionally add latency before a final success or failure
