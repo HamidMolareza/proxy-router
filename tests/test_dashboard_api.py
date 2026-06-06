@@ -1,10 +1,19 @@
+import json
 import tempfile
+import threading
 import unittest
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from proxy_router.config import RouterConfigManager
-from proxy_router.dashboard_api import build_dashboard_snapshot, build_live_update_message
+from proxy_router.dashboard_api import (
+    DashboardRequestHandler,
+    ThreadedDashboardServer,
+    build_dashboard_snapshot,
+    build_live_update_message,
+)
 from proxy_router.runtime import DashboardState
 
 
@@ -192,6 +201,58 @@ class DashboardApiScopeTests(unittest.TestCase):
                 self.assertNotIn("proxy_quota_status", connection_update["snapshot"])
                 self.assertIn("recent_requests", connection_update["snapshot"])
             finally:
+                router_config.shutdown()
+
+    def test_client_activity_endpoint_defaults_to_last_24_hours(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server_stub, router_config = self._server(temp_dir)
+            presence_history = root / "presence-history.log"
+            presence_history.write_text(
+                json.dumps(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "client": "user:phone",
+                        "state": "online",
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            failure_log = root / "failures.log"
+            failure_log.write_text("", encoding="utf-8")
+            block_history = root / "blocks.log"
+            block_history.write_text(
+                '{"timestamp":"2026-06-06T00:00:00+00:00","blocks":[]}\n',
+                encoding="utf-8",
+            )
+            runtime = server_stub.runtime
+            runtime.usage_log_path = root / "usage.log"
+            runtime.https_traffic_log_path = root / "https.log"
+            runtime.failure_log_path = failure_log
+            runtime.client_presence_history_path = presence_history
+            runtime.client_block_history_path = block_history
+            runtime.client_presence = SimpleNamespace(snapshot=lambda: {})
+            dashboard = ThreadedDashboardServer(
+                ("127.0.0.1", 0),
+                DashboardRequestHandler,
+                runtime=runtime,
+                router_config=router_config,
+            )
+            thread = threading.Thread(target=dashboard.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{dashboard.server_address[1]}/api/client-activity",
+                    timeout=5,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(payload["range"], "24h")
+                self.assertEqual(payload["rows"][0]["client"], "user:phone")
+            finally:
+                dashboard.shutdown()
+                dashboard.server_close()
+                thread.join(timeout=5)
                 router_config.shutdown()
 
 

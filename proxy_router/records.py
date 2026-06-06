@@ -3,11 +3,377 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .constants import *
 from .util import *
+
+
+class _IncrementalJsonlCache:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._file_id = None
+        self._offset = 0
+        self._records = []
+        self._invalid_lines = 0
+
+    def snapshot(self):
+        with self._lock:
+            self._load_if_needed()
+            return list(self._records), self._invalid_lines
+
+    def _load_if_needed(self):
+        if self.log_file is None:
+            self._file_id = None
+            self._offset = 0
+            self._records = []
+            self._invalid_lines = 0
+            return
+        try:
+            stat = self.log_file.stat()
+        except FileNotFoundError:
+            self._file_id = None
+            self._offset = 0
+            self._records = []
+            self._invalid_lines = 0
+            return
+        file_id = (getattr(stat, "st_dev", None), getattr(stat, "st_ino", None))
+        if self._file_id != file_id or stat.st_size < self._offset:
+            self._offset = 0
+            self._records = []
+            self._invalid_lines = 0
+        with self.log_file.open("r", encoding="utf-8") as stream:
+            if self._offset:
+                stream.seek(self._offset)
+            for line in stream:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    item = json.loads(stripped)
+                except json.JSONDecodeError:
+                    self._invalid_lines += 1
+                    continue
+                if isinstance(item, dict):
+                    self._records.append(item)
+                else:
+                    self._invalid_lines += 1
+            self._offset = stream.tell()
+            self._file_id = file_id
+
+
+class ClientBlockHistoryStore:
+    def __init__(self, log_file: Path | None):
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._last_fingerprint = None
+        if log_file is not None:
+            records, _ = _IncrementalJsonlCache(log_file).snapshot()
+            if records:
+                self._last_fingerprint = self._fingerprint(records[-1].get("blocks"))
+
+    @staticmethod
+    def _normalized_blocks(blocks):
+        normalized = []
+        for block in blocks or []:
+            if not isinstance(block, dict):
+                continue
+            client = str(block.get("client") or "").strip()
+            if not client:
+                continue
+            normalized.append(
+                {
+                    "client": client,
+                    "enabled": bool(block.get("enabled", True)),
+                    "duration": str(block.get("duration") or "always"),
+                    "expires_at": block.get("expires_at"),
+                    "note": str(block.get("note") or ""),
+                }
+            )
+        normalized.sort(key=lambda item: item["client"])
+        return normalized
+
+    @classmethod
+    def _fingerprint(cls, blocks):
+        return json.dumps(cls._normalized_blocks(blocks), sort_keys=True, separators=(",", ":"))
+
+    def record_snapshot(self, blocks, *, timestamp: str | None = None):
+        if self.log_file is None:
+            return False
+        normalized = self._normalized_blocks(blocks)
+        fingerprint = self._fingerprint(normalized)
+        with self._lock:
+            if fingerprint == self._last_fingerprint:
+                return False
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            event = {
+                "timestamp": timestamp or datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "blocks": normalized,
+            }
+            with self.log_file.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True) + "\n")
+            self._last_fingerprint = fingerprint
+        return True
+
+
+class ClientActivityCache:
+    def __init__(
+        self,
+        presence_history_file: Path | None,
+        block_history_file: Path | None,
+        failure_log_file: Path | None,
+    ):
+        self.presence_history_file = presence_history_file
+        self.block_history_file = block_history_file
+        self.failure_log_file = failure_log_file
+        self._presence = _IncrementalJsonlCache(presence_history_file)
+        self._blocks = _IncrementalJsonlCache(block_history_file)
+        self._failures = _IncrementalJsonlCache(failure_log_file)
+
+    @staticmethod
+    def _timestamp(value):
+        parsed = parse_usage_timestamp(str(value or ""))
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _merge_segments(segments):
+        merged = []
+        for segment in segments:
+            if segment["end_at"] <= segment["start_at"]:
+                continue
+            if (
+                merged
+                and merged[-1]["state"] == segment["state"]
+                and merged[-1].get("reason") == segment.get("reason")
+                and merged[-1].get("block_target") == segment.get("block_target")
+                and merged[-1]["end_at"] == segment["start_at"]
+            ):
+                merged[-1]["end_at"] = segment["end_at"]
+                continue
+            merged.append(segment)
+        return merged
+
+    def _presence_segments(self, events, start, end):
+        valid = []
+        for event in events:
+            timestamp = self._timestamp(event.get("timestamp"))
+            state = str(event.get("state") or "unknown").lower()
+            if timestamp is None or timestamp > end or state not in {"online", "offline", "unknown"}:
+                continue
+            valid.append((timestamp, state, event.get("reason")))
+        valid.sort(key=lambda item: item[0])
+        state = "unknown"
+        reason = None
+        for timestamp, next_state, next_reason in valid:
+            if timestamp > start:
+                break
+            state = next_state
+            reason = next_reason
+        cursor = start
+        segments = []
+        for timestamp, next_state, next_reason in valid:
+            if timestamp <= start:
+                continue
+            if timestamp > cursor:
+                segments.append({"start_at": cursor, "end_at": timestamp, "state": state, "reason": reason})
+            cursor = timestamp
+            state = next_state
+            reason = next_reason
+        if cursor < end:
+            segments.append({"start_at": cursor, "end_at": end, "state": state, "reason": reason})
+        return self._merge_segments(segments)
+
+    def _matching_block(self, blocks, client, at):
+        matches = []
+        for block in blocks or []:
+            if not isinstance(block, dict) or not block.get("enabled", True):
+                continue
+            target = str(block.get("client") or "").strip()
+            if not target or not client_ip_matches_limit_target(client, target):
+                continue
+            expires_at = self._timestamp(block.get("expires_at"))
+            if expires_at is not None and expires_at <= at:
+                continue
+            matches.append((client_limit_target_specificity(target), target, expires_at))
+        return max(matches, default=None, key=lambda item: item[0])
+
+    def _block_intervals(self, snapshots, client, start, end):
+        parsed = []
+        for snapshot in snapshots:
+            timestamp = self._timestamp(snapshot.get("timestamp"))
+            if timestamp is not None and timestamp <= end:
+                parsed.append((timestamp, snapshot.get("blocks") or []))
+        parsed.sort(key=lambda item: item[0])
+        effective = None
+        inside = []
+        for item in parsed:
+            if item[0] <= start:
+                effective = item
+            else:
+                inside.append(item)
+        timeline = []
+        if effective is not None:
+            timeline.append((start, effective[1]))
+        timeline.extend(inside)
+        intervals = []
+        for index, (timestamp, blocks) in enumerate(timeline):
+            segment_end = timeline[index + 1][0] if index + 1 < len(timeline) else end
+            match = self._matching_block(blocks, client, timestamp)
+            if match is None:
+                continue
+            _, target, expires_at = match
+            interval_end = min(segment_end, expires_at) if expires_at is not None else segment_end
+            if interval_end > timestamp:
+                intervals.append({"start_at": timestamp, "end_at": interval_end, "target": target})
+        return intervals
+
+    def _overlay_blocks(self, segments, intervals):
+        boundaries = {segment["start_at"] for segment in segments} | {segment["end_at"] for segment in segments}
+        for interval in intervals:
+            boundaries.add(interval["start_at"])
+            boundaries.add(interval["end_at"])
+        ordered = sorted(boundaries)
+        result = []
+        for left, right in zip(ordered, ordered[1:]):
+            base = next((item for item in segments if item["start_at"] <= left < item["end_at"]), None)
+            block = next((item for item in intervals if item["start_at"] <= left < item["end_at"]), None)
+            if base is None:
+                continue
+            result.append(
+                {
+                    "start_at": left,
+                    "end_at": right,
+                    "state": "blocked" if block else base["state"],
+                    "reason": "client_access_block" if block else base.get("reason"),
+                    "block_target": block.get("target") if block else None,
+                }
+            )
+        return self._merge_segments(result)
+
+    def query(
+        self,
+        *,
+        range_key: str,
+        client: str | None,
+        configured_users,
+        current_presence,
+        now: datetime | None = None,
+    ):
+        window = CLIENT_ACTIVITY_RANGE_OPTIONS.get(range_key, CLIENT_ACTIVITY_RANGE_OPTIONS["24h"])
+        end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        start = end - window
+        presence_records, presence_invalid = self._presence.snapshot()
+        block_records, block_invalid = self._blocks.snapshot()
+        failure_records, failure_invalid = self._failures.snapshot()
+
+        labels = {}
+        clients = set()
+        for credential in configured_users or []:
+            username = str(credential.get("username") or "").strip()
+            if not username:
+                continue
+            user_id = client_identity_from_username(username)
+            clients.add(user_id)
+            labels[user_id] = str(credential.get("label") or username).strip()
+        for event in presence_records:
+            event_client = str(event.get("client") or "").strip()
+            if event_client.startswith("user:"):
+                clients.add(event_client)
+        presence_snapshot = current_presence if isinstance(current_presence, dict) else {}
+        generated_at = presence_snapshot.get("generated_at")
+        for event_client, item in (presence_snapshot.get("clients") or {}).items():
+            if not str(event_client).startswith("user:") or not isinstance(item, dict):
+                continue
+            clients.add(str(event_client))
+            presence_records.append(
+                {
+                    "timestamp": generated_at,
+                    "client": event_client,
+                    "state": item.get("state"),
+                    "reason": item.get("offline_reason"),
+                }
+            )
+        for failure in failure_records:
+            failure_client = str(failure.get("client") or "").strip()
+            if failure_client.startswith("user:"):
+                clients.add(failure_client)
+        for snapshot in block_records:
+            for block in snapshot.get("blocks") or []:
+                target = str((block or {}).get("client") or "").strip()
+                if target.startswith("user:"):
+                    clients.add(target)
+
+        selected_client = str(client or "").strip()
+        if selected_client:
+            clients = {selected_client}
+        rows = []
+        for user_id in sorted(clients):
+            user_events = [item for item in presence_records if str(item.get("client") or "") == user_id]
+            base_segments = self._presence_segments(user_events, start, end)
+            block_intervals = self._block_intervals(block_records, user_id, start, end)
+            segments = self._overlay_blocks(base_segments, block_intervals)
+            totals = {"connected_seconds": 0, "disconnected_seconds": 0, "blocked_seconds": 0, "unknown_seconds": 0}
+            for segment in segments:
+                seconds = max(0, int((segment["end_at"] - segment["start_at"]).total_seconds()))
+                key = {
+                    "online": "connected_seconds",
+                    "offline": "disconnected_seconds",
+                    "blocked": "blocked_seconds",
+                }.get(segment["state"], "unknown_seconds")
+                totals[key] += seconds
+                segment["start_at"] = segment["start_at"].isoformat()
+                segment["end_at"] = segment["end_at"].isoformat()
+            attempts = []
+            for failure in failure_records:
+                if str(failure.get("client") or "") != user_id:
+                    continue
+                if str(failure.get("route_label") or "") not in {CLIENT_BLOCK_ROUTE_LABEL, CLIENT_TRAFFIC_ROUTE_LABEL}:
+                    continue
+                timestamp = self._timestamp(failure.get("timestamp"))
+                if timestamp is None or timestamp < start or timestamp > end:
+                    continue
+                attempts.append(
+                    {
+                        "timestamp": timestamp.isoformat(),
+                        "route_label": failure.get("route_label"),
+                        "destination": failure.get("destination"),
+                        "context": failure.get("context"),
+                    }
+                )
+            attempts.sort(key=lambda item: item["timestamp"], reverse=True)
+            current_state = segments[-1]["state"] if segments else "unknown"
+            rows.append(
+                {
+                    "client": user_id,
+                    "label": labels.get(user_id, user_id.removeprefix("user:")),
+                    "current_state": current_state,
+                    "segments": segments,
+                    "summary": totals,
+                    "blocked_attempts": attempts[:200],
+                }
+            )
+        rank = {"blocked": 0, "online": 1, "offline": 2, "unknown": 3}
+        rows.sort(key=lambda item: (rank.get(item["current_state"], 3), item["client"]))
+        return {
+            "range": range_key if range_key in CLIENT_ACTIVITY_RANGE_OPTIONS else "24h",
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "rows": rows,
+            "client": selected_client or "all",
+            "presence_history_available": bool(self.presence_history_file and self.presence_history_file.exists()),
+            "invalid_lines": {
+                "presence": presence_invalid,
+                "blocks": block_invalid,
+                "failures": failure_invalid,
+            },
+        }
 
 def build_failure_snapshot_from_records(recent_failures, router_config_snapshot):
     ignored_hosts = router_config_snapshot.get("ignored_failure_hosts", [])

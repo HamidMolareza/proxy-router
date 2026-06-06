@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 from .config import RuleSuggestionConflictError
 from .constants import *
 from .output import DEBUG_LOGGER, debug_log
-from .records import HttpsTrafficCache, UsageHistoryCache, build_failure_snapshot_from_records
+from .records import ClientActivityCache, HttpsTrafficCache, UsageHistoryCache, build_failure_snapshot_from_records
 from .util import client_identity_from_username, first_query_value, normalize_history_filter
 
 
@@ -38,6 +38,11 @@ class ThreadedDashboardServer(socketserver.ThreadingMixIn, HTTPServer):
         self.dashboard_state = runtime.dashboard_state
         self.history_cache = UsageHistoryCache(runtime.usage_log_path)
         self.https_traffic_cache = HttpsTrafficCache(runtime.https_traffic_log_path)
+        self.client_activity_cache = ClientActivityCache(
+            runtime.client_presence_history_path,
+            runtime.client_block_history_path,
+            runtime.failure_log_path,
+        )
         self.router_config = router_config
 
 
@@ -683,6 +688,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if route_path in {"/api/client-activity", "/api/client-activity.json"}:
+            query = parse_qs(parsed.query)
+            router_snapshot = self.server.router_config.snapshot()
+            presence = getattr(self.server.runtime, "client_presence", None)
+            payload = self.server.client_activity_cache.query(
+                range_key=first_query_value(query, "range") or "24h",
+                client=normalize_history_filter(first_query_value(query, "client")),
+                configured_users=(router_snapshot.get("client_auth") or {}).get("credentials", []),
+                current_presence=presence.snapshot() if presence is not None else {},
+            )
+            self._send_json(payload)
+            return
+
         if route_path in {"/api/router-config", "/api/router-config.json"}:
             self._send_json(self.server.router_config.public_snapshot())
             return
@@ -781,6 +799,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                     "/api/dashboard",
                     "/api/history",
                     "/api/history/requests",
+                    "/api/client-activity",
                     "/api/router-config",
                     "/api/router-config/preview",
                     "/api/admin-api/status",
@@ -1001,5 +1020,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if self.server.runtime.auto_proxy_failure_manager is not None:
             self.server.runtime.auto_proxy_failure_manager.reconcile_config_state()
         self.server.runtime.refresh_upstream_status(saved_config)
+        self.server.runtime.record_client_block_history(saved_config)
 
         self._send_json(saved_config, status=200)

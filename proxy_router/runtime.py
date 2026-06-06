@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .constants import *
 from .certificates import HttpsCertificateManager
-from .records import build_failure_snapshot_from_records
+from .records import ClientBlockHistoryStore, build_failure_snapshot_from_records
 from .traffic import AutoProxyFailureManager, HttpsDiscoveryManager, HttpsInterceptionTrustManager, TrafficQuotaManager
 from .util import *
 
@@ -1331,9 +1331,12 @@ class AppRuntime:
         self.usage_log_path: Path | None = None
         self.failure_log_path: Path | None = None
         self.https_traffic_log_path: Path | None = None
+        self.client_presence_history_path: Path | None = None
+        self.client_block_history_path: Path | None = None
         self.usage_logger = UsageLogger(None)
         self.failure_logger = FailureLogger(None)
         self.https_traffic_logger = HttpsTrafficLogger(None)
+        self.client_block_history = ClientBlockHistoryStore(None)
         self.traffic_quota_manager = TrafficQuotaManager()
         self.auto_proxy_failure_manager = None
         self.https_discovery_manager = None
@@ -1365,6 +1368,20 @@ class AppRuntime:
 
     def configure_client_presence_file(self, presence_file: Path | None):
         self.client_presence.configure(presence_file)
+
+    def configure_client_activity_history(
+        self,
+        presence_history_file: Path | None,
+        block_history_file: Path | None,
+    ):
+        self.client_presence_history_path = presence_history_file
+        self.client_block_history_path = block_history_file
+        self.client_block_history = ClientBlockHistoryStore(block_history_file)
+
+    def record_client_block_history(self, router_config_snapshot):
+        blocks = (router_config_snapshot or {}).get("client_blocks", [])
+        if self.client_block_history.record_snapshot(blocks):
+            self.notify_dashboard_update("client-activity")
 
     def configure_traffic_quota_manager(self, log_file: Path | None):
         self.traffic_quota_manager = TrafficQuotaManager()
@@ -1502,6 +1519,7 @@ class AppRuntime:
                 https_interception_state_file_path(router_config.config_file)
             )
             self.refresh_upstream_status(router_config.snapshot())
+            self.record_client_block_history(router_config.snapshot())
         else:
             self.https_interception_trust = HttpsInterceptionTrustManager(None)
             self.refresh_upstream_status(None)

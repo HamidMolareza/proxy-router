@@ -222,6 +222,15 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help="Optional JSON file with external VPN/client presence state for dashboard Access rows.",
     )
     parser.add_argument(
+        "--client-presence-history-file",
+        help="Optional JSONL file with external VPN/client presence transitions for Activity timelines.",
+    )
+    parser.add_argument(
+        "--client-block-history-file",
+        default=str(DEFAULT_CLIENT_BLOCK_HISTORY_PATH),
+        help=f"JSONL file for client block configuration history. Default: {DEFAULT_CLIENT_BLOCK_HISTORY_PATH}",
+    )
+    parser.add_argument(
         "--dashboard-bind",
         default=DASHBOARD_DEFAULT_BIND,
         help=f"Bind address for the dashboard API server. Default: {DASHBOARD_DEFAULT_BIND}",
@@ -639,6 +648,10 @@ def main():
     error_log_path = resolve_error_log_path(args.error_log_file)
     router_config_path = resolve_router_config_path(args.router_config_file)
     client_presence_path = Path(args.client_presence_file).expanduser() if args.client_presence_file else None
+    client_presence_history_path = (
+        Path(args.client_presence_history_file).expanduser() if args.client_presence_history_file else None
+    )
+    client_block_history_path = Path(args.client_block_history_file).expanduser() if args.client_block_history_file else None
     https_intercept_ca_cert_path = resolve_https_intercept_ca_cert_path(args.https_intercept_ca_cert_file)
     https_intercept_ca_key_path = resolve_https_intercept_ca_key_path(args.https_intercept_ca_key_file)
     https_intercept_cert_cache_dir = resolve_https_intercept_cert_cache_dir(args.https_intercept_cert_cache_dir)
@@ -695,6 +708,7 @@ def main():
 
     runtime.configure_traffic_quota_manager(usage_log_path)
     runtime.configure_client_presence_file(client_presence_path)
+    runtime.configure_client_activity_history(client_presence_history_path, client_block_history_path)
     runtime.rehydrate_dashboard_state()
 
     try:

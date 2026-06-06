@@ -16,6 +16,8 @@ services:
       - "18798"
       - --router-config-file
       - /data/router-config.json
+      - --client-block-history-file
+      - /data/client-block-history.log
       - --usage-log-file
       - /data/usage.log
       - --failure-log-file

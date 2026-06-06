@@ -63,6 +63,7 @@ MAX_DEBUG_VALUE_LENGTH = 512
 DEFAULT_USAGE_LOG_PATH = Path("/tmp/proxy-router-usage.log")
 DEFAULT_FAILURE_LOG_PATH = Path("/tmp/proxy-router-failures.log")
 DEFAULT_HTTPS_TRAFFIC_LOG_PATH = Path("/tmp/proxy-router-https-traffic.log")
+DEFAULT_CLIENT_BLOCK_HISTORY_PATH = Path("/tmp/proxy-router-client-block-history.log")
 DEFAULT_ERROR_LOG_PATH = Path("/tmp/proxy-router-errors.log")
 DEFAULT_ROUTER_CONFIG_PATH = Path.home() / ".config" / "proxy-router" / "router-config.json"
 DEFAULT_HTTPS_INTERCEPT_DIR = Path.home() / ".config" / "proxy-router" / "https-interception"
@@ -148,6 +149,12 @@ HISTORY_RANGE_OPTIONS = {
         "label_format": "%m-%d",
         "title": "Last 7 days",
     },
+    "30d": {
+        "window": timedelta(days=30),
+        "bucket_seconds": 86400,
+        "label_format": "%m-%d",
+        "title": "Last 30 days",
+    },
     "all": {
         "window": None,
         "bucket_seconds": 86400,
@@ -156,6 +163,12 @@ HISTORY_RANGE_OPTIONS = {
     },
 }
 HISTORY_TOP_DESTINATIONS_LIMIT = 8
+CLIENT_ACTIVITY_RANGE_OPTIONS = {
+    "1h": timedelta(hours=1),
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+}
 DEFAULT_ROUTE_ACTIONS = {"direct", "proxy"}
 RULE_ROUTE_ACTIONS = {"direct", "proxy", "block"}
 RULE_MATCH_TYPES = {"exact", "suffix", "contains"}

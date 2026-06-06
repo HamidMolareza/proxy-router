@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
+  ArrowLeft,
   BarChart3,
   CheckCircle2,
   CircleAlert,
@@ -18,6 +19,7 @@ import {
   ShieldCheck,
   Sun,
   Wifi,
+  Clock3,
 } from 'lucide-react'
 
 const PROXY_TYPES = ['http', 'https', 'socks5']
@@ -26,10 +28,13 @@ const HISTORY_RANGE_OPTIONS = [
   { value: '1h', label: 'Last hour' },
   { value: '24h', label: 'Last 24 hours' },
   { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
   { value: 'all', label: 'All time' },
 ]
+const ACTIVITY_RANGE_OPTIONS = HISTORY_RANGE_OPTIONS.filter((item) => item.value !== 'all')
 const TAB_DEFINITIONS = [
   { id: 'dashboard', label: 'Dashboard', shortLabel: 'Home', icon: Gauge },
+  { id: 'activity', label: 'Activity', shortLabel: 'Activity', icon: Clock3 },
   { id: 'traffic', label: 'Traffic', shortLabel: 'Traffic', icon: BarChart3 },
   { id: 'routing', label: 'Routing', shortLabel: 'Routes', icon: Route },
   { id: 'proxies', label: 'Proxies', shortLabel: 'Proxies', icon: ServerCog },
@@ -45,6 +50,7 @@ const TAB_HASH_ALIASES = {
 }
 const WORKFLOW_DESCRIPTIONS = {
   dashboard: 'Live operating view for traffic, routes, clients, and the latest completed request.',
+  activity: 'VPN connection, disconnection, and client block timelines.',
   traffic: 'History, filters, top destinations, timing, throughput, and failed request review.',
   routing: 'Profiles, host rules, suggestions, conflicts, retry behavior, and automatic proxy policy.',
   proxies: 'Upstream proxy health, connection settings, access policy, quotas, and per-client usage.',
@@ -253,8 +259,21 @@ function getQuotaClientSortValue(row, key) {
 
 function getTabFromHash() {
   const tabId = window.location.hash.replace(/^#/, '').trim()
-  const canonicalTabId = TAB_HASH_ALIASES[tabId] || tabId
+  const rootTabId = tabId.split('/', 1)[0]
+  const canonicalTabId = TAB_HASH_ALIASES[rootTabId] || rootTabId
   return TAB_DEFINITIONS.some((item) => item.id === canonicalTabId) ? canonicalTabId : 'dashboard'
+}
+
+function getActivityClientFromHash() {
+  const match = window.location.hash.replace(/^#/, '').match(/^activity\/(.+)$/)
+  if (!match) {
+    return ''
+  }
+  try {
+    return decodeURIComponent(match[1])
+  } catch {
+    return ''
+  }
 }
 
 function clamp(value, min, max) {
@@ -492,6 +511,18 @@ function emptyHistoryData() {
       from: null,
       to: null,
     },
+  }
+}
+
+function emptyActivityData() {
+  return {
+    range: '24h',
+    from: null,
+    to: null,
+    rows: [],
+    client: 'all',
+    presence_history_available: false,
+    invalid_lines: { presence: 0, blocks: 0, failures: 0 },
   }
 }
 
@@ -2587,6 +2618,127 @@ function buildLiveSocketUrl(scope = '') {
   return `${protocol}//${window.location.host}/api/live${query}`
 }
 
+function activityStateLabel(state) {
+  if (state === 'online') {
+    return 'Connected'
+  }
+  if (state === 'offline') {
+    return 'Disconnected'
+  }
+  if (state === 'blocked') {
+    return 'Blocked'
+  }
+  return 'Unknown'
+}
+
+function formatActivityDuration(seconds) {
+  const value = Math.max(0, Number(seconds) || 0)
+  if (value < 60) {
+    return `${Math.round(value)}s`
+  }
+  if (value < 3600) {
+    return `${Math.round(value / 60)}m`
+  }
+  if (value < 86400) {
+    return `${(value / 3600).toFixed(value >= 36000 ? 0 : 1)}h`
+  }
+  return `${(value / 86400).toFixed(value >= 864000 ? 0 : 1)}d`
+}
+
+function activityTickLabel(timestamp, range) {
+  const date = new Date(timestamp)
+  if (range === '1h' || range === '24h') {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+function ClientActivityTimeline({ data, onSelectClient, selectedClient = '' }) {
+  const rows = Array.isArray(data.rows) ? data.rows : []
+  const fromMs = new Date(data.from || 0).getTime()
+  const toMs = new Date(data.to || 0).getTime()
+  const durationMs = Math.max(1, toMs - fromMs)
+  const ticks = Array.from({ length: 5 }, (_, index) => fromMs + (durationMs * index) / 4)
+
+  if (!rows.length) {
+    return <div className="pt-3 text-[var(--pr-muted)]">No configured VPN users have activity data yet.</div>
+  }
+
+  return (
+    <div className="mt-3 overflow-x-auto pb-2">
+      <div className="min-w-0 md:min-w-[760px]">
+        <div className="grid grid-cols-[90px_minmax(0,1fr)] items-end gap-3 px-2 pb-2 text-xs text-[var(--pr-muted)] md:grid-cols-[190px_minmax(520px,1fr)_105px]">
+          <div>User</div>
+          <div className="flex justify-between">
+            {ticks.map((tick, index) => (
+              <span className={cx((index === 1 || index === 3) && 'hidden md:inline')} key={tick}>
+                {activityTickLabel(tick, data.range)}
+              </span>
+            ))}
+          </div>
+          <div className="hidden md:block">Current</div>
+        </div>
+        <div className="divide-y divide-[var(--pr-table-border)] rounded-[8px] border border-[var(--pr-table-border)] bg-[var(--pr-table-bg)]">
+          {rows.map((row) => (
+            <div
+              className={cx(
+                'grid min-h-14 grid-cols-[90px_minmax(0,1fr)] items-center gap-3 px-2 py-2 md:grid-cols-[190px_minmax(520px,1fr)_105px]',
+                selectedClient === row.client && 'bg-[var(--pr-row-selected-bg)]',
+              )}
+              key={row.client}
+            >
+              <button
+                className="!min-h-0 min-w-0 !border-0 !bg-transparent !p-1 !text-left !shadow-none"
+                type="button"
+                title={`Open activity details for ${row.client}`}
+                onClick={() => onSelectClient(row.client)}
+              >
+                <span className="block truncate text-sm font-semibold">{row.label || row.client}</span>
+                <span className="block truncate text-xs text-[var(--pr-muted)]">{row.client}</span>
+                <span className="mt-1 block truncate text-[11px] font-semibold text-[var(--pr-muted)] md:hidden">
+                  {activityStateLabel(row.current_state)}
+                </span>
+              </button>
+              <div className="relative h-7 overflow-hidden rounded-[6px] border border-[var(--pr-table-border)] bg-[var(--pr-activity-unknown)]" role="img" aria-label={`${row.client} VPN activity timeline`}>
+                {(row.segments || []).map((segment, index) => {
+                  const start = Math.max(fromMs, new Date(segment.start_at).getTime())
+                  const end = Math.min(toMs, new Date(segment.end_at).getTime())
+                  const left = ((start - fromMs) / durationMs) * 100
+                  const width = Math.max(0, ((end - start) / durationMs) * 100)
+                  const title = `${activityStateLabel(segment.state)}: ${new Date(segment.start_at).toLocaleString()} to ${new Date(segment.end_at).toLocaleString()}${segment.block_target ? ` · ${segment.block_target}` : ''}`
+                  return (
+                    <span
+                      className={`absolute inset-y-0 activity-state-${segment.state}`}
+                      key={`${segment.start_at}-${segment.state}-${index}`}
+                      style={{ left: `${left}%`, width: `${width}%` }}
+                      title={title}
+                    ></span>
+                  )
+                })}
+                {(row.blocked_attempts || []).map((attempt, index) => {
+                  const timestamp = new Date(attempt.timestamp).getTime()
+                  const left = ((timestamp - fromMs) / durationMs) * 100
+                  return (
+                    <span
+                      className="absolute top-0 z-10 h-full w-0.5 bg-[var(--pr-error)]"
+                      key={`${attempt.timestamp}-${index}`}
+                      style={{ left: `${left}%` }}
+                      title={`Rejected request: ${attempt.destination || 'unknown destination'}`}
+                    ></span>
+                  )
+                })}
+              </div>
+              <span className={`activity-status activity-current-desktop activity-status-${row.current_state}`}>
+                {activityStateLabel(row.current_state)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function createProfileId() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
     return `profile-${globalThis.crypto.randomUUID().slice(0, 8)}`
@@ -2760,6 +2912,12 @@ function App() {
   const [themePreference, setThemePreference] = useState(getStoredThemePreference)
   const [systemTheme, setSystemTheme] = useState(getSystemTheme)
   const [dashboardSnapshot, setDashboardSnapshot] = useState(emptyDashboardSnapshot())
+  const [activityData, setActivityData] = useState(emptyActivityData())
+  const [activityRange, setActivityRange] = useState('24h')
+  const [activityClient, setActivityClient] = useState(getActivityClientFromHash())
+  const [activityError, setActivityError] = useState('')
+  const [activityDetailHistory, setActivityDetailHistory] = useState(emptyHistoryData())
+  const [activityDetailRequests, setActivityDetailRequests] = useState({ items: [], total: 0 })
   const [historyData, setHistoryData] = useState(emptyHistoryData())
   const [historyRange, setHistoryRange] = useState('24h')
   const [historyProxyType, setHistoryProxyType] = useState('all')
@@ -2830,6 +2988,7 @@ function App() {
   const copyStatusTimerRef = useRef(null)
   const routerHasLocalChangesRef = useRef(false)
   const refreshHistoryRef = useRef(null)
+  const refreshActivityRef = useRef(null)
   const refreshHttpsTrafficRef = useRef(null)
   const refreshDashboardScopeRef = useRef(null)
   const loadRouterConfigRef = useRef(null)
@@ -3099,6 +3258,10 @@ function App() {
     ? historyData.client_period_totals
     : []
   const httpsTrafficRows = Array.isArray(httpsTrafficData.items) ? httpsTrafficData.items : []
+  const activityRows = Array.isArray(activityData.rows) ? activityData.rows : []
+  const selectedActivityRow = activityClient
+    ? activityRows.find((row) => row.client === activityClient) || null
+    : null
   const httpsTrafficSelectedId = httpsTrafficDetail && httpsTrafficDetail.id ? httpsTrafficDetail.id : ''
   const normalizedUsersSearchTerm = String(usersSearchTerm || '').trim().toLowerCase()
   const usersTableRows = useMemo(
@@ -3420,6 +3583,7 @@ function App() {
   useEffect(() => {
     function handleHashChange() {
       setActiveTab(getTabFromHash())
+      setActivityClient(getActivityClientFromHash())
     }
 
     window.addEventListener('hashchange', handleHashChange)
@@ -3429,11 +3593,13 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const nextHash = `#${activeTab}`
+    const nextHash = activeTab === 'activity' && activityClient
+      ? `#activity/${encodeURIComponent(activityClient)}`
+      : `#${activeTab}`
     if (window.location.hash !== nextHash) {
       window.history.replaceState(null, '', nextHash)
     }
-  }, [activeTab])
+  }, [activeTab, activityClient])
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -3518,6 +3684,53 @@ function App() {
     if (clientValue !== 'all' && !(history.available_clients || []).includes(clientValue)) {
       setHistoryClient('all')
     }
+  }
+
+  async function refreshActivity(rangeValue = activityRange, clientValue = activityClient) {
+    const params = new URLSearchParams({ range: rangeValue })
+    if (clientValue) {
+      params.set('client', clientValue)
+    }
+    const response = await fetch(`/api/client-activity?${params.toString()}`, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) {
+      throw new Error(`client activity HTTP ${response.status}`)
+    }
+    const payload = await response.json()
+    setActivityData(payload)
+    setActivityError('')
+
+    if (!clientValue) {
+      setActivityDetailHistory(emptyHistoryData())
+      setActivityDetailRequests({ items: [], total: 0 })
+      return
+    }
+
+    const historyParams = new URLSearchParams({ range: rangeValue, client: clientValue })
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    if (browserTimezone) {
+      historyParams.set('timezone', browserTimezone)
+    }
+    historyParams.set('timezone_offset_minutes', String(-new Date().getTimezoneOffset()))
+    const requestParams = new URLSearchParams({
+      client: clientValue,
+      sort: 'timestamp',
+      direction: 'desc',
+      page: '1',
+      page_size: '50',
+      max_results: '5000',
+    })
+    const [historyResponse, requestsResponse] = await Promise.all([
+      fetch(`/api/history?${historyParams.toString()}`, { cache: 'no-store', headers: { Accept: 'application/json' } }),
+      fetch(`/api/history/requests?${requestParams.toString()}`, { cache: 'no-store', headers: { Accept: 'application/json' } }),
+    ])
+    if (!historyResponse.ok || !requestsResponse.ok) {
+      throw new Error(`activity detail HTTP ${historyResponse.status}/${requestsResponse.status}`)
+    }
+    setActivityDetailHistory(await historyResponse.json())
+    setActivityDetailRequests(await requestsResponse.json())
   }
 
   async function refreshHttpsTraffic(filterValue = httpsTrafficFilters) {
@@ -3793,6 +4006,7 @@ function App() {
 
   useEffect(() => {
     refreshHistoryRef.current = refreshHistory
+    refreshActivityRef.current = refreshActivity
     refreshHttpsTrafficRef.current = refreshHttpsTraffic
     refreshDashboardScopeRef.current = refreshDashboardScope
     loadRouterConfigRef.current = loadRouterConfig
@@ -4009,6 +4223,30 @@ function App() {
       window.clearTimeout(timeoutId)
     }
   }, [activeDashboardScopes])
+
+  useEffect(() => {
+    if (activeTab !== 'activity') {
+      return undefined
+    }
+    let disposed = false
+    const run = () => {
+      const refresh = refreshActivityRef.current
+      if (!refresh) {
+        return
+      }
+      refresh(activityRange, activityClient).catch((error) => {
+        if (!disposed) {
+          setActivityError(`Activity refresh paused: ${error.message}`)
+        }
+      })
+    }
+    run()
+    const intervalId = window.setInterval(run, 15000)
+    return () => {
+      disposed = true
+      window.clearInterval(intervalId)
+    }
+  }, [activeTab, activityRange, activityClient])
 
   useEffect(() => {
     if (activeTab !== 'traffic') {
@@ -4951,7 +5189,12 @@ function App() {
                 type="button"
                 aria-current={activeTab === tab.id ? 'page' : undefined}
                 aria-pressed={activeTab === tab.id ? 'true' : 'false'}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => {
+                  if (tab.id === 'activity') {
+                    setActivityClient('')
+                  }
+                  setActiveTab(tab.id)
+                }}
               >
                 <IconText icon={tab.icon}>{tab.label}</IconText>
               </button>
@@ -5058,7 +5301,7 @@ function App() {
           </section>
 
           <section className="sticky top-0 z-20 -mx-3 mt-3 border-y border-[var(--pr-panel-border)] bg-[var(--pr-page-to)] px-3 py-2 lg:hidden">
-            <div className="grid grid-cols-3 gap-2 min-[460px]:grid-cols-6" aria-label="Admin workflows">
+            <div className="grid grid-cols-3 gap-2 min-[460px]:grid-cols-4 sm:grid-cols-7" aria-label="Admin workflows">
               {TAB_DEFINITIONS.map((tab) => (
                 <button
                   key={tab.id}
@@ -5069,7 +5312,12 @@ function App() {
                   type="button"
                   aria-current={activeTab === tab.id ? 'page' : undefined}
                   aria-pressed={activeTab === tab.id ? 'true' : 'false'}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => {
+                    if (tab.id === 'activity') {
+                      setActivityClient('')
+                    }
+                    setActiveTab(tab.id)
+                  }}
                 >
                   <IconText icon={tab.icon} className="justify-center">{tab.shortLabel || tab.label}</IconText>
                 </button>
@@ -5289,6 +5537,158 @@ function App() {
               ) : (
                 <div className="pt-2 text-[#6a6f73]">No recent requests yet.</div>
               )}
+            </section>
+          </section>
+        </section>
+      ) : null}
+
+      {activeTab === 'activity' ? (
+        <section className="block">
+          <section className={gridClass}>
+            <section className={cx(panelClass, 'col-span-full')}>
+              <div className={panelHeaderClass}>
+                <div>
+                  <h2>{activityClient ? selectedActivityRow?.label || activityClient : 'VPN activity'}</h2>
+                  <div className={noteClass}>
+                    {activityClient
+                      ? activityClient
+                      : 'Authoritative WireGuard presence with client access blocks overlaid.'}
+                  </div>
+                </div>
+                <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+                  {activityClient ? (
+                    <button
+                      type="button"
+                      onClick={() => setActivityClient('')}
+                    >
+                      <IconText icon={ArrowLeft}>All users</IconText>
+                    </button>
+                  ) : null}
+                  <label className={cx(controlClass, 'sm:min-w-44')}>
+                    <span>Range</span>
+                    <select value={activityRange} onChange={(event) => setActivityRange(event.target.value)}>
+                      {ACTIVITY_RANGE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-4 text-sm text-[var(--pr-muted)]">
+                {[
+                  ['Connected', 'var(--pr-activity-connected)'],
+                  ['Disconnected', 'var(--pr-activity-disconnected)'],
+                  ['Blocked', 'var(--pr-activity-blocked)'],
+                ].map(([label, color]) => (
+                  <span className="inline-flex items-center gap-2" key={label}>
+                    <i className="inline-block size-3.5 rounded-[3px]" style={{ background: color }}></i>
+                    {label}
+                  </span>
+                ))}
+                <span className="inline-flex items-center gap-2">
+                  <i className="inline-block size-3.5 rounded-[3px]" style={{ background: 'var(--pr-activity-unknown)' }}></i>
+                  Unknown history
+                </span>
+                <span className="inline-flex items-center gap-2">
+                  <i className="inline-block h-4 w-0.5 bg-[var(--pr-error)]"></i>
+                  Rejected request
+                </span>
+              </div>
+
+              {activityError ? <div className={cx(statusPillClass, errorPillClass)}>{activityError}</div> : null}
+              {!activityData.presence_history_available ? (
+                <div className={cx(statusPillClass, warningPillClass)}>
+                  VPN transition history is not available yet. Patterned periods are unknown, not confirmed disconnects.
+                </div>
+              ) : null}
+
+              <ClientActivityTimeline
+                data={activityData}
+                selectedClient={activityClient}
+                onSelectClient={(client) => setActivityClient(client)}
+              />
+
+              {activityClient && selectedActivityRow ? (
+                <div className="mt-4 grid grid-cols-12 gap-4">
+                  <section className={cx(subpanelClass, 'col-span-full')}>
+                    <h3>Time summary</h3>
+                    <div className={cx(cardGridClass, 'mt-3')}>
+                      {[
+                        ['Connected', selectedActivityRow.summary?.connected_seconds],
+                        ['Disconnected', selectedActivityRow.summary?.disconnected_seconds],
+                        ['Blocked', selectedActivityRow.summary?.blocked_seconds],
+                        ['Unknown', selectedActivityRow.summary?.unknown_seconds],
+                      ].map(([label, value]) => (
+                        <div className={cardClass} key={label}>
+                          <div className={cardLabelClass}>{label}</div>
+                          <div className={cardValueClass}>{formatActivityDuration(value)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section className={cx(subpanelClass, 'col-span-full lg:col-span-5')}>
+                    <h3>Usage in range</h3>
+                    <div className={cx(cardGridClass, 'mt-3')}>
+                      {[
+                        ['Requests', activityDetailHistory.summary?.count || 0],
+                        ['Traffic', formatPanelTraffic(activityDetailHistory.summary?.total_bytes || 0)],
+                        ['Upload', formatPanelTraffic(activityDetailHistory.summary?.uploaded_bytes || 0)],
+                        ['Download', formatPanelTraffic(activityDetailHistory.summary?.downloaded_bytes || 0)],
+                      ].map(([label, value]) => (
+                        <div className={cardClass} key={label}>
+                          <div className={cardLabelClass}>{label}</div>
+                          <div className={cardValueClass}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <h3 className="mt-4">Top destinations</h3>
+                    {(activityDetailHistory.top_destinations || []).length ? (
+                      <div className={cx(tableWrapClass, 'mt-3')}>
+                        <table>
+                          <thead><tr><th>Destination</th><th>Requests</th><th>Traffic</th></tr></thead>
+                          <tbody>
+                            {activityDetailHistory.top_destinations.map((item) => (
+                              <tr key={item.destination}>
+                                <td className="max-w-72 break-words">{item.destination}</td>
+                                <td>{item.count}</td>
+                                <td>{formatPanelTraffic(item.total_bytes)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : <div className={noteClass}>No traffic matched this range.</div>}
+                  </section>
+
+                  <section className={cx(subpanelClass, 'col-span-full lg:col-span-7')}>
+                    <h3>Recent requests</h3>
+                    <div className={noteClass}>Latest 50 completed requests for this user.</div>
+                    <div className={cx(tableWrapClass, 'mt-3 max-h-[32rem] overflow-auto')}>
+                      <table className="min-w-[54rem]">
+                        <thead>
+                          <tr><th>Time</th><th>Method</th><th>Host</th><th>Route</th><th>Duration</th><th>Traffic</th></tr>
+                        </thead>
+                        <tbody>
+                          {(activityDetailRequests.items || []).length ? activityDetailRequests.items.map((item, index) => (
+                            <tr key={`${item.timestamp}-${item.destination}-${index}`}>
+                              <td>{formatStatusDateTime(item.timestamp)}</td>
+                              <td>{item.method || item.proxy_type}</td>
+                              <td className="max-w-72 break-words">{item.host || item.destination}</td>
+                              <td>{item.route_label || 'direct'}</td>
+                              <td>{formatDurationMs(item.duration_ms)}</td>
+                              <td>{formatBytes(item.total_bytes)}</td>
+                            </tr>
+                          )) : (
+                            <tr><td colSpan="6" className="text-[var(--pr-muted)]">No completed requests recorded for this user.</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                </div>
+              ) : null}
             </section>
           </section>
         </section>

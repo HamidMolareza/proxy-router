@@ -108,6 +108,7 @@ Persisted backend files:
 - `./data/usage.log`
 - `./data/failures.log`
 - `./data/https-traffic.log`
+- `./data/client-block-history.log`
 - `./data/error.log`
 
 `usage.log` records transfer totals plus optional performance fields such as `duration_ms`, `upstream_setup_ms`, `relay_ms`, `throughput_bps`, upstream retry counts, and selected upstream proxy metadata such as `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count`. Older records without these fields still load normally; they count toward traffic totals but not duration, throughput, or per-upstream samples. `GET /api/history/requests` exposes a bounded, filterable request-history view over this log for admin tools and MCP clients.
@@ -219,9 +220,10 @@ Arvan VPS setup:
 
 ## Dashboard
 
-The dashboard is organized around six admin workflows. Old direct hashes such as `#overview`, `#history`, `#users`, `#quotas`, and `#failures` continue to land on their matching workflow:
+The dashboard is organized around seven admin workflows. Old direct hashes such as `#overview`, `#history`, `#users`, `#quotas`, and `#failures` continue to land on their matching workflow:
 
 - `Dashboard`: current activity, totals, recent traffic, active clients
+- `Activity`: last-hour, 24-hour, 7-day, or 30-day VPN presence timelines with connected, disconnected, blocked, and unknown periods plus shareable per-user detail views
 - `Traffic`: time-bucketed usage history, calendar daily/weekly/monthly/yearly totals, per-client usage totals, top destinations, recent failures, grouped review, ignore and rule-creation workflows
 - `Routing`: rules, routing profiles, rule suggestions, and auto-proxy controls
 - `Proxies`: ordered upstream proxy definitions, access mode, allowed clients, mobile-friendly proxy cards, check-all connectivity results, global and per-user proxy quotas, per-proxy traffic, and per-user proxy traffic windows
@@ -269,6 +271,7 @@ Current dashboard behaviors:
 - Proxy authentication can be enabled without forcing every device to use it. Anonymous devices keep using IP-based identities, while HTTP Basic or SOCKS5 username/password clients are logged and limited as `user:<username>`.
 - The `Access` workflow can silently block a `user:<username>`, single IP, or matched configured target for a timed window such as `6h` or permanently with `always`
 - When a gateway supplies `--client-presence-file`, the `Access` workflow shows VPN online/offline state separately from active proxy request counts.
+- When a gateway also supplies `--client-presence-history-file`, the `Activity` workflow uses authoritative WireGuard transitions instead of inferring connection state from proxy requests. Client block snapshots are stored separately so black timeline periods survive restarts.
 - The device portal includes a Burp-style CA install flow at `http://proxy.router/ca`
 - The dashboard shows adaptive HTTPS fallback and HTTPS discovery status, including temporary raw-CONNECT bypasses after TLS trust failures and learned domain probe outcomes
 - Transient upstream connection/setup failures first fail over to the next allowed proxy, then use the configurable retry policy before returning an error to the client. CONNECT and SOCKS5 tunnels are retried before the tunnel opens; regular HTTP retries are limited to safe or empty-body requests. The retry policy also controls the setup timeout used while opening each destination or upstream connection.
@@ -345,6 +348,9 @@ When a client is blocked from the `Access` workflow:
 - `--router-config-file`: router config JSON path
 - `--usage-log-file`: usage log path
 - `--failure-log-file`: failure log path
+- `--client-presence-file`: current external VPN/client presence snapshot
+- `--client-presence-history-file`: external VPN/client presence transition JSONL log
+- `--client-block-history-file`: client block configuration history JSONL log
 - `--error-log-file`: persistent exception log path with traceback details
 - `--https-intercept-ca-cert-file`: HTTPS interception CA certificate path
 - `--https-intercept-ca-key-file`: HTTPS interception CA private key path

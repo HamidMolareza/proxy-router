@@ -2548,6 +2548,15 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         help=f"Router config file path used by the dashboard API. Default: {DEFAULT_ROUTER_CONFIG_PATH}",
     )
     parser.add_argument(
+        "--client-presence-history-file",
+        help="Optional JSONL file with external VPN/client presence transitions for Activity timelines.",
+    )
+    parser.add_argument(
+        "--client-block-history-file",
+        default=str(DEFAULT_CLIENT_BLOCK_HISTORY_PATH),
+        help=f"JSONL file for client block configuration history. Default: {DEFAULT_CLIENT_BLOCK_HISTORY_PATH}",
+    )
+    parser.add_argument(
         "--dashboard-bind",
         default=DASHBOARD_DEFAULT_BIND,
         help=f"Bind address for the dashboard API server. Default: {DASHBOARD_DEFAULT_BIND}",

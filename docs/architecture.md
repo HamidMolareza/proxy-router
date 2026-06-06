@@ -91,6 +91,8 @@ Persisted files:
 - `usage.log`: JSONL transfer summaries, including optional timing, throughput, selected upstream proxy, and failover fields for completed records
 - `failures.log`: JSONL failed-request events
 - `https-traffic.log`: JSONL intercepted HTTPS request/response analyzer records
+- `vpn-client-presence-history.log`: optional gateway-produced JSONL online/offline transition records
+- `client-block-history.log`: deduplicated client block configuration snapshots used to reconstruct exact block periods
 - `error.log`: exception details and tracebacks
 
 On backend startup:
@@ -160,6 +162,7 @@ Important routes:
 - `GET /api/dashboard/{scope}` where `scope` is `overview`, `users`, `failures`, `proxies`, `quotas`, `routing`, `https-status`, or `full`
 - `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
 - `GET /api/history/requests` with optional `client`, `client_ip`, `proxy_type`, `upstream_proxy_id`, `route_label`, `host`, `method`, `status_code`, `search`, `sort`, `direction`, `page`, `page_size`, and `max_results` query parameters
+- `GET /api/client-activity` with optional `range` (`1h`, `24h`, `7d`, or `30d`) and exact `client` query parameters
 - `GET /api/router-config`
 - `POST /api/router-config`
 - `POST /api/router-config/preview`
@@ -180,6 +183,7 @@ History API notes:
 - `/api/history` returns aggregate summaries and period buckets for dashboard charts.
 - `/api/history` summary responses are cached briefly by usage-log identity, invalid-line count, range/filter values, timezone fields, and time bucket. Appends are loaded but may be reflected on the next cache bucket; truncation, rotation, or explicit traffic-data clears invalidate cached summaries immediately.
 - `/api/history/requests` returns summarized request rows from `usage.log`; it filters before sorting, applies `max_results` before paging, and clamps page sizes to keep MCP and dashboard callers bounded.
+- `/api/client-activity` returns range-clipped per-user segments. Client blocks override presence, current presence extends the latest gateway transition, and periods before the first authoritative transition remain `unknown` rather than being reported as disconnected.
 - `/api/https-traffic` is separate from request history because it reads intercepted HTTPS analyzer records with request/response metadata from `https-traffic.log`.
 
 ### Device Portal
