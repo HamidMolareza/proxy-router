@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import errno
+import os
 import queue
 import socket
 import threading
@@ -18,6 +19,165 @@ from .traffic import AutoProxyFailureManager, HttpsDiscoveryManager, HttpsInterc
 from .util import *
 
 PROXY_CONNECTION_FAILURE_THRESHOLD = 3
+
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return default
+
+
+class TunnelLimitTicket:
+    def __init__(self, manager, client: str):
+        self._manager = manager
+        self._client = client
+        self._released = False
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        self._manager.release(self._client)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.release()
+
+
+class TunnelLimitManager:
+    def __init__(
+        self,
+        *,
+        max_active: int | None = None,
+        max_per_client: int | None = None,
+        max_per_admin_client: int | None = None,
+        idle_timeout_seconds: float | None = None,
+        notify_callback=None,
+    ):
+        self.max_active = max(
+            0,
+            int(
+                max_active
+                if max_active is not None
+                else _env_int("PROXY_ROUTER_MAX_ACTIVE_TUNNELS", 120)
+            ),
+        )
+        self.max_per_client = max(
+            0,
+            int(
+                max_per_client
+                if max_per_client is not None
+                else _env_int("PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_CLIENT", 50)
+            ),
+        )
+        self.max_per_admin_client = max(
+            0,
+            int(
+                max_per_admin_client
+                if max_per_admin_client is not None
+                else _env_int("PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_ADMIN_CLIENT", 80)
+            ),
+        )
+        self.idle_timeout_seconds = max(
+            0.0,
+            float(
+                idle_timeout_seconds
+                if idle_timeout_seconds is not None
+                else _env_float("PROXY_ROUTER_TUNNEL_IDLE_TIMEOUT_SECONDS", 300.0)
+            ),
+        )
+        self._notify_callback = notify_callback
+        self._lock = threading.Lock()
+        self._active_total = 0
+        self._active_by_client = {}
+        self._rejected_total = 0
+        self._rejected_by_reason = {}
+
+    def _limit_for_client(self, client: str) -> int:
+        if str(client or "").startswith("user:admin"):
+            return self.max_per_admin_client
+        return self.max_per_client
+
+    def _notify(self):
+        if self._notify_callback is not None:
+            self._notify_callback("connections")
+
+    def try_acquire(self, *, client: str) -> tuple[TunnelLimitTicket | None, dict | None]:
+        normalized_client = str(client or "unknown").strip() or "unknown"
+        with self._lock:
+            if self.max_active and self._active_total >= self.max_active:
+                rejection = self._record_rejection_locked("global_limit", normalized_client)
+                return None, rejection
+
+            client_limit = self._limit_for_client(normalized_client)
+            client_active = int(self._active_by_client.get(normalized_client, 0))
+            if client_limit and client_active >= client_limit:
+                rejection = self._record_rejection_locked("client_limit", normalized_client)
+                return None, rejection
+
+            self._active_total += 1
+            self._active_by_client[normalized_client] = client_active + 1
+
+        self._notify()
+        return TunnelLimitTicket(self, normalized_client), None
+
+    def _record_rejection_locked(self, reason: str, client: str) -> dict:
+        self._rejected_total += 1
+        self._rejected_by_reason[reason] = self._rejected_by_reason.get(reason, 0) + 1
+        return {
+            "reason": reason,
+            "client": client,
+            "active_total": self._active_total,
+            "client_active": int(self._active_by_client.get(client, 0)),
+            "max_active": self.max_active,
+            "client_limit": self._limit_for_client(client),
+        }
+
+    def release(self, client: str):
+        normalized_client = str(client or "unknown").strip() or "unknown"
+        with self._lock:
+            if self._active_total > 0:
+                self._active_total -= 1
+            client_active = int(self._active_by_client.get(normalized_client, 0))
+            if client_active <= 1:
+                self._active_by_client.pop(normalized_client, None)
+            else:
+                self._active_by_client[normalized_client] = client_active - 1
+        self._notify()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "active_total": self._active_total,
+                "active_by_client": dict(
+                    sorted(self._active_by_client.items(), key=lambda item: (-item[1], item[0]))
+                ),
+                "rejected_total": self._rejected_total,
+                "rejected_by_reason": dict(sorted(self._rejected_by_reason.items())),
+                "limits": {
+                    "max_active": self.max_active,
+                    "max_per_client": self.max_per_client,
+                    "max_per_admin_client": self.max_per_admin_client,
+                    "idle_timeout_seconds": self.idle_timeout_seconds,
+                },
+            }
+
 
 class DashboardState:
     def __init__(
@@ -1344,6 +1504,7 @@ class AppRuntime:
         self.self_endpoints = SelfEndpoints()
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
         self.proxy_status = UpstreamProxyListStatus(self.notify_dashboard_update)
+        self.tunnel_limits = TunnelLimitManager(notify_callback=self.notify_dashboard_update)
         self.https_interception = HttpsCertificateManager(
             ca_cert_file=DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH,
             ca_key_file=DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH,

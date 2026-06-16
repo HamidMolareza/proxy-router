@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import errno
 import hashlib
 import html
@@ -383,6 +384,7 @@ def tunnel_bidirectional(
     right_socket,
     *,
     half_close_drain_seconds=TUNNEL_HALF_CLOSE_DRAIN_SECONDS,
+    idle_timeout_seconds: float | None = None,
 ):
     left_socket.setblocking(False)
     right_socket.setblocking(False)
@@ -405,6 +407,8 @@ def tunnel_bidirectional(
         "close_reason": "completed",
     }
     half_close_deadline = None
+    idle_timeout = max(0.0, float(idle_timeout_seconds or 0.0))
+    last_activity = time.monotonic()
 
     def peer_for(sock):
         return right_socket if sock is left_socket else left_socket
@@ -476,12 +480,19 @@ def tunnel_bidirectional(
                 return stats
 
             select_timeout = 1.0
+            now_monotonic = time.monotonic()
             if half_close_deadline is not None:
-                remaining_drain_seconds = half_close_deadline - time.monotonic()
+                remaining_drain_seconds = half_close_deadline - now_monotonic
                 if remaining_drain_seconds <= 0:
                     stats["close_reason"] = "half_close_timeout"
                     return stats
                 select_timeout = min(select_timeout, remaining_drain_seconds)
+            if idle_timeout > 0:
+                remaining_idle_seconds = (last_activity + idle_timeout) - now_monotonic
+                if remaining_idle_seconds <= 0:
+                    stats["close_reason"] = "idle_timeout"
+                    return stats
+                select_timeout = min(select_timeout, remaining_idle_seconds)
 
             selected = selector.select(timeout=select_timeout)
             if not selected:
@@ -513,6 +524,7 @@ def tunnel_bidirectional(
 
                     target = peer_for(current)
                     buffers[target].extend(data)
+                    last_activity = time.monotonic()
                     if current is left_socket:
                         stats["left_to_right_bytes"] += len(data)
                     else:
@@ -532,12 +544,18 @@ def tunnel_bidirectional(
                     if sent <= 0:
                         stats["close_reason"] = "socket_error"
                         return stats
+                    last_activity = time.monotonic()
                     del buffers[current][:sent]
                     shutdown_peer_when_drained(current)
                     update_interest(current)
                     update_interest(peer_for(current))
     finally:
         selector.close()
+        for sock in (left_socket, right_socket):
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 class ClientTracker:
     def __init__(self, proxy_label: str, runtime):
@@ -782,6 +800,53 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _tunnel_idle_timeout_seconds(self) -> float:
+        tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
+        if tunnel_limits is None:
+            return 0.0
+        return float(getattr(tunnel_limits, "idle_timeout_seconds", 0.0) or 0.0)
+
+    def _try_acquire_tunnel_slot(self, *, destination: str, host: str, port: int, route_decision):
+        tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
+        if tunnel_limits is None:
+            return contextlib.nullcontext()
+        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id())
+        if ticket is not None:
+            return ticket
+
+        reason = str((rejection or {}).get("reason") or "limit")
+        message = f"Proxy-router tunnel limit reached ({reason})."
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method="CONNECT",
+            destination=destination,
+            host=host,
+            port=port,
+            error=message,
+            context="proxy-router tunnel overload",
+            route_label=route_decision["route_label"],
+            matched_rule=route_decision["matched_rule"],
+            profile_id=route_decision.get("profile_id"),
+            **self._proxy_record_kwargs(route_decision),
+        )
+        self._send_body_response(
+            503,
+            "Proxy Router Overloaded",
+            f"{message}\n".encode("utf-8"),
+            content_type="text/plain; charset=utf-8",
+            extra_headers={
+                "Connection": "close",
+                "Retry-After": "5",
+                "Proxy-Status": "proxy-router; error=proxy_overloaded",
+            },
+        )
+        return None
+
     def _https_interception_client_key(self) -> str:
         return https_interception_client_key(self._client_identity(), self.client_address[0])
 
@@ -993,11 +1058,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self._log_http_event(
                     f"CONNECT {host}:{port} using raw tunnel after adaptive HTTPS bypass"
                 )
+            tunnel_ticket = self._try_acquire_tunnel_slot(
+                destination=f"{host}:{port}",
+                host=host,
+                port=port,
+                route_decision=route_decision,
+            )
+            if tunnel_ticket is None:
+                return
             upstream_owner = None
             upstream = None
             upstream_metrics = {}
             upstream_setup_ms = None
-            try:
+            with tunnel_ticket:
                 upstream_setup_started = time.monotonic()
                 try:
                     opened_stream = self._open_routed_stream(
@@ -1039,7 +1112,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
                 self.send_response(200, "Connection Established")
                 self.end_headers()
-                stats = tunnel_bidirectional(self.connection, upstream)
+                stats = tunnel_bidirectional(
+                    self.connection,
+                    upstream,
+                    idle_timeout_seconds=self._tunnel_idle_timeout_seconds(),
+                )
                 duration_ms = int((time.monotonic() - request_started) * 1000)
                 relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
@@ -1073,12 +1150,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 )
                 if route_decision.get("auto_proxy_probe"):
                     self.server.runtime.record_auto_proxy_success(host, route_decision)
-            finally:
                 if upstream_owner is not None:
                     upstream_owner.close()
+                    upstream_owner = None
                 elif upstream is not None:
                     upstream.close()
+                    upstream = None
         except Exception as exc:
+            if "upstream_owner" in locals() and upstream_owner is not None:
+                upstream_owner.close()
+                upstream_owner = None
+            elif "upstream" in locals() and upstream is not None:
+                upstream.close()
+                upstream = None
             self._send_gateway_error(
                 exc,
                 context=f"CONNECT {host}:{port}" if "host" in locals() else "CONNECT",
@@ -3261,6 +3345,43 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
     def _client_id(self) -> str:
         return str(self._client_identity().get("id") or self.client_address[0])
 
+    def _tunnel_idle_timeout_seconds(self) -> float:
+        tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
+        if tunnel_limits is None:
+            return 0.0
+        return float(getattr(tunnel_limits, "idle_timeout_seconds", 0.0) or 0.0)
+
+    def _try_acquire_tunnel_slot(self, *, destination: str, host: str, port: int, route_decision):
+        tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
+        if tunnel_limits is None:
+            return contextlib.nullcontext()
+        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id())
+        if ticket is not None:
+            return ticket
+
+        reason = str((rejection or {}).get("reason") or "limit")
+        message = f"Proxy-router tunnel limit reached ({reason})."
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method="CONNECT",
+            destination=destination,
+            host=host,
+            port=port,
+            error=message,
+            context="proxy-router tunnel overload",
+            route_label=route_decision["route_label"],
+            matched_rule=route_decision["matched_rule"],
+            profile_id=route_decision.get("profile_id"),
+            **self._proxy_record_kwargs(route_decision),
+        )
+        self._send_reply(0x01)
+        return None
+
     def _https_interception_client_key(self) -> str:
         return https_interception_client_key(self._client_identity(), self.client_address[0])
 
@@ -3689,11 +3810,19 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 )
                 self._send_reply(reply_code)
                 return
+            tunnel_ticket = self._try_acquire_tunnel_slot(
+                destination=f"{destination_host}:{destination_port}",
+                host=destination_host,
+                port=destination_port,
+                route_decision=route_decision,
+            )
+            if tunnel_ticket is None:
+                return
             upstream_owner = None
             upstream = None
             upstream_metrics = {}
             upstream_setup_ms = None
-            try:
+            with tunnel_ticket:
                 upstream_setup_started = time.monotonic()
                 try:
                     opened_stream = self._open_routed_stream(
@@ -3740,7 +3869,11 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                     destination=f"{destination_host}:{destination_port}",
                     proxy_label=self.server.proxy_label,
                 )
-                stats = tunnel_bidirectional(self.request, upstream)
+                stats = tunnel_bidirectional(
+                    self.request,
+                    upstream,
+                    idle_timeout_seconds=self._tunnel_idle_timeout_seconds(),
+                )
                 duration_ms = int((time.monotonic() - request_started) * 1000)
                 relay_ms = max(0, duration_ms - upstream_setup_ms) if upstream_setup_ms is not None else None
                 self._debug(
@@ -3773,12 +3906,19 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 )
                 if route_decision.get("auto_proxy_probe"):
                     self.server.runtime.record_auto_proxy_success(destination_host, route_decision)
-            finally:
                 if upstream_owner is not None:
                     upstream_owner.close()
+                    upstream_owner = None
                 elif upstream is not None:
                     upstream.close()
+                    upstream = None
         except (OSError, ValueError) as exc:
+            if "upstream_owner" in locals() and upstream_owner is not None:
+                upstream_owner.close()
+                upstream_owner = None
+            elif "upstream" in locals() and upstream is not None:
+                upstream.close()
+                upstream = None
             if self._is_closed_socket_error(exc):
                 self._debug(f"client disconnected before SOCKS5 reply could be sent: {exc}", level="INFO")
                 return

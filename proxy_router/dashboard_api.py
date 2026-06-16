@@ -260,6 +260,9 @@ def build_router_runtime_dashboard_snapshot(server):
     proxy_status = getattr(server.runtime, "proxy_status", None)
     if proxy_status is not None:
         router_runtime_snapshot["proxy_status"] = proxy_status.snapshot()
+    tunnel_limits = getattr(server.runtime, "tunnel_limits", None)
+    if tunnel_limits is not None:
+        router_runtime_snapshot["tunnel_limits"] = tunnel_limits.snapshot()
     router_runtime_snapshot["https_interception_status"] = server.runtime.https_interception_status(
         server.router_config.https_interception_settings()
     )

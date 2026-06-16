@@ -312,6 +312,18 @@ Diagnosis tips:
 - HTTPS interception can add TLS and body-preview work for matched hosts; use HTTPS throughput mode or an allowlist-only setup when raw CONNECT/SOCKS5 speed matters.
 - `python3 ./proxy-router usage-analyze /tmp/proxy-router-usage.log` prints timing samples from the same JSONL data for offline review.
 
+Run the managed tunnel pressure test before deploying relay or tunnel-limit
+changes:
+
+```bash
+python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 \
+  --max-per-client 20 --idle-timeout 1 --duration 20 --json
+```
+
+The test starts a temporary local proxy-router, opens idle and half-closed
+tunnels through a blackhole target, verifies dashboard probes stay responsive,
+and fails if final active tunnels or `CLOSE-WAIT` sockets remain.
+
 ## Quotas
 
 - Client auth credentials can be managed from the `Access` workflow. When `Allow anonymous devices` is enabled, devices without proxy credentials continue to work normally; SOCKS5 clients that offer both no-auth and username/password are accepted as anonymous. Loopback clients from the proxy host (`127.0.0.0/8` and `::1`) are allowed without credentials even when anonymous devices are disabled.
@@ -401,6 +413,7 @@ docs/                      supporting project documentation
 ```bash
 python3 -m py_compile ./proxy-router proxy_router/*.py
 python3 -m unittest discover
+python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 --max-per-client 20 --idle-timeout 1 --duration 20 --json
 python3 ./proxy-router --help
 cd frontend && npm install && npm run lint && npm run build
 docker compose config

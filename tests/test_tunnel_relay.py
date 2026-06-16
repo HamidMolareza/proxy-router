@@ -28,6 +28,11 @@ def recv_exact(sock, size):
     return b"".join(chunks)
 
 
+def assert_sockets_closed(test_case, *sockets):
+    for sock in sockets:
+        test_case.assertEqual(sock.fileno(), -1)
+
+
 class BlockingSendOnceSocket:
     def __init__(self, inner):
         self._inner = inner
@@ -112,6 +117,30 @@ class TunnelRelayTests(unittest.TestCase):
             close_sockets(left_client, right_client, left_proxy, right_proxy)
             thread.join(timeout=2.0)
 
+    def test_tunnel_bidirectional_times_out_when_idle_timeout_is_configured(self):
+        left_proxy, left_client = socket.socketpair()
+        right_proxy, right_client = socket.socketpair()
+        result = {}
+
+        def run_tunnel():
+            result["stats"] = tunnel_bidirectional(
+                left_proxy,
+                right_proxy,
+                idle_timeout_seconds=0.05,
+            )
+
+        thread = threading.Thread(target=run_tunnel)
+        thread.start()
+        try:
+            thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["stats"]["close_reason"], "idle_timeout")
+            assert_sockets_closed(self, left_proxy, right_proxy)
+        finally:
+            close_sockets(left_client, right_client, left_proxy, right_proxy)
+            thread.join(timeout=2.0)
+
     def test_tunnel_bidirectional_relays_both_directions(self):
         left_proxy, left_client = socket.socketpair()
         right_proxy, right_client = socket.socketpair()
@@ -138,6 +167,7 @@ class TunnelRelayTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(result["stats"]["left_to_right_bytes"], 5)
             self.assertEqual(result["stats"]["right_to_left_bytes"], 5)
+            assert_sockets_closed(self, left_proxy, right_proxy)
         finally:
             close_sockets(left_client, right_client, left_proxy, right_proxy)
             thread.join(timeout=2.0)
@@ -229,6 +259,7 @@ class TunnelRelayTests(unittest.TestCase):
             self.assertEqual(result["stats"]["left_to_right_bytes"], len(request))
             self.assertEqual(result["stats"]["right_to_left_bytes"], 0)
             self.assertEqual(result["stats"]["close_reason"], "half_close_timeout")
+            assert_sockets_closed(self, left_proxy, right_proxy)
         finally:
             close_sockets(left_client, right_client, left_proxy, right_proxy)
             thread.join(timeout=2.0)

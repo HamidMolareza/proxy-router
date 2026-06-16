@@ -360,6 +360,18 @@ function emptyDashboardSnapshot() {
         enabled_count: 0,
         results: [],
       },
+      tunnel_limits: {
+        active_total: 0,
+        active_by_client: {},
+        rejected_total: 0,
+        rejected_by_reason: {},
+        limits: {
+          max_active: 0,
+          max_per_client: 0,
+          max_per_admin_client: 0,
+          idle_timeout_seconds: 0,
+        },
+      },
       https_interception_status: emptyHttpsInterceptionStatus(),
     },
   }
@@ -400,6 +412,24 @@ function mergeDashboardSnapshot(existingSnapshot, patch) {
         patch.router_runtime?.proxy_status?.results ||
         base.router_runtime?.proxy_status?.results ||
         [],
+    }
+  }
+  if (base.router_runtime?.tunnel_limits || patch.router_runtime?.tunnel_limits) {
+    mergedRuntime.tunnel_limits = {
+      ...(base.router_runtime?.tunnel_limits || {}),
+      ...(patch.router_runtime?.tunnel_limits || {}),
+      active_by_client:
+        patch.router_runtime?.tunnel_limits?.active_by_client ||
+        base.router_runtime?.tunnel_limits?.active_by_client ||
+        {},
+      rejected_by_reason:
+        patch.router_runtime?.tunnel_limits?.rejected_by_reason ||
+        base.router_runtime?.tunnel_limits?.rejected_by_reason ||
+        {},
+      limits: {
+        ...(base.router_runtime?.tunnel_limits?.limits || {}),
+        ...(patch.router_runtime?.tunnel_limits?.limits || {}),
+      },
     }
   }
   if (base.router_runtime?.https_interception_status || patch.router_runtime?.https_interception_status) {
@@ -2289,9 +2319,13 @@ function buildOverviewCards(snapshot) {
   const activeTotal = Object.values(snapshot.active_by_proxy || {}).reduce((sum, count) => sum + count, 0)
   const directSummary = (snapshot.totals_by_route && snapshot.totals_by_route.direct) || emptyUsageSummary()
   const proxySummary = (snapshot.totals_by_route && snapshot.totals_by_route.proxy) || emptyUsageSummary()
+  const tunnelStatus = buildTunnelPressureStatus(snapshot)
   return [
     ['Started', snapshot.started_at],
     ['Active connections', String(activeTotal)],
+    ['Active tunnels', tunnelStatus.activeLabel],
+    ['Tunnel rejections', String(tunnelStatus.rejectedTotal)],
+    ['Tunnel idle timeout', tunnelStatus.idleTimeoutLabel],
     ['Requests handled', String(overall.count)],
     ['Direct handled', `${String(directSummary.count)} (${formatPercent(directSummary.count, overall.count)})`],
     ['Proxied handled', `${String(proxySummary.count)} (${formatPercent(proxySummary.count, overall.count)})`],
@@ -2302,6 +2336,32 @@ function buildOverviewCards(snapshot) {
     ['Proxied traffic', formatPanelTraffic(proxySummary.total_bytes)],
     ['Total traffic', formatPanelTraffic(overall.total_bytes)],
   ]
+}
+
+function buildTunnelPressureStatus(snapshot) {
+  const runtime = currentRouterRuntime(snapshot)
+  const tunnelLimits = runtime.tunnel_limits && typeof runtime.tunnel_limits === 'object' ? runtime.tunnel_limits : {}
+  const limits = tunnelLimits.limits && typeof tunnelLimits.limits === 'object' ? tunnelLimits.limits : {}
+  const activeTotal = Number(tunnelLimits.active_total || 0)
+  const rejectedTotal = Number(tunnelLimits.rejected_total || 0)
+  const maxActive = Number(limits.max_active || 0)
+  const maxPerClient = Number(limits.max_per_client || 0)
+  const maxPerAdminClient = Number(limits.max_per_admin_client || 0)
+  const idleTimeoutSeconds = Number(limits.idle_timeout_seconds || 0)
+  const activeLabel = maxActive > 0 ? `${activeTotal}/${maxActive}` : String(activeTotal)
+  const clientLimitLabel = [
+    maxPerClient > 0 ? `${maxPerClient}/client` : 'client limit off',
+    maxPerAdminClient > 0 ? `${maxPerAdminClient}/admin` : 'admin limit off',
+  ].join(' · ')
+  return {
+    activeTotal,
+    activeLabel,
+    rejectedTotal,
+    maxActive,
+    clientLimitLabel,
+    idleTimeoutLabel: idleTimeoutSeconds > 0 ? formatDuration(idleTimeoutSeconds) : 'Disabled',
+    warning: (maxActive > 0 && activeTotal >= maxActive) || rejectedTotal > 0,
+  }
 }
 
 function buildHistoryCards(history) {
@@ -3119,6 +3179,7 @@ function App() {
   const historyCards = useMemo(() => buildHistoryCards(historyData), [historyData])
   const overviewCards = useMemo(() => buildOverviewCards(dashboardSnapshot), [dashboardSnapshot])
   const usageChartPoints = useMemo(() => buildUsageChartPoints(dashboardSnapshot), [dashboardSnapshot])
+  const tunnelPressureStatus = useMemo(() => buildTunnelPressureStatus(dashboardSnapshot), [dashboardSnapshot])
   const profileRuntimeItems = useMemo(
     () => buildProfileRuntimeItems(currentRouterConfig, dashboardSnapshot),
     [currentRouterConfig, dashboardSnapshot],
@@ -3148,6 +3209,13 @@ function App() {
       detail: proxyConnectionStatus.message,
       icon: Network,
       warning: proxyConnectionStatus.pillClassName.includes('warning') || proxyConnectionStatus.label.includes('No '),
+    },
+    {
+      label: 'Tunnel pressure',
+      value: tunnelPressureStatus.activeLabel,
+      detail: `${tunnelPressureStatus.clientLimitLabel} · idle ${tunnelPressureStatus.idleTimeoutLabel} · rejected ${tunnelPressureStatus.rejectedTotal}`,
+      icon: Activity,
+      warning: tunnelPressureStatus.warning,
     },
     {
       label: 'Live state',
@@ -5263,7 +5331,7 @@ function App() {
               </div>
             </div>
 
-            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3" aria-live="polite">
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4" aria-live="polite">
               {statusCards.map((item) => (
                 <div
                   className={cx(
