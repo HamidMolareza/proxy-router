@@ -598,7 +598,56 @@ class ClientTracker:
         self.runtime.notify_dashboard_update("connections")
 
 
-class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
+class BoundedThreadingMixIn(socketserver.ThreadingMixIn):
+    def configure_client_handler_limits(
+        self,
+        *,
+        client_header_timeout_seconds: float,
+        max_client_handler_threads: int,
+    ):
+        self.client_header_timeout_seconds = max(0.1, float(client_header_timeout_seconds))
+        self.max_client_handler_threads = max(0, int(max_client_handler_threads))
+        self._client_handler_semaphore = (
+            threading.BoundedSemaphore(self.max_client_handler_threads)
+            if self.max_client_handler_threads
+            else None
+        )
+        self._client_handler_rejections = 0
+
+    def process_request(self, request, client_address):
+        semaphore = getattr(self, "_client_handler_semaphore", None)
+        acquired = False
+        if semaphore is not None:
+            acquired = semaphore.acquire(blocking=False)
+            if not acquired:
+                self._client_handler_rejections += 1
+                with contextlib.suppress(OSError):
+                    request.shutdown(socket.SHUT_RDWR)
+                self.close_request(request)
+                log_event(
+                    getattr(self, "proxy_label", "proxy"),
+                    "client handler limit reached: "
+                    f"{client_address[0]}:{client_address[1]} "
+                    f"max={self.max_client_handler_threads}",
+                )
+                return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            if acquired:
+                semaphore.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            semaphore = getattr(self, "_client_handler_semaphore", None)
+            if semaphore is not None:
+                semaphore.release()
+
+
+class ThreadedHTTPProxyServer(BoundedThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
@@ -609,6 +658,8 @@ class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
         *,
         allowed_networks,
         timeout_seconds,
+        client_header_timeout_seconds,
+        max_client_handler_threads,
         verbose,
         debug,
         proxy_label,
@@ -616,6 +667,10 @@ class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
         runtime,
     ):
         super().__init__(server_address, handler_class)
+        self.configure_client_handler_limits(
+            client_header_timeout_seconds=client_header_timeout_seconds,
+            max_client_handler_threads=max_client_handler_threads,
+        )
         self.allowed_networks = allowed_networks
         self.timeout_seconds = timeout_seconds
         self.verbose = verbose
@@ -625,6 +680,11 @@ class ThreadedHTTPProxyServer(socketserver.ThreadingMixIn, HTTPServer):
         self.router_config = router_config
         self.runtime = runtime
         self.history_cache = UsageHistoryCache(runtime.usage_log_path)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(self.client_header_timeout_seconds)
+        return request, client_address
 
 
 class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
@@ -636,6 +696,8 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
         ssl_context,
         allowed_networks,
         timeout_seconds,
+        client_header_timeout_seconds,
+        max_client_handler_threads,
         verbose,
         debug,
         proxy_label,
@@ -648,6 +710,8 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
             handler_class,
             allowed_networks=allowed_networks,
             timeout_seconds=timeout_seconds,
+            client_header_timeout_seconds=client_header_timeout_seconds,
+            max_client_handler_threads=max_client_handler_threads,
             verbose=verbose,
             debug=debug,
             proxy_label=proxy_label,
@@ -658,6 +722,7 @@ class ThreadedTLSHTTPProxyServer(ThreadedHTTPProxyServer):
     def get_request(self):
         raw_socket, client_address = super().get_request()
         try:
+            raw_socket.settimeout(self.client_header_timeout_seconds)
             return self.ssl_context.wrap_socket(raw_socket, server_side=True), client_address
         except ssl.SSLError:
             raw_socket.close()
@@ -669,6 +734,7 @@ class ProtocolServerView:
         self._server = server
         self.allowed_networks = server.allowed_networks
         self.timeout_seconds = server.timeout_seconds
+        self.client_header_timeout_seconds = server.client_header_timeout_seconds
         self.verbose = server.verbose
         self.debug = server.debug
         self.proxy_label = proxy_label
@@ -684,6 +750,7 @@ class InterceptedHTTPSProtocolView:
     def __init__(self, server, *, client_identity=None):
         self.allowed_networks = server.allowed_networks
         self.timeout_seconds = server.timeout_seconds
+        self.client_header_timeout_seconds = getattr(server, "client_header_timeout_seconds", DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS)
         self.verbose = server.verbose
         self.debug = server.debug
         self.proxy_label = "https"
@@ -700,6 +767,7 @@ class ClientPortalProtocolView:
     def __init__(self, server, *, client_identity=None):
         self.allowed_networks = server.allowed_networks
         self.timeout_seconds = server.timeout_seconds
+        self.client_header_timeout_seconds = getattr(server, "client_header_timeout_seconds", DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS)
         self.verbose = server.verbose
         self.debug = server.debug
         self.proxy_label = server.proxy_label
@@ -712,13 +780,29 @@ class ClientPortalProtocolView:
         self.https_interception_capture = False
 
 
-class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class ThreadedMixedProxyServer(BoundedThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
     address_family = socket.AF_INET
 
-    def __init__(self, server_address, *, allowed_networks, timeout_seconds, verbose, debug, router_config, runtime):
+    def __init__(
+        self,
+        server_address,
+        *,
+        allowed_networks,
+        timeout_seconds,
+        client_header_timeout_seconds,
+        max_client_handler_threads,
+        verbose,
+        debug,
+        router_config,
+        runtime,
+    ):
         super().__init__(server_address, socketserver.BaseRequestHandler)
+        self.configure_client_handler_limits(
+            client_header_timeout_seconds=client_header_timeout_seconds,
+            max_client_handler_threads=max_client_handler_threads,
+        )
         self.allowed_networks = allowed_networks
         self.timeout_seconds = timeout_seconds
         self.verbose = verbose
@@ -736,13 +820,23 @@ class ThreadedMixedProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServ
         }
 
     def finish_request(self, request, client_address):
-        protocol = self.detect_protocol(request)
+        request.settimeout(self.client_header_timeout_seconds)
+        try:
+            protocol = self.detect_protocol(request)
+        except socket.timeout:
+            log_event(
+                "mixed",
+                f"client header timeout: {client_address[0]}:{client_address[1]}",
+            )
+            return
         handler_class = Socks5RequestHandler if protocol == "socks5" else ProxyRequestHandler
         handler_class(request, client_address, self._protocol_views[protocol])
 
     def detect_protocol(self, request) -> str:
         try:
             first_byte = request.recv(1, socket.MSG_PEEK)
+        except socket.timeout:
+            raise
         except OSError:
             return "http"
 
@@ -773,6 +867,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.client_address[0],
                 client=getattr(self, "_dashboard_client_id", self.client_address[0]),
             )
+
+    def handle_one_request(self):
+        with contextlib.suppress(OSError):
+            self.request.settimeout(
+                getattr(self.server, "client_header_timeout_seconds", DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS)
+            )
+        super().handle_one_request()
+
+    def parse_request(self):
+        parsed = super().parse_request()
+        if parsed:
+            with contextlib.suppress(OSError):
+                self.request.settimeout(getattr(self.server, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        return parsed
 
     def log_message(self, fmt, *args):
         if self.server.verbose:
@@ -843,6 +951,47 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 "Connection": "close",
                 "Retry-After": "5",
                 "Proxy-Status": "proxy-router; error=proxy_overloaded",
+            },
+        )
+        return None
+
+    def _try_acquire_upstream_setup_slot(self, *, destination: str, host: str, port: int, route_decision):
+        setup_limits = getattr(self.server.runtime, "upstream_setup_limits", None)
+        if setup_limits is None:
+            return contextlib.nullcontext()
+        ticket, rejection = setup_limits.try_acquire()
+        if ticket is not None:
+            return ticket
+
+        reason = str((rejection or {}).get("reason") or "limit")
+        message = f"Proxy-router upstream setup limit reached ({reason})."
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method="CONNECT",
+            destination=destination,
+            host=host,
+            port=port,
+            error=message,
+            context="proxy-router upstream setup overload",
+            route_label=route_decision["route_label"],
+            matched_rule=route_decision["matched_rule"],
+            profile_id=route_decision.get("profile_id"),
+            **self._proxy_record_kwargs(route_decision),
+        )
+        self._send_body_response(
+            503,
+            "Proxy Router Overloaded",
+            f"{message}\n".encode("utf-8"),
+            content_type="text/plain; charset=utf-8",
+            extra_headers={
+                "Connection": "close",
+                "Retry-After": "3",
+                "Proxy-Status": "proxy-router; error=upstream_setup_overload",
             },
         )
         return None
@@ -1071,38 +1220,47 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             upstream_metrics = {}
             upstream_setup_ms = None
             with tunnel_ticket:
+                setup_ticket = self._try_acquire_upstream_setup_slot(
+                    destination=f"{host}:{port}",
+                    host=host,
+                    port=port,
+                    route_decision=route_decision,
+                )
+                if setup_ticket is None:
+                    return
                 upstream_setup_started = time.monotonic()
-                try:
-                    opened_stream = self._open_routed_stream(
-                        host,
-                        port,
-                        route_decision,
-                        retry_metrics=upstream_metrics,
-                    )
-                    if len(opened_stream) == 2:
-                        upstream, upstream_owner = opened_stream
-                    else:
-                        upstream, upstream_owner, route_decision = opened_stream
-                except Exception as exc:
-                    probe_route = self._build_auto_proxy_direct_failure_probe_route(host, route_decision, exc)
-                    if probe_route is None:
-                        raise
-                    self._debug(
-                        "retrying failed direct CONNECT through auto-proxy probe "
-                        f"target={host}:{port} route={probe_route['route_label']} direct_error={exc}",
-                        level="WARNING",
-                    )
-                    route_decision = probe_route
-                    opened_stream = self._open_routed_stream(
-                        host,
-                        port,
-                        route_decision,
-                        retry_metrics=upstream_metrics,
-                    )
-                    if len(opened_stream) == 2:
-                        upstream, upstream_owner = opened_stream
-                    else:
-                        upstream, upstream_owner, route_decision = opened_stream
+                with setup_ticket:
+                    try:
+                        opened_stream = self._open_routed_stream(
+                            host,
+                            port,
+                            route_decision,
+                            retry_metrics=upstream_metrics,
+                        )
+                        if len(opened_stream) == 2:
+                            upstream, upstream_owner = opened_stream
+                        else:
+                            upstream, upstream_owner, route_decision = opened_stream
+                    except Exception as exc:
+                        probe_route = self._build_auto_proxy_direct_failure_probe_route(host, route_decision, exc)
+                        if probe_route is None:
+                            raise
+                        self._debug(
+                            "retrying failed direct CONNECT through auto-proxy probe "
+                            f"target={host}:{port} route={probe_route['route_label']} direct_error={exc}",
+                            level="WARNING",
+                        )
+                        route_decision = probe_route
+                        opened_stream = self._open_routed_stream(
+                            host,
+                            port,
+                            route_decision,
+                            retry_metrics=upstream_metrics,
+                        )
+                        if len(opened_stream) == 2:
+                            upstream, upstream_owner = opened_stream
+                        else:
+                            upstream, upstream_owner, route_decision = opened_stream
                 upstream_setup_ms = int((time.monotonic() - upstream_setup_started) * 1000)
                 local_bind = format_client_address(upstream.getsockname())
                 remote_peer = format_client_address(upstream.getpeername())
@@ -3294,7 +3452,7 @@ class ClientPortalSocksRequestHandler(ProxyRequestHandler):
             self.close_connection = True
 
 
-class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class ThreadedSocks5Server(BoundedThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
     address_family = socket.AF_INET
@@ -3306,12 +3464,18 @@ class ThreadedSocks5Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
         *,
         allowed_networks,
         timeout_seconds,
+        client_header_timeout_seconds,
+        max_client_handler_threads,
         verbose,
         debug,
         router_config,
         runtime,
     ):
         super().__init__(server_address, handler_class)
+        self.configure_client_handler_limits(
+            client_header_timeout_seconds=client_header_timeout_seconds,
+            max_client_handler_threads=max_client_handler_threads,
+        )
         self.allowed_networks = allowed_networks
         self.timeout_seconds = timeout_seconds
         self.verbose = verbose
@@ -3374,6 +3538,37 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             port=port,
             error=message,
             context="proxy-router tunnel overload",
+            route_label=route_decision["route_label"],
+            matched_rule=route_decision["matched_rule"],
+            profile_id=route_decision.get("profile_id"),
+            **self._proxy_record_kwargs(route_decision),
+        )
+        self._send_reply(0x01)
+        return None
+
+    def _try_acquire_upstream_setup_slot(self, *, destination: str, host: str, port: int, route_decision):
+        setup_limits = getattr(self.server.runtime, "upstream_setup_limits", None)
+        if setup_limits is None:
+            return contextlib.nullcontext()
+        ticket, rejection = setup_limits.try_acquire()
+        if ticket is not None:
+            return ticket
+
+        reason = str((rejection or {}).get("reason") or "limit")
+        message = f"Proxy-router upstream setup limit reached ({reason})."
+        self.server.runtime.record_failure(
+            proxy_label=self.server.proxy_label,
+            client=self._client_id(),
+            client_ip=self.client_address[0],
+            client_auth_type=self._client_identity().get("auth_type"),
+            client_auth_username=self._client_identity().get("username"),
+            client_auth_label=self._client_identity().get("label"),
+            method="CONNECT",
+            destination=destination,
+            host=host,
+            port=port,
+            error=message,
+            context="proxy-router upstream setup overload",
             route_label=route_decision["route_label"],
             matched_rule=route_decision["matched_rule"],
             profile_id=route_decision.get("profile_id"),
@@ -3649,7 +3844,9 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
                 )
                 return
 
-            self.request.settimeout(self.server.timeout_seconds)
+            self.request.settimeout(
+                getattr(self.server, "client_header_timeout_seconds", DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS)
+            )
 
             version = self._read_exact(1)[0]
             if version != SOCKS_VERSION:
@@ -3670,6 +3867,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
 
             destination_host = self._read_destination_host(address_type)
             destination_port = int.from_bytes(self._read_exact(2), "big")
+            self.request.settimeout(getattr(self.server, "timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
             if self._drop_blocked_client(
                 method="CONNECT",
                 destination=f"{destination_host}:{destination_port}",
@@ -3823,35 +4021,44 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
             upstream_metrics = {}
             upstream_setup_ms = None
             with tunnel_ticket:
+                setup_ticket = self._try_acquire_upstream_setup_slot(
+                    destination=f"{destination_host}:{destination_port}",
+                    host=destination_host,
+                    port=destination_port,
+                    route_decision=route_decision,
+                )
+                if setup_ticket is None:
+                    return
                 upstream_setup_started = time.monotonic()
-                try:
-                    opened_stream = self._open_routed_stream(
-                        destination_host,
-                        destination_port,
-                        route_decision,
-                        retry_metrics=upstream_metrics,
-                    )
-                except Exception as exc:
-                    probe_route = self._build_auto_proxy_direct_failure_probe_route(
-                        destination_host,
-                        route_decision,
-                        exc,
-                    )
-                    if probe_route is None:
-                        raise
-                    self._debug(
-                        "retrying failed direct SOCKS5 CONNECT through auto-proxy probe "
-                        f"target={destination_host}:{destination_port} "
-                        f"route={probe_route['route_label']} direct_error={exc}",
-                        level="WARNING",
-                    )
-                    route_decision = probe_route
-                    opened_stream = self._open_routed_stream(
-                        destination_host,
-                        destination_port,
-                        route_decision,
-                        retry_metrics=upstream_metrics,
-                    )
+                with setup_ticket:
+                    try:
+                        opened_stream = self._open_routed_stream(
+                            destination_host,
+                            destination_port,
+                            route_decision,
+                            retry_metrics=upstream_metrics,
+                        )
+                    except Exception as exc:
+                        probe_route = self._build_auto_proxy_direct_failure_probe_route(
+                            destination_host,
+                            route_decision,
+                            exc,
+                        )
+                        if probe_route is None:
+                            raise
+                        self._debug(
+                            "retrying failed direct SOCKS5 CONNECT through auto-proxy probe "
+                            f"target={destination_host}:{destination_port} "
+                            f"route={probe_route['route_label']} direct_error={exc}",
+                            level="WARNING",
+                        )
+                        route_decision = probe_route
+                        opened_stream = self._open_routed_stream(
+                            destination_host,
+                            destination_port,
+                            route_decision,
+                            retry_metrics=upstream_metrics,
+                        )
                 if len(opened_stream) == 2:
                     upstream, upstream_owner = opened_stream
                 else:

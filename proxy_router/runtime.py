@@ -179,6 +179,73 @@ class TunnelLimitManager:
             }
 
 
+class UpstreamSetupLimitTicket:
+    def __init__(self, manager):
+        self._manager = manager
+        self._released = False
+
+    def release(self):
+        if self._released:
+            return
+        self._released = True
+        self._manager.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.release()
+
+
+class UpstreamSetupLimitManager:
+    def __init__(self, *, max_pending: int | None = None, notify_callback=None):
+        self.max_pending = max(
+            0,
+            int(
+                max_pending
+                if max_pending is not None
+                else _env_int("PROXY_ROUTER_MAX_PENDING_UPSTREAM_SETUPS", DEFAULT_MAX_PENDING_UPSTREAM_SETUPS)
+            ),
+        )
+        self._notify_callback = notify_callback
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._rejected_total = 0
+
+    def _notify(self):
+        if self._notify_callback is not None:
+            self._notify_callback("connections")
+
+    def try_acquire(self) -> tuple[UpstreamSetupLimitTicket | None, dict | None]:
+        with self._lock:
+            if self.max_pending and self._pending >= self.max_pending:
+                self._rejected_total += 1
+                return None, {
+                    "reason": "setup_limit",
+                    "pending": self._pending,
+                    "max_pending": self.max_pending,
+                }
+            self._pending += 1
+        self._notify()
+        return UpstreamSetupLimitTicket(self), None
+
+    def release(self):
+        with self._lock:
+            if self._pending > 0:
+                self._pending -= 1
+        self._notify()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "pending": self._pending,
+                "rejected_total": self._rejected_total,
+                "limits": {
+                    "max_pending": self.max_pending,
+                },
+            }
+
+
 class DashboardState:
     def __init__(
         self,
@@ -1505,6 +1572,7 @@ class AppRuntime:
         self.upstream_status = UpstreamProxyStatus(self.notify_dashboard_update)
         self.proxy_status = UpstreamProxyListStatus(self.notify_dashboard_update)
         self.tunnel_limits = TunnelLimitManager(notify_callback=self.notify_dashboard_update)
+        self.upstream_setup_limits = UpstreamSetupLimitManager(notify_callback=self.notify_dashboard_update)
         self.https_interception = HttpsCertificateManager(
             ca_cert_file=DEFAULT_HTTPS_INTERCEPT_CA_CERT_PATH,
             ca_key_file=DEFAULT_HTTPS_INTERCEPT_CA_KEY_PATH,

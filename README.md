@@ -73,6 +73,16 @@ python3 ./proxy-router --help
   --mixed-port 8799
 ```
 
+Export the effective routing policy as a `sing-box` redirect config:
+
+```bash
+python3 ./proxy-router sing-box-export \
+  --router-config-file ./data/router-config.json \
+  --listen 0.0.0.0 \
+  --listen-port 19090 \
+  --output /tmp/sing-box.json
+```
+
 Start the frontend dev server:
 
 ```bash
@@ -293,6 +303,13 @@ Current dashboard behaviors:
 
 Raw CONNECT and SOCKS5 tunnels stay on the lightweight relay path: the proxy counts bytes and records timing only when the session finishes. The relay handles retryable nonblocking socket states and drains buffered data before half-closing the peer direction, which avoids treating transient backpressure as a completed tunnel. After one side closes and its buffered data drains, the other side has up to five seconds to finish before proxy-router closes the tunnel; fully open tunnels have no relay idle timeout. Normal HTTP requests also record the time spent opening the upstream/request response head separately from response relay time. Usage, failure, and HTTPS analysis JSONL records are queued through a bounded background writer so request threads do not flush every log line synchronously. Dashboard history summaries are cached briefly by filter set and time bucket, while detailed request-history queries remain filterable and bounded.
 
+Upstream setup has its own backpressure limit. `PROXY_ROUTER_MAX_PENDING_UPSTREAM_SETUPS`
+defaults to `32` and caps concurrent destination/upstream connection setup
+before a tunnel enters the relay path. When the cap is reached, HTTP CONNECT
+requests receive `503` with `Proxy-Status: proxy-router; error=upstream_setup_overload`
+and SOCKS5 requests receive a general failure reply, instead of letting slow
+upstream setup consume every handler thread.
+
 Use these fields when investigating slow traffic:
 
 - `duration_ms`: total request or tunnel lifetime seen by proxy-router
@@ -323,6 +340,15 @@ python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 
 The test starts a temporary local proxy-router, opens idle and half-closed
 tunnels through a blackhole target, verifies dashboard probes stay responsive,
 and fails if final active tunnels or `CLOSE-WAIT` sockets remain.
+
+Use `--idle-pre-protocol` to reproduce clients that open TCP sockets but never
+send the first HTTP or SOCKS byte:
+
+```bash
+python3 tools/stress_tunnel_pressure.py --managed --tunnels 0 \
+  --idle-pre-protocol 120 --client-header-timeout 0.2 \
+  --max-client-handler-threads 64 --duration 3 --json
+```
 
 ## Quotas
 
@@ -376,6 +402,13 @@ When a client is blocked from the `Access` workflow:
 - `--dashboard-bind`: dashboard API bind address
 - `--dashboard-port`: dashboard API port
 - `--no-dashboard`: disable the dashboard API
+- `--client-header-timeout`: maximum seconds an accepted client socket may sit before sending its initial HTTP/SOCKS bytes
+- `--max-client-handler-threads`: maximum concurrent accepted-client handler threads before new sockets are closed immediately; `0` disables this cap
+- `PROXY_ROUTER_MAX_PENDING_UPSTREAM_SETUPS`: maximum concurrent upstream setup attempts before new tunnel setup is rejected; defaults to `32`
+
+`proxy-router sing-box-export` is a separate control-plane command. It does not
+start the proxy listener or edit routing rules; it reads the router config and
+prints a candidate `sing-box` config that can be validated with `sing-box check`.
 
 Usage summary:
 

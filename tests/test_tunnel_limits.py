@@ -1,6 +1,6 @@
 import unittest
 
-from proxy_router.runtime import TunnelLimitManager
+from proxy_router.runtime import TunnelLimitManager, UpstreamSetupLimitManager
 
 
 class TunnelLimitManagerTests(unittest.TestCase):
@@ -53,6 +53,35 @@ class TunnelLimitManagerTests(unittest.TestCase):
 
         first_ticket.release()
         second_ticket.release()
+
+
+class UpstreamSetupLimitManagerTests(unittest.TestCase):
+    def test_enforces_pending_setup_limit_and_releases_ticket(self):
+        manager = UpstreamSetupLimitManager(max_pending=2)
+
+        first_ticket, rejection = manager.try_acquire()
+        self.assertIsNotNone(first_ticket)
+        self.assertIsNone(rejection)
+
+        second_ticket, rejection = manager.try_acquire()
+        self.assertIsNotNone(second_ticket)
+        self.assertIsNone(rejection)
+
+        third_ticket, rejection = manager.try_acquire()
+        self.assertIsNone(third_ticket)
+        self.assertEqual(rejection["reason"], "setup_limit")
+        self.assertEqual(rejection["pending"], 2)
+        self.assertEqual(rejection["max_pending"], 2)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(snapshot["pending"], 2)
+        self.assertEqual(snapshot["rejected_total"], 1)
+        self.assertEqual(snapshot["limits"]["max_pending"], 2)
+
+        first_ticket.release()
+        self.assertEqual(manager.snapshot()["pending"], 1)
+        second_ticket.release()
+        self.assertEqual(manager.snapshot()["pending"], 0)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ from .config import RuleSuggestionConflictError
 from .constants import *
 from .output import DEBUG_LOGGER, debug_log
 from .records import ClientActivityCache, HttpsTrafficCache, UsageHistoryCache, build_failure_snapshot_from_records
-from .util import client_identity_from_username, first_query_value, normalize_history_filter
+from .sing_box import build_sing_box_config
+from .util import client_identity_from_username, ensure_valid_port, first_query_value, normalize_history_filter
 
 
 DASHBOARD_SCOPES = {"overview", "users", "failures", "proxies", "quotas", "routing", "https-status", "full"}
@@ -263,6 +264,9 @@ def build_router_runtime_dashboard_snapshot(server):
     tunnel_limits = getattr(server.runtime, "tunnel_limits", None)
     if tunnel_limits is not None:
         router_runtime_snapshot["tunnel_limits"] = tunnel_limits.snapshot()
+    upstream_setup_limits = getattr(server.runtime, "upstream_setup_limits", None)
+    if upstream_setup_limits is not None:
+        router_runtime_snapshot["upstream_setup_limits"] = upstream_setup_limits.snapshot()
     router_runtime_snapshot["https_interception_status"] = server.runtime.https_interception_status(
         server.router_config.https_interception_settings()
     )
@@ -504,12 +508,16 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload, status: int = 200):
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            if DEBUG_LOGGER.enabled:
+                debug_log("dashboard", "client disconnected while sending JSON response", level="INFO")
 
     def _send_bytes(self, body: bytes, *, content_type: str, filename: str | None = None, status: int = 200):
         self.send_response(status)
@@ -630,6 +638,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 return
             return
 
+        if route_path in {"/api/health", "/api/health.json"}:
+            self._send_json({"status": "ok"})
+            return
+
         if route_path in {"/api/dashboard", "/api/dashboard.json"}:
             self._send_json(build_dashboard_snapshot(self.server))
             return
@@ -706,6 +718,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
         if route_path in {"/api/router-config", "/api/router-config.json"}:
             self._send_json(self.server.router_config.public_snapshot())
+            return
+
+        if route_path in {"/api/sing-box/config", "/api/sing-box/config.json"}:
+            query = parse_qs(parsed.query)
+            listen_port_text = first_query_value(query, "listen_port") or "19090"
+            try:
+                listen_port = int(listen_port_text)
+                ensure_valid_port(listen_port, "listen_port")
+            except (TypeError, ValueError) as exc:
+                self._send_json({"error": f"invalid listen_port: {exc}"}, status=400)
+                return
+            self._send_json(
+                build_sing_box_config(
+                    self.server.router_config,
+                    listen=first_query_value(query, "listen") or "127.0.0.1",
+                    listen_port=listen_port,
+                    profile_id=first_query_value(query, "profile_id"),
+                    log_level=first_query_value(query, "log_level") or "warn",
+                )
+            )
             return
 
         if route_path in {"/api/admin-api/status", "/api/admin-api/status.json"}:

@@ -25,6 +25,7 @@ from .proxy_server import (
     ThreadedTLSHTTPProxyServer,
 )
 from .runtime import AppRuntime
+from .sing_box import build_sing_box_config, dump_sing_box_config
 from .util import *
 
 DEFAULT_NOFILE_SOFT_LIMIT = 65536
@@ -144,6 +145,24 @@ def build_proxy_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_TIMEOUT_SECONDS,
         help=f"Upstream connect/read timeout in seconds. Default: {DEFAULT_TIMEOUT_SECONDS}",
+    )
+    parser.add_argument(
+        "--client-header-timeout",
+        type=float,
+        default=DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS,
+        help=(
+            "Seconds to wait for a newly accepted client to send proxy request/protocol bytes. "
+            f"Default: {DEFAULT_CLIENT_HEADER_TIMEOUT_SECONDS:g}"
+        ),
+    )
+    parser.add_argument(
+        "--max-client-handler-threads",
+        type=int,
+        default=DEFAULT_MAX_CLIENT_HANDLER_THREADS,
+        help=(
+            "Maximum simultaneous accepted client handler threads across each listener. "
+            f"Use 0 to disable. Default: {DEFAULT_MAX_CLIENT_HANDLER_THREADS}"
+        ),
     )
     parser.add_argument(
         "--cert-file",
@@ -273,6 +292,44 @@ def build_usage_analyze_parser(prog_name: str) -> argparse.ArgumentParser:
     return parser
 
 
+def build_sing_box_export_parser(prog_name: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{prog_name} sing-box-export",
+        description="Export the effective proxy-router routing policy as a sing-box data-plane config.",
+    )
+    parser.add_argument(
+        "--router-config-file",
+        default=str(DEFAULT_ROUTER_CONFIG_PATH),
+        help=f"Router config file to compile. Default: {DEFAULT_ROUTER_CONFIG_PATH}",
+    )
+    parser.add_argument(
+        "--profile-id",
+        help="Optional routing profile id. Defaults to the currently effective profile.",
+    )
+    parser.add_argument(
+        "--listen",
+        default="127.0.0.1",
+        help="sing-box redirect inbound listen address. Default: 127.0.0.1",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=19090,
+        help="sing-box redirect inbound listen port. Default: 19090",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="warn",
+        help="sing-box log level. Default: warn",
+    )
+    parser.add_argument(
+        "--output",
+        default="-",
+        help="Output file path, or '-' for stdout. Default: -",
+    )
+    return parser
+
+
 def parse_allowed_networks(values):
     networks = []
     for value in values:
@@ -331,6 +388,36 @@ def run_usage_analyze(argv):
     print_info(
         "HTTP records count request and response bodies. CONNECT and SOCKS5 records count raw tunnel bytes."
     )
+
+
+def run_sing_box_export(argv):
+    parser = build_sing_box_export_parser(Path(sys.argv[0]).name)
+    args = parser.parse_args(argv)
+    ensure_valid_port(args.listen_port, "--listen-port")
+    router_config_path = resolve_router_config_path(args.router_config_file)
+    try:
+        router_config = RouterConfigManager(router_config_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Error: could not load router config file '{router_config_path}': {exc}") from exc
+    try:
+        payload = dump_sing_box_config(
+            build_sing_box_config(
+                router_config,
+                listen=args.listen,
+                listen_port=args.listen_port,
+                profile_id=args.profile_id,
+                log_level=args.log_level,
+            )
+        )
+    finally:
+        router_config.shutdown()
+
+    if args.output == "-":
+        print(payload, end="")
+        return
+    output_path = Path(args.output).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(payload, encoding="utf-8")
 
 
 def start_dashboard_server(args, runtime: AppRuntime, router_config):
@@ -403,6 +490,8 @@ def start_servers(args, allowed_networks, router_config, runtime: AppRuntime):
                 (args.bind, mixed_port),
                 allowed_networks=allowed_networks,
                 timeout_seconds=args.timeout,
+                client_header_timeout_seconds=args.client_header_timeout,
+                max_client_handler_threads=args.max_client_handler_threads,
                 verbose=args.verbose,
                 debug=args.debug,
                 router_config=router_config,
@@ -439,6 +528,8 @@ def start_servers(args, allowed_networks, router_config, runtime: AppRuntime):
                 ssl_context=ssl_context,
                 allowed_networks=allowed_networks,
                 timeout_seconds=args.timeout,
+                client_header_timeout_seconds=args.client_header_timeout,
+                max_client_handler_threads=args.max_client_handler_threads,
                 verbose=args.verbose,
                 debug=args.debug,
                 proxy_label="https",
@@ -470,6 +561,8 @@ def start_servers(args, allowed_networks, router_config, runtime: AppRuntime):
             Socks5RequestHandler,
             allowed_networks=allowed_networks,
             timeout_seconds=args.timeout,
+            client_header_timeout_seconds=args.client_header_timeout,
+            max_client_handler_threads=args.max_client_handler_threads,
             verbose=args.verbose,
             debug=args.debug,
             router_config=router_config,
@@ -610,6 +703,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "usage-analyze":
         run_usage_analyze(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "sing-box-export":
+        run_sing_box_export(sys.argv[2:])
+        return
 
     parser = build_proxy_parser()
     args = parser.parse_args()
@@ -640,6 +736,10 @@ def main():
 
     if args.timeout <= 0:
         raise SystemExit("Error: --timeout must be greater than 0.")
+    if args.client_header_timeout <= 0:
+        raise SystemExit("Error: --client-header-timeout must be greater than 0.")
+    if args.max_client_handler_threads < 0:
+        raise SystemExit("Error: --max-client-handler-threads must be greater than or equal to 0.")
 
     debug_log_path = resolve_debug_log_path(args.debug_log_file) if args.debug else None
     usage_log_path = resolve_usage_log_path(args.usage_log_file)
@@ -729,7 +829,10 @@ def main():
         "system",
         "configuration "
         f"bind={args.bind} mixed_port={args.mixed_port} http_port={args.http_port} https_port={args.https_port} "
-        f"socks5_port={args.socks5_port} timeout={args.timeout}s verbose={args.verbose} debug={args.debug} "
+        f"socks5_port={args.socks5_port} timeout={args.timeout}s "
+        f"client_header_timeout={args.client_header_timeout:g}s "
+        f"max_client_handler_threads={args.max_client_handler_threads} "
+        f"verbose={args.verbose} debug={args.debug} "
         f"usage_log={usage_log_path} failure_log={failure_log_path} error_log={error_log_path} router_config={router_config_path} "
         f"https_intercept_ca_cert={https_intercept_ca_cert_path} https_intercept_cert_cache={https_intercept_cert_cache_dir} "
         f"dashboard={args.dashboard_bind}:{args.dashboard_port} dashboard_enabled={not args.no_dashboard} quiet={args.quiet}",

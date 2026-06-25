@@ -116,6 +116,9 @@ The traffic path records observability at request or tunnel boundaries instead o
 - `throughput_bps` is derived from bytes and `duration_ms`; summaries compute it only from records that have timing samples so older logs do not distort rates.
 - `upstream_retry_count` and `upstream_retry_delay_ms` show retry attempts and configured backoff time before success or failure.
 - `upstream_proxy_id`, `upstream_proxy_name`, and `proxy_failover_count` identify the selected upstream proxy and how many higher-priority candidates were skipped before success.
+- `PROXY_ROUTER_MAX_PENDING_UPSTREAM_SETUPS` caps concurrent destination or
+  upstream proxy connection attempts before the relay starts. This protects
+  handler threads when an upstream is slow, stale, or timing out.
 
 Expected overhead:
 
@@ -158,6 +161,7 @@ The backend executable remains:
 
 Important routes:
 
+- `GET /api/health`
 - `GET /api/dashboard`
 - `GET /api/dashboard/{scope}` where `scope` is `overview`, `users`, `failures`, `proxies`, `quotas`, `routing`, `https-status`, or `full`
 - `GET /api/history` with optional `range`, `proxy_type`, `client`, `upstream_proxy_id`, `timezone`, and `timezone_offset_minutes` query parameters
@@ -170,6 +174,8 @@ Important routes:
 - `POST /api/admin-api/tokens`
 - `POST /api/admin-api/tokens/{id}/delete`
 - `GET /api/routing/decide` with `host`, optional `client_id`, and optional `client_ip`
+- `GET /api/sing-box/config` exports the effective routing policy as a
+  candidate `sing-box` redirect config for gateway data-plane migration.
 - `POST /api/proxies/check`
 - `GET /api/https-interception/status`
 - `GET /api/https-interception/ca.crt`

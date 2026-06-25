@@ -177,6 +177,15 @@ test -d $(quote "$APP_ROOT/src/proxy-router/wheelhouse")
 test -f $(quote "$APP_ROOT/src/proxy-router/frontend/dist/index.html")
 test -d $(quote "$APP_ROOT/src/proxy-router/frontend/dist/assets")"
 
+log "Repairing proxy-router data ownership"
+remote "set -eu
+uid=\$(sudo awk -F= '/^PROXY_ROUTER_UID=/{print \$2; exit}' /etc/arvan-vps-gateway/server.env 2>/dev/null || true)
+gid=\$(sudo awk -F= '/^PROXY_ROUTER_GID=/{print \$2; exit}' /etc/arvan-vps-gateway/server.env 2>/dev/null || true)
+uid=\${uid:-1000}
+gid=\${gid:-1000}
+sudo chown -R \"\$uid:\$gid\" $(quote "$APP_ROOT/data/proxy-router")
+sudo chmod 0600 $(quote "$APP_ROOT/data/proxy-router/router-config.json")"
+
 log "Rebuilding backend and recreating backend/frontend services"
 remote "set -eu
 cd $(quote "$APP_ROOT")

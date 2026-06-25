@@ -45,7 +45,7 @@ def proc_metrics(pid: int) -> dict:
 
 
 def close_wait_count(port: int) -> int:
-    command = f"ss -Htan state close-wait '( sport = :{port} or dport = :{port} )' | wc -l"
+    command = f"ss -Htan state close-wait '( sport = :{port} )' | wc -l"
     result = subprocess.run(command, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
     try:
         return int((result.stdout or "0").splitlines()[-1].strip() or "0")
@@ -147,6 +147,10 @@ def start_managed_router(args, temp_dir: Path) -> tuple[subprocess.Popen, int, i
         str(temp_dir / "client-block-history.log"),
         "--error-log-file",
         str(temp_dir / "error.log"),
+        "--client-header-timeout",
+        str(args.client_header_timeout),
+        "--max-client-handler-threads",
+        str(args.max_client_handler_threads),
         "--quiet",
     ]
     process = subprocess.Popen(
@@ -157,7 +161,7 @@ def start_managed_router(args, temp_dir: Path) -> tuple[subprocess.Popen, int, i
         stderr=subprocess.PIPE,
         text=True,
     )
-    wait_for_dashboard(f"http://127.0.0.1:{dashboard_port}/api/dashboard", time.monotonic() + 10.0)
+    wait_for_dashboard(f"http://127.0.0.1:{dashboard_port}/api/health", time.monotonic() + 10.0)
     return process, mixed_port, dashboard_port
 
 
@@ -198,11 +202,20 @@ def dashboard_probe(dashboard_port: int) -> bool:
         return False
 
 
+def health_probe(dashboard_port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{dashboard_port}/api/health", timeout=1.0) as response:
+            return response.status == http.client.OK
+    except Exception:
+        return False
+
+
 def run_pressure(args) -> dict:
     blackhole = BlackholeServer()
     blackhole.start()
     process = None
     clients: list[socket.socket] = []
+    idle_clients: list[socket.socket] = []
     with tempfile.TemporaryDirectory(prefix="proxy-router-stress-") as temp_name:
         temp_dir = Path(temp_name)
         if args.managed:
@@ -221,6 +234,10 @@ def run_pressure(args) -> dict:
             "rejected": 0,
             "errors": 0,
             "dashboard_probe_failures": 0,
+            "health_probe_failures": 0,
+            "idle_pre_protocol_attempted": args.idle_pre_protocol,
+            "idle_pre_protocol_opened": 0,
+            "idle_pre_protocol_errors": 0,
             "threads_peak": 0,
             "fds_peak": 0,
             "close_wait_peak": 0,
@@ -263,6 +280,14 @@ def run_pressure(args) -> dict:
         for thread in threads:
             thread.join(timeout=5.0)
 
+        for _ in range(args.idle_pre_protocol):
+            try:
+                sock = socket.create_connection((proxy_host, proxy_port), timeout=args.connect_timeout)
+                idle_clients.append(sock)
+                metrics["idle_pre_protocol_opened"] += 1
+            except Exception:
+                metrics["idle_pre_protocol_errors"] += 1
+
         sample_until = time.monotonic() + args.duration
         while time.monotonic() < sample_until:
             if process_pid:
@@ -272,15 +297,21 @@ def run_pressure(args) -> dict:
             metrics["close_wait_peak"] = max(metrics["close_wait_peak"], close_wait_count(proxy_port))
             if not dashboard_probe(dashboard_port):
                 metrics["dashboard_probe_failures"] += 1
+            if not health_probe(dashboard_port):
+                metrics["health_probe_failures"] += 1
             time.sleep(args.sample_interval)
 
         for sock in clients:
+            with contextlib.suppress(OSError):
+                sock.close()
+        for sock in idle_clients:
             with contextlib.suppress(OSError):
                 sock.close()
         time.sleep(args.drain_seconds)
 
         final_close_wait = close_wait_count(proxy_port)
         final_dashboard_ok = dashboard_probe(dashboard_port)
+        final_health_ok = health_probe(dashboard_port)
         final_runtime = {}
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{dashboard_port}/api/dashboard", timeout=2.0) as response:
@@ -289,12 +320,15 @@ def run_pressure(args) -> dict:
         except Exception:
             pass
         active_final = int(final_runtime.get("active_total") or 0)
-        thread_budget = args.baseline_threads + args.max_active + args.thread_headroom
+        thread_limit = args.max_client_handler_threads if args.max_client_handler_threads > 0 else args.max_active
+        thread_budget = args.baseline_threads + thread_limit + args.thread_headroom
         passed = (
             final_close_wait == 0
             and active_final == 0
             and final_dashboard_ok
+            and final_health_ok
             and metrics["dashboard_probe_failures"] == 0
+            and metrics["health_probe_failures"] == 0
             and (not metrics["threads_peak"] or metrics["threads_peak"] <= thread_budget)
         )
         result = {
@@ -308,11 +342,14 @@ def run_pressure(args) -> dict:
                 "max_active": args.max_active,
                 "max_per_client": args.max_per_client,
                 "idle_timeout_seconds": args.idle_timeout,
+                "client_header_timeout_seconds": args.client_header_timeout,
+                "max_client_handler_threads": args.max_client_handler_threads,
             },
             **metrics,
             "final": {
                 "close_wait": final_close_wait,
                 "dashboard_ok": final_dashboard_ok,
+                "health_ok": final_health_ok,
                 "active_tunnels": active_final,
                 "thread_budget": thread_budget,
                 "tunnel_limits": final_runtime,
@@ -347,6 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-active", type=int, default=40)
     parser.add_argument("--max-per-client", type=int, default=20)
     parser.add_argument("--idle-timeout", type=float, default=1.0)
+    parser.add_argument("--client-header-timeout", type=float, default=5.0)
+    parser.add_argument("--max-client-handler-threads", type=int, default=256)
+    parser.add_argument("--idle-pre-protocol", type=int, default=0)
     parser.add_argument("--duration", type=float, default=20.0)
     parser.add_argument("--connect-timeout", type=float, default=8.0)
     parser.add_argument("--drain-seconds", type=float, default=2.0)

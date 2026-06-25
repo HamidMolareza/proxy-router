@@ -173,6 +173,30 @@ class DashboardApiScopeTests(unittest.TestCase):
             finally:
                 router_config.shutdown()
 
+    def test_dashboard_snapshot_includes_upstream_setup_limits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            server, router_config = self._server(temp_dir)
+            server.runtime.upstream_setup_limits = SimpleNamespace(
+                snapshot=lambda: {
+                    "pending": 2,
+                    "rejected_total": 3,
+                    "limits": {"max_pending": 4},
+                }
+            )
+            try:
+                overview = build_dashboard_snapshot(server)
+
+                self.assertEqual(
+                    overview["router_runtime"]["upstream_setup_limits"],
+                    {
+                        "pending": 2,
+                        "rejected_total": 3,
+                        "limits": {"max_pending": 4},
+                    },
+                )
+            finally:
+                router_config.shutdown()
+
     def test_live_update_can_include_active_scope_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             server, router_config = self._server(temp_dir)
@@ -201,6 +225,90 @@ class DashboardApiScopeTests(unittest.TestCase):
                 self.assertNotIn("proxy_quota_status", connection_update["snapshot"])
                 self.assertIn("recent_requests", connection_update["snapshot"])
             finally:
+                router_config.shutdown()
+
+    def test_health_endpoint_does_not_build_dashboard_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server_stub, router_config = self._server(temp_dir)
+            runtime = server_stub.runtime
+            runtime.usage_log_path = root / "usage.log"
+            runtime.https_traffic_log_path = root / "https.log"
+            runtime.failure_log_path = root / "failures.log"
+            runtime.client_presence_history_path = root / "presence-history.log"
+            runtime.client_block_history_path = root / "blocks.log"
+            for path in (
+                runtime.usage_log_path,
+                runtime.https_traffic_log_path,
+                runtime.failure_log_path,
+                runtime.client_presence_history_path,
+                runtime.client_block_history_path,
+            ):
+                path.write_text("", encoding="utf-8")
+            runtime.dashboard_state.snapshot = lambda: (_ for _ in ()).throw(AssertionError("snapshot should not run"))
+            dashboard = ThreadedDashboardServer(
+                ("127.0.0.1", 0),
+                DashboardRequestHandler,
+                runtime=runtime,
+                router_config=router_config,
+            )
+            thread = threading.Thread(target=dashboard.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{dashboard.server_address[1]}/api/health",
+                    timeout=5,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(payload, {"status": "ok"})
+            finally:
+                dashboard.shutdown()
+                dashboard.server_close()
+                thread.join(timeout=5)
+                router_config.shutdown()
+
+    def test_sing_box_config_endpoint_exports_candidate_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server_stub, router_config = self._server(temp_dir)
+            runtime = server_stub.runtime
+            runtime.usage_log_path = root / "usage.log"
+            runtime.https_traffic_log_path = root / "https.log"
+            runtime.failure_log_path = root / "failures.log"
+            runtime.client_presence_history_path = root / "presence-history.log"
+            runtime.client_block_history_path = root / "blocks.log"
+            for path in (
+                runtime.usage_log_path,
+                runtime.https_traffic_log_path,
+                runtime.failure_log_path,
+                runtime.client_presence_history_path,
+                runtime.client_block_history_path,
+            ):
+                path.write_text("", encoding="utf-8")
+            dashboard = ThreadedDashboardServer(
+                ("127.0.0.1", 0),
+                DashboardRequestHandler,
+                runtime=runtime,
+                router_config=router_config,
+            )
+            thread = threading.Thread(target=dashboard.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{dashboard.server_address[1]}/api/sing-box/config?listen=0.0.0.0&listen_port=19090",
+                    timeout=5,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(payload["inbounds"][0]["type"], "redirect")
+                self.assertEqual(payload["inbounds"][0]["listen"], "0.0.0.0")
+                self.assertEqual(payload["inbounds"][0]["listen_port"], 19090)
+                self.assertIn({"type": "http", "tag": "proxy-main", "server": "127.0.0.1", "server_port": 8901}, payload["outbounds"])
+            finally:
+                dashboard.shutdown()
+                dashboard.server_close()
+                thread.join(timeout=5)
                 router_config.shutdown()
 
     def test_client_activity_endpoint_defaults_to_last_24_hours(self):
