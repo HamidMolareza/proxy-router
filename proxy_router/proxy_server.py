@@ -918,7 +918,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
         if tunnel_limits is None:
             return contextlib.nullcontext()
-        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id())
+        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id(), destination=destination)
         if ticket is not None:
             return ticket
 
@@ -3519,7 +3519,7 @@ class Socks5RequestHandler(socketserver.BaseRequestHandler):
         tunnel_limits = getattr(self.server.runtime, "tunnel_limits", None)
         if tunnel_limits is None:
             return contextlib.nullcontext()
-        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id())
+        ticket, rejection = tunnel_limits.try_acquire(client=self._client_id(), destination=destination)
         if ticket is not None:
             return ticket
 

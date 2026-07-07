@@ -334,12 +334,16 @@ changes:
 
 ```bash
 python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 \
-  --max-per-client 20 --idle-timeout 1 --duration 20 --json
+  --max-per-client 20 --max-per-client-destination 6 \
+  --client-count 8 --destination-count 4 --idle-timeout 1 --duration 20 --json
 ```
 
-The test starts a temporary local proxy-router, opens idle and half-closed
-tunnels through a blackhole target, verifies dashboard probes stay responsive,
-and fails if final active tunnels or `CLOSE-WAIT` sockets remain.
+The test starts a temporary local proxy-router, creates optional test client
+credentials, opens idle and half-closed tunnels through one or more blackhole
+targets, verifies dashboard probes stay responsive, and fails if final active
+tunnels or `CLOSE-WAIT` sockets remain. Use `--client-count` and
+`--destination-count` when validating per-client and per-client/destination
+limits before changing production caps.
 
 Use `--idle-pre-protocol` to reproduce clients that open TCP sockets but never
 send the first HTTP or SOCKS byte:
@@ -404,6 +408,7 @@ When a client is blocked from the `Access` workflow:
 - `--no-dashboard`: disable the dashboard API
 - `--client-header-timeout`: maximum seconds an accepted client socket may sit before sending its initial HTTP/SOCKS bytes
 - `--max-client-handler-threads`: maximum concurrent accepted-client handler threads before new sockets are closed immediately; `0` disables this cap
+- `PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_CLIENT_DESTINATION`: maximum concurrent tunnels a single authenticated client may keep open to one destination; `0` disables this cap
 - `PROXY_ROUTER_MAX_PENDING_UPSTREAM_SETUPS`: maximum concurrent upstream setup attempts before new tunnel setup is rejected; defaults to `32`
 
 `proxy-router sing-box-export` is a separate control-plane command. It does not
@@ -446,7 +451,7 @@ docs/                      supporting project documentation
 ```bash
 python3 -m py_compile ./proxy-router proxy_router/*.py
 python3 -m unittest discover
-python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 --max-per-client 20 --idle-timeout 1 --duration 20 --json
+python3 tools/stress_tunnel_pressure.py --managed --tunnels 160 --max-active 40 --max-per-client 20 --max-per-client-destination 6 --client-count 8 --destination-count 4 --idle-timeout 1 --duration 20 --json
 python3 ./proxy-router --help
 cd frontend && npm install && npm run lint && npm run build
 docker compose config

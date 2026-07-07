@@ -42,16 +42,17 @@ def _env_float(name: str, default: float) -> float:
 
 
 class TunnelLimitTicket:
-    def __init__(self, manager, client: str):
+    def __init__(self, manager, client: str, destination: str):
         self._manager = manager
         self._client = client
+        self._destination = destination
         self._released = False
 
     def release(self):
         if self._released:
             return
         self._released = True
-        self._manager.release(self._client)
+        self._manager.release(self._client, self._destination)
 
     def __enter__(self):
         return self
@@ -67,6 +68,7 @@ class TunnelLimitManager:
         max_active: int | None = None,
         max_per_client: int | None = None,
         max_per_admin_client: int | None = None,
+        max_per_client_destination: int | None = None,
         idle_timeout_seconds: float | None = None,
         notify_callback=None,
     ):
@@ -94,6 +96,17 @@ class TunnelLimitManager:
                 else _env_int("PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_ADMIN_CLIENT", 80)
             ),
         )
+        self.max_per_client_destination = max(
+            0,
+            int(
+                max_per_client_destination
+                if max_per_client_destination is not None
+                else _env_int(
+                    "PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_CLIENT_DESTINATION",
+                    DEFAULT_MAX_ACTIVE_TUNNELS_PER_CLIENT_DESTINATION,
+                )
+            ),
+        )
         self.idle_timeout_seconds = max(
             0.0,
             float(
@@ -106,6 +119,7 @@ class TunnelLimitManager:
         self._lock = threading.Lock()
         self._active_total = 0
         self._active_by_client = {}
+        self._active_by_client_destination = {}
         self._rejected_total = 0
         self._rejected_by_reason = {}
 
@@ -118,39 +132,65 @@ class TunnelLimitManager:
         if self._notify_callback is not None:
             self._notify_callback("connections")
 
-    def try_acquire(self, *, client: str) -> tuple[TunnelLimitTicket | None, dict | None]:
+    def _normalize_destination(self, destination: str | None) -> str:
+        return str(destination or "").strip().lower()
+
+    def try_acquire(self, *, client: str, destination: str | None = None) -> tuple[TunnelLimitTicket | None, dict | None]:
         normalized_client = str(client or "unknown").strip() or "unknown"
+        normalized_destination = self._normalize_destination(destination)
+        client_destination_key = (normalized_client, normalized_destination)
         with self._lock:
             if self.max_active and self._active_total >= self.max_active:
-                rejection = self._record_rejection_locked("global_limit", normalized_client)
+                rejection = self._record_rejection_locked("global_limit", normalized_client, normalized_destination)
                 return None, rejection
 
             client_limit = self._limit_for_client(normalized_client)
             client_active = int(self._active_by_client.get(normalized_client, 0))
             if client_limit and client_active >= client_limit:
-                rejection = self._record_rejection_locked("client_limit", normalized_client)
+                rejection = self._record_rejection_locked("client_limit", normalized_client, normalized_destination)
+                return None, rejection
+
+            client_destination_active = int(self._active_by_client_destination.get(client_destination_key, 0))
+            if (
+                self.max_per_client_destination
+                and normalized_destination
+                and client_destination_active >= self.max_per_client_destination
+            ):
+                rejection = self._record_rejection_locked(
+                    "client_destination_limit",
+                    normalized_client,
+                    normalized_destination,
+                )
                 return None, rejection
 
             self._active_total += 1
             self._active_by_client[normalized_client] = client_active + 1
+            if normalized_destination:
+                self._active_by_client_destination[client_destination_key] = client_destination_active + 1
 
         self._notify()
-        return TunnelLimitTicket(self, normalized_client), None
+        return TunnelLimitTicket(self, normalized_client, normalized_destination), None
 
-    def _record_rejection_locked(self, reason: str, client: str) -> dict:
+    def _record_rejection_locked(self, reason: str, client: str, destination: str) -> dict:
         self._rejected_total += 1
         self._rejected_by_reason[reason] = self._rejected_by_reason.get(reason, 0) + 1
+        destination_active = int(self._active_by_client_destination.get((client, destination), 0))
         return {
             "reason": reason,
             "client": client,
+            "destination": destination,
             "active_total": self._active_total,
             "client_active": int(self._active_by_client.get(client, 0)),
+            "client_destination_active": destination_active,
             "max_active": self.max_active,
             "client_limit": self._limit_for_client(client),
+            "client_destination_limit": self.max_per_client_destination,
         }
 
-    def release(self, client: str):
+    def release(self, client: str, destination: str | None = None):
         normalized_client = str(client or "unknown").strip() or "unknown"
+        normalized_destination = self._normalize_destination(destination)
+        client_destination_key = (normalized_client, normalized_destination)
         with self._lock:
             if self._active_total > 0:
                 self._active_total -= 1
@@ -159,21 +199,36 @@ class TunnelLimitManager:
                 self._active_by_client.pop(normalized_client, None)
             else:
                 self._active_by_client[normalized_client] = client_active - 1
+            if normalized_destination:
+                client_destination_active = int(self._active_by_client_destination.get(client_destination_key, 0))
+                if client_destination_active <= 1:
+                    self._active_by_client_destination.pop(client_destination_key, None)
+                else:
+                    self._active_by_client_destination[client_destination_key] = client_destination_active - 1
         self._notify()
 
     def snapshot(self):
         with self._lock:
+            active_by_client_destination = {
+                f"{client} {destination}": count
+                for (client, destination), count in sorted(
+                    self._active_by_client_destination.items(),
+                    key=lambda item: (-item[1], item[0][0], item[0][1]),
+                )
+            }
             return {
                 "active_total": self._active_total,
                 "active_by_client": dict(
                     sorted(self._active_by_client.items(), key=lambda item: (-item[1], item[0]))
                 ),
+                "active_by_client_destination": active_by_client_destination,
                 "rejected_total": self._rejected_total,
                 "rejected_by_reason": dict(sorted(self._rejected_by_reason.items())),
                 "limits": {
                     "max_active": self.max_active,
                     "max_per_client": self.max_per_client,
                     "max_per_admin_client": self.max_per_admin_client,
+                    "max_per_client_destination": self.max_per_client_destination,
                     "idle_timeout_seconds": self.idle_timeout_seconds,
                 },
             }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import http.client
 import json
@@ -99,6 +100,27 @@ class BlackholeServer:
                         return
 
 
+def build_managed_router_config(args) -> dict:
+    credentials = []
+    for index in range(max(0, args.client_count)):
+        username = f"{args.client_prefix}{index + 1:03d}"
+        credentials.append(
+            {
+                "username": username,
+                "password": args.client_password,
+                "label": f"Stress client {index + 1}",
+                "enabled": True,
+            }
+        )
+    return {
+        "client_auth": {
+            "enabled": bool(credentials),
+            "allow_anonymous": True,
+            "credentials": credentials,
+        }
+    }
+
+
 def wait_for_dashboard(dashboard_url: str, deadline: float):
     last_error = None
     while time.monotonic() < deadline:
@@ -115,12 +137,15 @@ def wait_for_dashboard(dashboard_url: str, deadline: float):
 def start_managed_router(args, temp_dir: Path) -> tuple[subprocess.Popen, int, int]:
     mixed_port = find_free_port()
     dashboard_port = find_free_port()
+    config_path = temp_dir / "router-config.json"
+    config_path.write_text(json.dumps(build_managed_router_config(args), indent=2), encoding="utf-8")
     env = os.environ.copy()
     env.update(
         {
             "PROXY_ROUTER_MAX_ACTIVE_TUNNELS": str(args.max_active),
             "PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_CLIENT": str(args.max_per_client),
             "PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_ADMIN_CLIENT": str(args.max_per_client),
+            "PROXY_ROUTER_MAX_ACTIVE_TUNNELS_PER_CLIENT_DESTINATION": str(args.max_per_client_destination),
             "PROXY_ROUTER_TUNNEL_IDLE_TIMEOUT_SECONDS": str(args.idle_timeout),
         }
     )
@@ -136,7 +161,7 @@ def start_managed_router(args, temp_dir: Path) -> tuple[subprocess.Popen, int, i
         "--dashboard-port",
         str(dashboard_port),
         "--router-config-file",
-        str(temp_dir / "router-config.json"),
+        str(config_path),
         "--usage-log-file",
         str(temp_dir / "usage.log"),
         "--failure-log-file",
@@ -171,12 +196,21 @@ def connect_tunnel(
     target_host: str,
     target_port: int,
     *,
+    username: str | None,
+    password: str,
     half_close: bool,
     connect_timeout: float,
 ) -> tuple[socket.socket | None, str]:
     sock = socket.create_connection((proxy_host, proxy_port), timeout=connect_timeout)
     sock.settimeout(connect_timeout)
-    request = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+    headers = [
+        f"CONNECT {target_host}:{target_port} HTTP/1.1",
+        f"Host: {target_host}:{target_port}",
+    ]
+    if username:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers.append(f"Proxy-Authorization: Basic {token}")
+    request = "\r\n".join(headers) + "\r\n\r\n"
     sock.sendall(request.encode("ascii"))
     response = b""
     while b"\r\n\r\n" not in response and len(response) < 8192:
@@ -211,8 +245,9 @@ def health_probe(dashboard_port: int) -> bool:
 
 
 def run_pressure(args) -> dict:
-    blackhole = BlackholeServer()
-    blackhole.start()
+    blackholes = [BlackholeServer() for _ in range(max(1, args.destination_count))]
+    for blackhole in blackholes:
+        blackhole.start()
     process = None
     clients: list[socket.socket] = []
     idle_clients: list[socket.socket] = []
@@ -230,6 +265,8 @@ def run_pressure(args) -> dict:
 
         metrics = {
             "attempted": args.tunnels,
+            "client_count": args.client_count,
+            "destination_count": len(blackholes),
             "connected": 0,
             "rejected": 0,
             "errors": 0,
@@ -247,12 +284,21 @@ def run_pressure(args) -> dict:
 
         def open_one(index: int):
             half_close = args.half_close_every > 0 and index % args.half_close_every == 0
+            username = None
+            if args.client_count > 0:
+                username = f"{args.client_prefix}{(index % args.client_count) + 1:03d}"
+                destination_index = (index // args.client_count) % len(blackholes)
+            else:
+                destination_index = index % len(blackholes)
+            blackhole = blackholes[destination_index]
             try:
                 sock, status = connect_tunnel(
                     proxy_host,
                     proxy_port,
                     blackhole.host,
                     blackhole.port,
+                    username=username,
+                    password=args.client_password,
                     half_close=half_close,
                     connect_timeout=args.connect_timeout,
                 )
@@ -327,6 +373,7 @@ def run_pressure(args) -> dict:
             and active_final == 0
             and final_dashboard_ok
             and final_health_ok
+            and metrics["errors"] == 0
             and metrics["dashboard_probe_failures"] == 0
             and metrics["health_probe_failures"] == 0
             and (not metrics["threads_peak"] or metrics["threads_peak"] <= thread_budget)
@@ -335,12 +382,17 @@ def run_pressure(args) -> dict:
             "passed": passed,
             "proxy_port": proxy_port,
             "dashboard_port": dashboard_port,
-            "target_port": blackhole.port,
-            "accepted_by_target": blackhole.accepted,
+            "target_port": blackholes[0].port,
+            "target_ports": [blackhole.port for blackhole in blackholes],
+            "accepted_by_target": sum(blackhole.accepted for blackhole in blackholes),
+            "accepted_by_destination": {
+                f"{blackhole.host}:{blackhole.port}": blackhole.accepted for blackhole in blackholes
+            },
             "status_counts": statuses,
             "limits": {
                 "max_active": args.max_active,
                 "max_per_client": args.max_per_client,
+                "max_per_client_destination": args.max_per_client_destination,
                 "idle_timeout_seconds": args.idle_timeout,
                 "client_header_timeout_seconds": args.client_header_timeout,
                 "max_client_handler_threads": args.max_client_handler_threads,
@@ -367,7 +419,8 @@ def run_pressure(args) -> dict:
                     "stdout": (process.stdout.read() if process.stdout else "")[-4000:],
                     "stderr": (process.stderr.read() if process.stderr else "")[-4000:],
                 }
-        blackhole.stop()
+        for blackhole in blackholes:
+            blackhole.stop()
         return result
 
 
@@ -383,6 +436,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tunnels", type=int, default=160)
     parser.add_argument("--max-active", type=int, default=40)
     parser.add_argument("--max-per-client", type=int, default=20)
+    parser.add_argument("--max-per-client-destination", type=int, default=0)
+    parser.add_argument("--client-count", type=int, default=0)
+    parser.add_argument("--client-prefix", default="admin")
+    parser.add_argument("--client-password", default="stress-secret")
+    parser.add_argument("--destination-count", type=int, default=1)
     parser.add_argument("--idle-timeout", type=float, default=1.0)
     parser.add_argument("--client-header-timeout", type=float, default=5.0)
     parser.add_argument("--max-client-handler-threads", type=int, default=256)
