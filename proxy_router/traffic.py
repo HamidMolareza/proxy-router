@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,12 @@ from .output import debug_exception, debug_log, log_event
 from .util import *
 
 FAKE_DNS_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in ("198.18.0.0/15",))
+
+
+@dataclass(frozen=True, slots=True)
+class TrafficUsageRecord:
+    timestamp: datetime
+    total_bytes: int
 
 
 def host_resolves_to_fake_dns(host: str | None) -> bool:
@@ -1507,17 +1514,11 @@ class TrafficQuotaManager:
                     )
                     if timestamp >= cutoff:
                         loaded_records.setdefault(client, deque()).append(
-                            {
-                                "timestamp": timestamp,
-                                "total_bytes": total_bytes,
-                            }
+                            TrafficUsageRecord(timestamp=timestamp, total_bytes=total_bytes)
                         )
                     proxy_id = str(record.get("upstream_proxy_id") or "").strip()
                     if proxy_id and timestamp >= proxy_cutoff:
-                        proxy_record = {
-                            "timestamp": timestamp,
-                            "total_bytes": total_bytes,
-                        }
+                        proxy_record = TrafficUsageRecord(timestamp=timestamp, total_bytes=total_bytes)
                         loaded_proxy_records.setdefault(proxy_id, deque()).append(proxy_record)
                         loaded_proxy_client_records.setdefault((proxy_id, client), deque()).append(proxy_record)
         except FileNotFoundError:
@@ -1550,18 +1551,12 @@ class TrafficQuotaManager:
         with self._lock:
             records = self._records_by_client.setdefault(client, deque())
             records.append(
-                {
-                    "timestamp": event_time,
-                    "total_bytes": int(total_bytes),
-                }
+                TrafficUsageRecord(timestamp=event_time, total_bytes=int(total_bytes))
             )
             self._prune_locked(client, now=event_time)
             proxy_id = str(upstream_proxy_id or "").strip()
             if proxy_id:
-                proxy_record = {
-                    "timestamp": event_time,
-                    "total_bytes": int(total_bytes),
-                }
+                proxy_record = TrafficUsageRecord(timestamp=event_time, total_bytes=int(total_bytes))
                 proxy_records = self._records_by_proxy.setdefault(proxy_id, deque())
                 proxy_records.append(proxy_record)
                 proxy_client_records = self._records_by_proxy_client.setdefault((proxy_id, client), deque())
@@ -1592,7 +1587,7 @@ class TrafficQuotaManager:
         for window_key, window_config in CLIENT_TRAFFIC_WINDOW_CONFIG.items():
             cutoff = current_time - window_config["window"]
             total_bytes = sum(
-                record["total_bytes"] for record in records if record["timestamp"] >= cutoff
+                record.total_bytes for record in records if record.timestamp >= cutoff
             )
             usage[window_key] = {
                 "window_seconds": int(window_config["window"].total_seconds()),
@@ -1759,7 +1754,7 @@ class TrafficQuotaManager:
         for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items():
             cutoff = current_time - window_config["window"]
             total_bytes = sum(
-                record["total_bytes"] for record in records if record["timestamp"] >= cutoff
+                record.total_bytes for record in records if record.timestamp >= cutoff
             )
             usage[window_key] = {
                 "window_seconds": int(window_config["window"].total_seconds()),
@@ -1891,8 +1886,8 @@ class TrafficQuotaManager:
             for window_key, window_config in PROXY_TRAFFIC_WINDOW_CONFIG.items()
         }
         for record in records:
-            timestamp = record.get("timestamp")
-            total_bytes = int(record.get("total_bytes") or 0)
+            timestamp = record.timestamp
+            total_bytes = record.total_bytes
             for window_key, cutoff in cutoffs.items():
                 if timestamp >= cutoff:
                     totals[window_key] += total_bytes
@@ -1935,7 +1930,7 @@ class TrafficQuotaManager:
         if not records:
             return
 
-        while records and records[0]["timestamp"] < cutoff:
+        while records and records[0].timestamp < cutoff:
             records.popleft()
 
         if not records:
@@ -1946,7 +1941,7 @@ class TrafficQuotaManager:
         records = self._records_by_proxy.get(proxy_id)
         if not records:
             return
-        while records and records[0]["timestamp"] < cutoff:
+        while records and records[0].timestamp < cutoff:
             records.popleft()
         if not records:
             self._records_by_proxy.pop(proxy_id, None)
@@ -1956,24 +1951,24 @@ class TrafficQuotaManager:
         records = self._records_by_proxy_client.get((proxy_id, client))
         if not records:
             return
-        while records and records[0]["timestamp"] < cutoff:
+        while records and records[0].timestamp < cutoff:
             records.popleft()
         if not records:
             self._records_by_proxy_client.pop((proxy_id, client), None)
 
     def _estimate_unblock_at(self, *, records, now: datetime, window: timedelta, limit_bytes: int):
         cutoff = now - window
-        in_window_records = [record for record in records if record["timestamp"] >= cutoff]
-        total_bytes = sum(record["total_bytes"] for record in in_window_records)
+        in_window_records = [record for record in records if record.timestamp >= cutoff]
+        total_bytes = sum(record.total_bytes for record in in_window_records)
         if total_bytes < limit_bytes:
             return None
 
         remaining_bytes = total_bytes
         for record in in_window_records:
-            remaining_bytes -= record["total_bytes"]
+            remaining_bytes -= record.total_bytes
             if remaining_bytes < limit_bytes:
-                return record["timestamp"] + window
+                return record.timestamp + window
 
         if in_window_records:
-            return in_window_records[-1]["timestamp"] + window
+            return in_window_records[-1].timestamp + window
         return None

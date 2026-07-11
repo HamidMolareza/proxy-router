@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .constants import *
 from .certificates import HttpsCertificateManager
-from .records import ClientBlockHistoryStore, build_failure_snapshot_from_records
+from .records import ClientBlockHistoryStore, build_failure_snapshot_from_records, iter_jsonl_records
 from .traffic import AutoProxyFailureManager, HttpsDiscoveryManager, HttpsInterceptionTrustManager, TrafficQuotaManager
 from .util import *
 
@@ -1689,13 +1689,7 @@ class AppRuntime:
     def rehydrate_dashboard_state(self):
         self.dashboard_state.clear_traffic_data()
 
-        usage_records, _ = load_usage_records(
-            self.usage_log_path,
-            log_invalid=False,
-            allow_missing=True,
-        )
-        usage_records.sort(key=lambda item: str(item.get("timestamp") or ""))
-        for record in usage_records:
+        for record in iter_jsonl_records(self.usage_log_path):
             client = str(record.get("client") or "").strip()
             timestamp = str(record.get("timestamp") or "").strip()
             if not client or not timestamp:
@@ -1733,13 +1727,7 @@ class AppRuntime:
                 proxy_failover_count=record.get("proxy_failover_count"),
             )
 
-        failure_records, _ = load_failure_records(
-            self.failure_log_path,
-            log_invalid=False,
-            allow_missing=True,
-        )
-        failure_records.sort(key=lambda item: str(item.get("timestamp") or ""))
-        for record in failure_records:
+        for record in iter_jsonl_records(self.failure_log_path):
             timestamp = str(record.get("timestamp") or "").strip()
             if not timestamp:
                 continue

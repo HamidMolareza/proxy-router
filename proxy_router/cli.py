@@ -24,6 +24,7 @@ from .proxy_server import (
     ThreadedSocks5Server,
     ThreadedTLSHTTPProxyServer,
 )
+from .records import compact_jsonl_file
 from .runtime import AppRuntime
 from .sing_box import build_sing_box_config, dump_sing_box_config
 from .util import *
@@ -755,6 +756,16 @@ def main():
     https_intercept_ca_cert_path = resolve_https_intercept_ca_cert_path(args.https_intercept_ca_cert_file)
     https_intercept_ca_key_path = resolve_https_intercept_ca_key_path(args.https_intercept_ca_key_file)
     https_intercept_cert_cache_dir = resolve_https_intercept_cert_cache_dir(args.https_intercept_cert_cache_dir)
+
+    for log_path, retention_days in (
+        (usage_log_path, 30),
+        (failure_log_path, 14),
+        (https_traffic_log_path, 14),
+    ):
+        try:
+            compact_jsonl_file(log_path, retention_days=retention_days)
+        except OSError as exc:
+            print_warning(f"Could not compact '{log_path}': {exc}")
 
     try:
         configure_error_logger(error_log_path)

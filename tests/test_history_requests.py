@@ -2,13 +2,37 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from proxy_router.records import UsageHistoryCache
+from proxy_router.records import UsageHistoryCache, compact_jsonl_file, iter_jsonl_records
 
 
 class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
+    def test_iter_jsonl_records_streams_valid_objects(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "usage.log"
+            log_file.write_text('{"id": 1}\ninvalid\n[2]\n{"id": 3}\n')
+
+            records = iter_jsonl_records(log_file)
+
+            self.assertFalse(isinstance(records, list))
+            self.assertEqual([{"id": 1}, {"id": 3}], list(records))
+
+    def test_compact_jsonl_file_keeps_only_valid_records_inside_retention(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "usage.log"
+            reference = datetime(2026, 7, 11, tzinfo=timezone.utc)
+            recent = {"timestamp": (reference - timedelta(days=2)).isoformat(), "total_bytes": 10}
+            old = {"timestamp": (reference - timedelta(days=31)).isoformat(), "total_bytes": 20}
+            log_file.write_text("\n".join((json.dumps(recent), json.dumps(old), "invalid")) + "\n")
+
+            result = compact_jsonl_file(log_file, retention_days=30, reference_time=reference)
+
+            self.assertEqual({"kept": 1, "removed": 1, "invalid": 1}, result)
+            self.assertEqual([recent], [json.loads(line) for line in log_file.read_text().splitlines()])
+
     def test_query_records_filters_searches_sorts_and_pages(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             log_file = Path(temp_dir) / "usage.log"
@@ -128,6 +152,7 @@ class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
             call_record_counts = []
 
             def fake_summary(records, **kwargs):
+                records = list(records)
                 call_record_counts.append(len(records))
                 return {
                     "summary": {"count": len(records)},
@@ -146,19 +171,14 @@ class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
                     appended_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
                 with patch("proxy_router.records.time.time", return_value=1070):
                     expired_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
-                    deadline = time.monotonic() + 2
-                    refreshed_payload = None
-                    while time.monotonic() < deadline:
-                        refreshed_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
-                        if refreshed_payload["summary"]["count"] == 2:
-                            break
-                        time.sleep(0.01)
+                    refreshed_payload = cache.build_history_payload(range_key="24h", timezone_name="UTC")
 
             self.assertEqual(call_record_counts, [1, 2])
             self.assertEqual(second_payload["summary"]["count"], 1)
             self.assertEqual(appended_payload["summary"]["count"], 1)
-            self.assertEqual(expired_payload["summary"]["count"], 1)
+            self.assertEqual(expired_payload["summary"]["count"], 2)
             self.assertEqual(refreshed_payload["summary"]["count"], 2)
+            self.assertFalse(hasattr(cache, "_records"))
 
     def test_build_history_payload_invalidates_cached_summary_on_log_rotation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -182,6 +202,7 @@ class UsageHistoryCacheRequestQueryTests(unittest.TestCase):
             call_record_counts = []
 
             def fake_summary(records, **kwargs):
+                records = list(records)
                 call_record_counts.append(len(records))
                 return {
                     "summary": {"first_client": records[0]["client"] if records else ""},

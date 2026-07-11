@@ -187,8 +187,8 @@ Important routes:
 History API notes:
 
 - `/api/history` returns aggregate summaries and period buckets for dashboard charts.
-- `/api/history` summary responses are cached briefly by usage-log identity, invalid-line count, range/filter values, timezone fields, and time bucket. Appends are loaded but may be reflected on the next cache bucket; truncation, rotation, or explicit traffic-data clears invalidate cached summaries immediately.
-- `/api/history/requests` returns summarized request rows from `usage.log`; it filters before sorting, applies `max_results` before paging, and clamps page sizes to keep MCP and dashboard callers bounded.
+- `/api/history` summary responses are produced with a single streaming pass over `usage.log` and cached briefly by usage-log identity, range/filter values, timezone fields, and time bucket. The cache does not retain decoded JSONL records. Appends appear on the next cache bucket; truncation, rotation, or explicit traffic-data clears invalidate cached summaries immediately.
+- `/api/history/requests` streams `usage.log`, filters before sorting, retains at most `max_results` candidates with a bounded heap, and clamps page sizes to keep MCP and dashboard callers bounded.
 - `/api/client-activity` returns range-clipped per-user segments. Client blocks override presence, current presence extends the latest gateway transition, and periods before the first authoritative transition remain `unknown` rather than being reported as disconnected.
 - `/api/https-traffic` is separate from request history because it reads intercepted HTTPS analyzer records with request/response metadata from `https-traffic.log`.
 

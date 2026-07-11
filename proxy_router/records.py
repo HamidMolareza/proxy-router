@@ -1,14 +1,75 @@
 from __future__ import annotations
 
 import json
+import heapq
+import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .constants import *
 from .util import *
+
+
+def iter_jsonl_records(log_file: Path | None):
+    if log_file is None:
+        return
+    try:
+        with log_file.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+    except FileNotFoundError:
+        return
+
+
+def compact_jsonl_file(log_file: Path | None, *, retention_days: int, reference_time: datetime | None = None) -> dict:
+    if log_file is None or not log_file.exists():
+        return {"kept": 0, "removed": 0, "invalid": 0}
+    cutoff = (reference_time or datetime.now().astimezone()).timestamp() - (retention_days * 86400)
+    temporary = log_file.with_name(f".{log_file.name}.compact-{os.getpid()}")
+    kept = 0
+    removed = 0
+    invalid = 0
+    try:
+        with log_file.open("r", encoding="utf-8", errors="replace") as source, temporary.open(
+            "w", encoding="utf-8"
+        ) as destination:
+            for line in source:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    invalid += 1
+                    continue
+                timestamp = parse_usage_timestamp(str(record.get("timestamp") or "")) if isinstance(record, dict) else None
+                if timestamp is None:
+                    invalid += 1
+                    continue
+                if timestamp.timestamp() < cutoff:
+                    removed += 1
+                    continue
+                destination.write(json.dumps(record, sort_keys=True) + "\n")
+                kept += 1
+            destination.flush()
+            os.fsync(destination.fileno())
+        temporary.chmod(log_file.stat().st_mode & 0o777)
+        os.replace(temporary, log_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"kept": kept, "removed": removed, "invalid": invalid}
 
 
 class _IncrementalJsonlCache:
@@ -395,21 +456,13 @@ class UsageHistoryCache:
         self.log_file = log_file
         self._lock = threading.Lock()
         self._file_id = None
-        self._offset = 0
-        self._records = []
-        self._invalid_lines = 0
+        self._file_size = 0
         self._history_payload_cache = {}
-        self._history_payload_stale_cache = {}
-        self._history_payload_refreshing = set()
 
     def _reset(self):
         self._file_id = None
-        self._offset = 0
-        self._records = []
-        self._invalid_lines = 0
+        self._file_size = 0
         self._history_payload_cache = {}
-        self._history_payload_stale_cache = {}
-        self._history_payload_refreshing = set()
 
     def clear(self):
         with self._lock:
@@ -427,40 +480,36 @@ class UsageHistoryCache:
             return False
 
         file_id = (getattr(stat, "st_dev", None), getattr(stat, "st_ino", None))
-        reload_full = self._file_id != file_id or stat.st_size < self._offset
-        previous_offset = self._offset
-        previous_invalid_lines = self._invalid_lines
+        rotated = self._file_id != file_id or stat.st_size < self._file_size
+        changed = rotated or stat.st_size != self._file_size
+        if rotated:
+            self._history_payload_cache = {}
+        self._file_id = file_id
+        self._file_size = stat.st_size
+        return changed
 
-        if reload_full:
-            self._records = []
-            self._invalid_lines = 0
-            self._offset = 0
-
-        with self.log_file.open("r", encoding="utf-8") as stream:
-            if self._offset > 0:
-                stream.seek(self._offset)
-
+    def _iter_records(self, invalid_lines: list[int] | None = None):
+        if self.log_file is None:
+            return
+        try:
+            stream = self.log_file.open("r", encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return
+        with stream:
             for line in stream:
                 stripped = line.strip()
                 if not stripped:
                     continue
                 try:
-                    self._records.append(json.loads(stripped))
+                    record = json.loads(stripped)
                 except json.JSONDecodeError:
-                    self._invalid_lines += 1
-
-            self._offset = stream.tell()
-            self._file_id = file_id
-        appended = self._offset != previous_offset or self._invalid_lines != previous_invalid_lines
-        changed = reload_full or appended
-        # Appends are loaded into memory immediately, but cached summaries may
-        # stay briefly stale so active traffic does not force full aggregation
-        # on every dashboard refresh. Rotation/truncation still invalidates.
-        if reload_full:
-            self._history_payload_cache = {}
-            self._history_payload_stale_cache = {}
-            self._history_payload_refreshing = set()
-        return changed
+                    if invalid_lines is not None:
+                        invalid_lines[0] += 1
+                    continue
+                if isinstance(record, dict):
+                    yield record
+                elif invalid_lines is not None:
+                    invalid_lines[0] += 1
 
     def _history_payload_cache_key(
         self,
@@ -473,28 +522,9 @@ class UsageHistoryCache:
         timezone_offset_minutes,
     ):
         time_bucket = int(time.time() // HISTORY_SUMMARY_CACHE_SECONDS)
-        return (time_bucket,) + self._history_payload_stale_key(
-            range_key=range_key,
-            proxy_type=proxy_type,
-            client=client,
-            upstream_proxy_id=upstream_proxy_id,
-            timezone_name=timezone_name,
-            timezone_offset_minutes=timezone_offset_minutes,
-        )
-
-    def _history_payload_stale_key(
-        self,
-        *,
-        range_key: str,
-        proxy_type: str | None,
-        client: str | None,
-        upstream_proxy_id: str | None,
-        timezone_name: str | None,
-        timezone_offset_minutes,
-    ):
         return (
+            time_bucket,
             self._file_id,
-            self._invalid_lines,
             str(range_key or ""),
             str(proxy_type or ""),
             str(client or ""),
@@ -507,19 +537,14 @@ class UsageHistoryCache:
     def _clone_payload(payload):
         return json.loads(json.dumps(payload))
 
-    def _remember_history_payload(self, cache_key, stale_key, payload):
+    def _remember_history_payload(self, cache_key, payload):
         if len(self._history_payload_cache) >= HISTORY_SUMMARY_CACHE_MAX_SIZE:
             self._history_payload_cache.pop(next(iter(self._history_payload_cache)), None)
         self._history_payload_cache[cache_key] = self._clone_payload(payload)
-        if len(self._history_payload_stale_cache) >= HISTORY_SUMMARY_CACHE_MAX_SIZE:
-            self._history_payload_stale_cache.pop(next(iter(self._history_payload_stale_cache)), None)
-        self._history_payload_stale_cache[stale_key] = self._clone_payload(payload)
 
     def _summarize_history_payload(
         self,
-        records,
         *,
-        invalid_lines: int,
         range_key: str,
         proxy_type: str | None,
         client: str | None,
@@ -527,9 +552,10 @@ class UsageHistoryCache:
         timezone_name: str | None,
         timezone_offset_minutes,
     ):
-        return summarize_history_records(
-            records,
-            invalid_lines=invalid_lines,
+        invalid_lines = [0]
+        payload = summarize_history_records(
+            self._iter_records(invalid_lines),
+            invalid_lines=0,
             range_key=range_key,
             proxy_type=proxy_type,
             client=client,
@@ -537,74 +563,8 @@ class UsageHistoryCache:
             timezone_name=timezone_name,
             timezone_offset_minutes=timezone_offset_minutes,
         )
-
-    def _refresh_history_payload(
-        self,
-        *,
-        cache_key,
-        stale_key,
-        records,
-        invalid_lines: int,
-        range_key: str,
-        proxy_type: str | None,
-        client: str | None,
-        upstream_proxy_id: str | None,
-        timezone_name: str | None,
-        timezone_offset_minutes,
-    ):
-        try:
-            payload = self._summarize_history_payload(
-                records,
-                invalid_lines=invalid_lines,
-                range_key=range_key,
-                proxy_type=proxy_type,
-                client=client,
-                upstream_proxy_id=upstream_proxy_id,
-                timezone_name=timezone_name,
-                timezone_offset_minutes=timezone_offset_minutes,
-            )
-            with self._lock:
-                if stale_key[0] == self._file_id and stale_key[1] == self._invalid_lines:
-                    self._remember_history_payload(cache_key, stale_key, payload)
-        finally:
-            with self._lock:
-                self._history_payload_refreshing.discard(stale_key)
-
-    def _start_history_payload_refresh(
-        self,
-        *,
-        cache_key,
-        stale_key,
-        records,
-        invalid_lines: int,
-        range_key: str,
-        proxy_type: str | None,
-        client: str | None,
-        upstream_proxy_id: str | None,
-        timezone_name: str | None,
-        timezone_offset_minutes,
-    ):
-        if stale_key in self._history_payload_refreshing:
-            return
-        self._history_payload_refreshing.add(stale_key)
-        refresh_thread = threading.Thread(
-            target=self._refresh_history_payload,
-            kwargs={
-                "cache_key": cache_key,
-                "stale_key": stale_key,
-                "records": records,
-                "invalid_lines": invalid_lines,
-                "range_key": range_key,
-                "proxy_type": proxy_type,
-                "client": client,
-                "upstream_proxy_id": upstream_proxy_id,
-                "timezone_name": timezone_name,
-                "timezone_offset_minutes": timezone_offset_minutes,
-            },
-            name="usage-history-summary-refresh",
-            daemon=True,
-        )
-        refresh_thread.start()
+        payload["invalid_lines"] = invalid_lines[0]
+        return payload
 
     def build_history_payload(
         self,
@@ -629,35 +589,8 @@ class UsageHistoryCache:
             cached_payload = self._history_payload_cache.get(cache_key)
             if cached_payload is not None:
                 return self._clone_payload(cached_payload)
-            stale_key = self._history_payload_stale_key(
-                range_key=range_key,
-                proxy_type=proxy_type,
-                client=client,
-                upstream_proxy_id=upstream_proxy_id,
-                timezone_name=timezone_name,
-                timezone_offset_minutes=timezone_offset_minutes,
-            )
-            stale_payload = self._history_payload_stale_cache.get(stale_key)
-            records = list(self._records)
-            invalid_lines = self._invalid_lines
-            if stale_payload is not None:
-                self._start_history_payload_refresh(
-                    cache_key=cache_key,
-                    stale_key=stale_key,
-                    records=records,
-                    invalid_lines=invalid_lines,
-                    range_key=range_key,
-                    proxy_type=proxy_type,
-                    client=client,
-                    upstream_proxy_id=upstream_proxy_id,
-                    timezone_name=timezone_name,
-                    timezone_offset_minutes=timezone_offset_minutes,
-                )
-                return self._clone_payload(stale_payload)
 
         payload = self._summarize_history_payload(
-            records,
-            invalid_lines=invalid_lines,
             range_key=range_key,
             proxy_type=proxy_type,
             client=client,
@@ -666,8 +599,9 @@ class UsageHistoryCache:
             timezone_offset_minutes=timezone_offset_minutes,
         )
         with self._lock:
-            if stale_key[0] == self._file_id and stale_key[1] == self._invalid_lines:
-                self._remember_history_payload(cache_key, stale_key, payload)
+            self._load_if_needed()
+            if cache_key[1] == self._file_id:
+                self._remember_history_payload(cache_key, payload)
         return self._clone_payload(payload)
 
     def recent_records(
@@ -680,21 +614,18 @@ class UsageHistoryCache:
         target_limit = max(0, int(limit))
         with self._lock:
             self._load_if_needed()
-            records = list(self._records)
 
         if target_limit == 0:
             return []
 
-        selected = []
-        for record in reversed(records):
+        selected = deque(maxlen=target_limit)
+        for record in self._iter_records():
             if proxy_type is not None and record.get("proxy_type") != proxy_type:
                 continue
             if client is not None and record.get("client") != client:
                 continue
             selected.append(record)
-            if len(selected) >= target_limit:
-                break
-        return selected
+        return list(reversed(selected))
 
     def query_records(
         self,
@@ -716,19 +647,6 @@ class UsageHistoryCache:
     ):
         with self._lock:
             self._load_if_needed()
-            records = list(self._records)
-            invalid_lines = self._invalid_lines
-
-        available_clients = sorted({str(item.get("client") or "") for item in records if item.get("client")})
-        available_proxy_types = sorted(
-            {str(item.get("proxy_type") or "") for item in records if item.get("proxy_type")}
-        )
-        available_upstream_proxy_ids = sorted(
-            {str(item.get("upstream_proxy_id") or "") for item in records if item.get("upstream_proxy_id")}
-        )
-        available_route_labels = sorted(
-            {str(item.get("route_label") or "") for item in records if item.get("route_label")}
-        )
 
         normalized_client = str(client or "").strip()
         normalized_client_ip = str(client_ip or "").strip()
@@ -739,28 +657,6 @@ class UsageHistoryCache:
         normalized_method = str(method or "").strip().upper()
         normalized_status = str(status_code or "").strip()
         normalized_search = str(search or "").strip().lower()
-
-        selected = []
-        for record in records:
-            if normalized_client and str(record.get("client") or "") != normalized_client:
-                continue
-            if normalized_client_ip and str(record.get("client_ip") or "") != normalized_client_ip:
-                continue
-            if normalized_proxy_type and str(record.get("proxy_type") or "") != normalized_proxy_type:
-                continue
-            if normalized_upstream_proxy_id and str(record.get("upstream_proxy_id") or "") != normalized_upstream_proxy_id:
-                continue
-            if normalized_route_label and str(record.get("route_label") or "") != normalized_route_label:
-                continue
-            if normalized_host and normalized_host not in self._record_host_text(record):
-                continue
-            if normalized_method and str(record.get("method") or "").upper() != normalized_method:
-                continue
-            if normalized_status and str(record.get("status_code") or "") != normalized_status:
-                continue
-            if normalized_search and normalized_search not in self._record_search_text(record):
-                continue
-            selected.append(record)
 
         sort_key = str(sort or "timestamp")
         numeric_sort_keys = {
@@ -799,25 +695,66 @@ class UsageHistoryCache:
                 return self._int_value(value)
             return str(value or "")
 
-        selected.sort(key=sortable_value, reverse=reverse)
-
         target_page = max(1, self._int_value(page, default=1))
         target_page_size = min(max(1, self._int_value(page_size, default=50)), 200)
         target_max_results = min(max(1, self._int_value(max_results, default=1000)), 5000)
-        total = len(selected)
-        truncated = total > target_max_results
-        capped = selected[:target_max_results]
+        available_clients = set()
+        available_proxy_types = set()
+        available_upstream_proxy_ids = set()
+        available_route_labels = set()
+        invalid_lines = [0]
+        total = [0]
+
+        def matched_records():
+            for record in self._iter_records(invalid_lines):
+                record_client = str(record.get("client") or "")
+                record_proxy_type = str(record.get("proxy_type") or "")
+                record_upstream_proxy_id = str(record.get("upstream_proxy_id") or "")
+                record_route_label = str(record.get("route_label") or "")
+                if record_client:
+                    available_clients.add(record_client)
+                if record_proxy_type:
+                    available_proxy_types.add(record_proxy_type)
+                if record_upstream_proxy_id:
+                    available_upstream_proxy_ids.add(record_upstream_proxy_id)
+                if record_route_label:
+                    available_route_labels.add(record_route_label)
+                if normalized_client and record_client != normalized_client:
+                    continue
+                if normalized_client_ip and str(record.get("client_ip") or "") != normalized_client_ip:
+                    continue
+                if normalized_proxy_type and record_proxy_type != normalized_proxy_type:
+                    continue
+                if normalized_upstream_proxy_id and record_upstream_proxy_id != normalized_upstream_proxy_id:
+                    continue
+                if normalized_route_label and record_route_label != normalized_route_label:
+                    continue
+                if normalized_host and normalized_host not in self._record_host_text(record):
+                    continue
+                if normalized_method and str(record.get("method") or "").upper() != normalized_method:
+                    continue
+                if normalized_status and str(record.get("status_code") or "") != normalized_status:
+                    continue
+                if normalized_search and normalized_search not in self._record_search_text(record):
+                    continue
+                total[0] += 1
+                yield record
+
+        selector = heapq.nlargest if reverse else heapq.nsmallest
+        capped = selector(target_max_results, matched_records(), key=sortable_value)
+        total_count = total[0]
+        truncated = total_count > target_max_results
         offset = (target_page - 1) * target_page_size
         rows = [self._summary_record(record) for record in capped[offset : offset + target_page_size]]
 
         return {
             "items": rows,
-            "total": total,
+            "total": total_count,
             "page": target_page,
             "page_size": target_page_size,
             "max_results": target_max_results,
             "truncated": truncated,
-            "invalid_lines": invalid_lines,
+            "invalid_lines": invalid_lines[0],
             "log_file": str(self.log_file) if self.log_file is not None else None,
             "filters": {
                 "client": normalized_client or "all",
@@ -832,10 +769,10 @@ class UsageHistoryCache:
                 "sort": sort_key,
                 "direction": "desc" if reverse else "asc",
             },
-            "available_clients": available_clients,
-            "available_proxy_types": available_proxy_types,
-            "available_upstream_proxy_ids": available_upstream_proxy_ids,
-            "available_route_labels": available_route_labels,
+            "available_clients": sorted(available_clients),
+            "available_proxy_types": sorted(available_proxy_types),
+            "available_upstream_proxy_ids": sorted(available_upstream_proxy_ids),
+            "available_route_labels": sorted(available_route_labels),
         }
 
     def _summary_record(self, record):
