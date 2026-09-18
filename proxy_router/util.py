@@ -153,6 +153,34 @@ def rule_patterns_overlap(left_rule, right_rule) -> bool:
     if not left_pattern or not right_pattern:
         return False
 
+    if left_match == "cidr" and right_match == "cidr":
+        try:
+            net1 = ipaddress.ip_network(left_pattern, strict=False)
+            net2 = ipaddress.ip_network(right_pattern, strict=False)
+            return net1.overlaps(net2)
+        except ValueError:
+            return False
+    if left_match == "cidr" and right_match == "exact":
+        try:
+            ip = ipaddress.ip_address(right_pattern)
+            net = ipaddress.ip_network(left_pattern, strict=False)
+            return ip in net
+        except ValueError:
+            return False
+    if left_match == "exact" and right_match == "cidr":
+        try:
+            ip = ipaddress.ip_address(left_pattern)
+            net = ipaddress.ip_network(right_pattern, strict=False)
+            return ip in net
+        except ValueError:
+            return False
+    if left_match == "cidr" and right_match == "contains":
+        return right_pattern in left_pattern
+    if left_match == "contains" and right_match == "cidr":
+        return left_pattern in right_pattern
+    if left_match == "cidr" or right_match == "cidr":
+        return False
+
     if left_match == "exact" and right_match == "exact":
         return left_pattern == right_pattern
     if left_match == "exact" and right_match == "suffix":
@@ -177,12 +205,32 @@ def rule_patterns_overlap(left_rule, right_rule) -> bool:
 def is_specific_rule_override(left_rule, right_rule) -> bool:
     left_pattern, left_match = router_rule_identity(left_rule)
     right_pattern, right_match = router_rule_identity(right_rule)
-    if not left_pattern or not right_pattern or right_match != "suffix":
+    if not left_pattern or not right_pattern:
         return False
-    if left_match == "exact":
-        return left_pattern == right_pattern or left_pattern.endswith(f".{right_pattern}")
-    if left_match == "suffix":
-        return left_pattern != right_pattern and left_pattern.endswith(f".{right_pattern}")
+    if right_match == "suffix":
+        if left_match == "exact":
+            return left_pattern == right_pattern or left_pattern.endswith(f".{right_pattern}")
+        if left_match == "suffix":
+            return left_pattern != right_pattern and left_pattern.endswith(f".{right_pattern}")
+    if right_match == "cidr":
+        if left_match == "exact":
+            try:
+                ip = ipaddress.ip_address(left_pattern)
+                net = ipaddress.ip_network(right_pattern, strict=False)
+                return ip in net
+            except ValueError:
+                return False
+        if left_match == "cidr":
+            try:
+                net_left = ipaddress.ip_network(left_pattern, strict=False)
+                net_right = ipaddress.ip_network(right_pattern, strict=False)
+                return (
+                    net_left != net_right
+                    and net_left.prefixlen > net_right.prefixlen
+                    and net_left.subnet_of(net_right)
+                )
+            except ValueError:
+                return False
     return False
 
 
@@ -190,14 +238,16 @@ def rule_conflict_hint(left_entry, right_entry) -> str:
     left_rule = left_entry["rule"]
     right_rule = right_entry["rule"]
     if is_specific_rule_override(right_rule, left_rule):
+        rule_type = "CIDR" if left_rule.get("match") == "cidr" else "suffix"
         return (
             f"{right_rule.get('pattern')} is more specific than {left_rule.get('pattern')}. "
-            f"Move the specific rule above the broader suffix rule, disable one rule, or use the same action."
+            f"Move the specific rule above the broader {rule_type} rule, disable one rule, or use the same action."
         )
     if is_specific_rule_override(left_rule, right_rule):
+        rule_type = "CIDR" if right_rule.get("match") == "cidr" else "suffix"
         return (
             f"{left_rule.get('pattern')} is a specific exception for {right_rule.get('pattern')} "
-            f"and must stay above the broader suffix rule."
+            f"and must stay above the broader {rule_type} rule."
         )
     return "Disable one rule, make the actions match, or narrow the match so only one rule can apply."
 
@@ -1387,6 +1437,15 @@ def normalize_routing_target_payload(payload, *, field_prefix: str, default_conf
                 f"{field_prefix} rule #{index} match must be one of: {', '.join(sorted(RULE_MATCH_TYPES))}"
             )
 
+        if match_type == "cidr":
+            try:
+                network = ipaddress.ip_network(pattern, strict=False)
+                pattern = str(network)
+            except ValueError:
+                raise ValueError(
+                    f"{field_prefix} rule #{index} pattern must be a valid CIDR network: {pattern}"
+                )
+
         action = str(rule_payload.get("action", "proxy")).strip().lower()
         if action not in RULE_ROUTE_ACTIONS:
             raise ValueError(
@@ -1986,6 +2045,18 @@ def rule_matches_host(rule, host: str) -> bool:
     pattern = rule["pattern"]
     match_type = rule["match"]
 
+    if match_type == "cidr":
+        clean_host = (
+            normalized_host[1:-1]
+            if normalized_host.startswith("[") and normalized_host.endswith("]")
+            else normalized_host
+        )
+        try:
+            ip = ipaddress.ip_address(clean_host)
+            net = ipaddress.ip_network(pattern, strict=False)
+            return ip in net
+        except ValueError:
+            return False
     if match_type == "exact":
         return normalized_host == pattern
     if match_type == "contains":

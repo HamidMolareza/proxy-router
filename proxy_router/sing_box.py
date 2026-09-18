@@ -59,6 +59,8 @@ def _route_match_for_rule(rule: dict) -> dict | None:
     if not pattern:
         return None
     match_type = str(rule.get("match") or "suffix").strip().lower()
+    if match_type == "cidr":
+        return {"ip_cidr": [pattern]}
     if match_type == "exact":
         return {"domain": [pattern]}
     if match_type == "contains":

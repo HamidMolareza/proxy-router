@@ -34,6 +34,13 @@ def normalize_rule_suggestion_rule(payload) -> dict:
     if match_type not in RULE_MATCH_TYPES:
         raise ValueError(f"rule suggestion match must be one of: {', '.join(sorted(RULE_MATCH_TYPES))}")
 
+    if match_type == "cidr":
+        try:
+            network = ipaddress.ip_network(pattern, strict=False)
+            pattern = str(network)
+        except ValueError:
+            raise ValueError(f"rule suggestion pattern must be a valid CIDR network: {pattern}")
+
     action = str(payload.get("action", "proxy")).strip().lower()
     if action not in RULE_ROUTE_ACTIONS:
         raise ValueError(f"rule suggestion action must be one of: {', '.join(sorted(RULE_ROUTE_ACTIONS))}")

@@ -176,7 +176,7 @@ CLIENT_ACTIVITY_RANGE_OPTIONS = {
 }
 DEFAULT_ROUTE_ACTIONS = {"direct", "proxy"}
 RULE_ROUTE_ACTIONS = {"direct", "proxy", "block"}
-RULE_MATCH_TYPES = {"exact", "suffix", "contains"}
+RULE_MATCH_TYPES = {"exact", "suffix", "contains", "cidr"}
 UPSTREAM_PROXY_TYPES = {"http", "socks5"}
 UPSTREAM_PROXY_ACCESS_MODES = {"public", "authenticated", "private"}
 HTTPS_INTERCEPTION_MODES = {"allowlist", "all"}

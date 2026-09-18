@@ -884,7 +884,7 @@ function normalizeRules(rules, options = {}) {
       return ensureRuleExpiration({
         enabled: rule.enabled !== false,
         pattern: normalizePattern(rule.pattern),
-        match: ['exact', 'suffix', 'contains'].includes(rule.match) ? rule.match : 'suffix',
+        match: ['exact', 'suffix', 'contains', 'cidr'].includes(rule.match) ? rule.match : 'suffix',
         action: ['proxy', 'block'].includes(rule.action) ? rule.action : 'direct',
         note: String(rule.note || ''),
         source,
@@ -1393,10 +1393,36 @@ function getEditorVisibleRuleEntries(config, profileId) {
   return [...profileEntries, ...sharedEntries]
 }
 
+function parseIpv4(ipStr) {
+  const parts = String(ipStr || '').trim().split('.')
+  if (parts.length !== 4) return null
+  let num = 0
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null
+    const n = Number(part)
+    if (n < 0 || n > 255) return null
+    num = (num << 8) | n
+  }
+  return num >>> 0
+}
+
+function ipv4MatchesCidr(ipStr, cidrStr) {
+  const [netStr, maskStr] = String(cidrStr || '').trim().split('/')
+  const ip = parseIpv4(ipStr)
+  const net = parseIpv4(netStr)
+  const prefix = Number(maskStr)
+  if (ip === null || net === null || Number.isNaN(prefix) || prefix < 0 || prefix > 32) {
+    return false
+  }
+  if (prefix === 0) return true
+  const mask = ((0xffffffff << (32 - prefix)) >>> 0)
+  return (ip & mask) === (net & mask)
+}
+
 function ruleIdentity(rule) {
   return {
     pattern: normalizeRulePattern(rule && rule.pattern),
-    match: ['exact', 'suffix', 'contains'].includes(rule && rule.match) ? rule.match : 'suffix',
+    match: ['exact', 'suffix', 'contains', 'cidr'].includes(rule && rule.match) ? rule.match : 'suffix',
   }
 }
 
@@ -1412,6 +1438,29 @@ function rulePatternsOverlap(leftRule, rightRule) {
   const left = ruleIdentity(leftRule)
   const right = ruleIdentity(rightRule)
   if (!left.pattern || !right.pattern) {
+    return false
+  }
+  if (left.match === 'cidr' && right.match === 'cidr') {
+    const [leftNet, leftMask] = left.pattern.split('/')
+    const [rightNet, rightMask] = right.pattern.split('/')
+    const ip1 = parseIpv4(leftNet)
+    const ip2 = parseIpv4(rightNet)
+    const m1 = Number(leftMask)
+    const m2 = Number(rightMask)
+    if (ip1 !== null && ip2 !== null && !Number.isNaN(m1) && !Number.isNaN(m2)) {
+      const minPrefix = Math.min(m1, m2)
+      const mask = minPrefix === 0 ? 0 : ((0xffffffff << (32 - minPrefix)) >>> 0)
+      return (ip1 & mask) === (ip2 & mask)
+    }
+    return false
+  }
+  if (left.match === 'cidr' && right.match === 'exact') {
+    return ipv4MatchesCidr(right.pattern, left.pattern)
+  }
+  if (left.match === 'exact' && right.match === 'cidr') {
+    return ipv4MatchesCidr(left.pattern, right.pattern)
+  }
+  if (left.match === 'cidr' || right.match === 'cidr') {
     return false
   }
   if (left.match === 'exact' && right.match === 'exact') {
@@ -1447,14 +1496,30 @@ function rulePatternsOverlap(leftRule, rightRule) {
 function isSpecificRuleOverride(leftRule, rightRule) {
   const left = ruleIdentity(leftRule)
   const right = ruleIdentity(rightRule)
-  if (!left.pattern || !right.pattern || right.match !== 'suffix') {
+  if (!left.pattern || !right.pattern) {
     return false
   }
-  if (left.match === 'exact') {
-    return left.pattern === right.pattern || left.pattern.endsWith(`.${right.pattern}`)
+  if (right.match === 'suffix') {
+    if (left.match === 'exact') {
+      return left.pattern === right.pattern || left.pattern.endsWith(`.${right.pattern}`)
+    }
+    if (left.match === 'suffix') {
+      return left.pattern !== right.pattern && left.pattern.endsWith(`.${right.pattern}`)
+    }
   }
-  if (left.match === 'suffix') {
-    return left.pattern !== right.pattern && left.pattern.endsWith(`.${right.pattern}`)
+  if (right.match === 'cidr') {
+    if (left.match === 'exact') {
+      return ipv4MatchesCidr(left.pattern, right.pattern)
+    }
+    if (left.match === 'cidr') {
+      const [lNet, lMask] = left.pattern.split('/')
+      const [rNet, rMask] = right.pattern.split('/')
+      const pLeft = Number(lMask)
+      const pRight = Number(rMask)
+      if (pLeft > pRight && ipv4MatchesCidr(lNet, right.pattern)) {
+        return true
+      }
+    }
   }
   return false
 }
@@ -1463,14 +1528,16 @@ function ruleConflictHint(leftEntry, rightEntry) {
   const leftRule = leftEntry.rule || {}
   const rightRule = rightEntry.rule || {}
   if (isSpecificRuleOverride(rightRule, leftRule)) {
+    const broaderType = leftRule.match === 'cidr' ? 'CIDR' : 'suffix'
     return `${normalizeRulePattern(rightRule.pattern)} is more specific than ${normalizeRulePattern(
       leftRule.pattern,
-    )}. Move the specific rule above the broader suffix rule, disable one rule, or use the same action.`
+    )}. Move the specific rule above the broader ${broaderType} rule, disable one rule, or use the same action.`
   }
   if (isSpecificRuleOverride(leftRule, rightRule)) {
+    const broaderType = rightRule.match === 'cidr' ? 'CIDR' : 'suffix'
     return `${normalizeRulePattern(leftRule.pattern)} is a specific exception for ${normalizeRulePattern(
       rightRule.pattern,
-    )} and must stay above the broader suffix rule.`
+    )} and must stay above the broader ${broaderType} rule.`
   }
   return 'Disable one rule, make the actions match, or narrow the match so only one rule can apply.'
 }
@@ -1482,7 +1549,7 @@ function ruleIssueRef(entry) {
     scope_label: entry.scope_label,
     index: entry.index,
     pattern: normalizeRulePattern(rule.pattern),
-    match: ['exact', 'suffix', 'contains'].includes(rule.match) ? rule.match : 'suffix',
+    match: ['exact', 'suffix', 'contains', 'cidr'].includes(rule.match) ? rule.match : 'suffix',
     action: ['direct', 'proxy', 'block'].includes(rule.action) ? rule.action : 'direct',
     enabled: rule.enabled !== false,
     source: normalizeRuleSource(rule),
@@ -1676,6 +1743,9 @@ function ruleMatchesHost(rule, host) {
   const pattern = String((rule && rule.pattern) || '').trim().toLowerCase()
   if (!normalizedHost || !pattern) {
     return false
+  }
+  if (rule.match === 'cidr') {
+    return ipv4MatchesCidr(normalizedHost, pattern)
   }
   if (rule.match === 'exact') {
     return normalizedHost === pattern
@@ -4964,7 +5034,7 @@ function App() {
     targetScope.rules[index] = {
       enabled: true,
       pattern,
-      match: rule.match === 'exact' || rule.match === 'contains' ? rule.match : 'suffix',
+      match: ['exact', 'contains', 'cidr'].includes(rule.match) ? rule.match : 'suffix',
       action: 'direct',
       note: pattern ? `ignored auto-proxy rule for ${pattern}` : 'ignored auto-proxy rule',
       source: 'manual',
@@ -7284,6 +7354,7 @@ function App() {
                                     <option value="suffix">Suffix</option>
                                     <option value="exact">Exact</option>
                                     <option value="contains">Contains</option>
+                                    <option value="cidr">CIDR</option>
                                   </select>
                                 </td>
                                 <td className="min-w-44">
