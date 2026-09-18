@@ -116,6 +116,11 @@ class TunnelLimitManager:
             ),
         )
         self._notify_callback = notify_callback
+        admin_clients = os.environ.get("PROXY_ROUTER_ADMIN_CLIENTS")
+        self._admin_clients = (
+            {client.strip() for client in admin_clients.split(",") if client.strip()}
+            if admin_clients is not None else None
+        )
         self._lock = threading.Lock()
         self._active_total = 0
         self._active_by_client = {}
@@ -124,7 +129,11 @@ class TunnelLimitManager:
         self._rejected_by_reason = {}
 
     def _limit_for_client(self, client: str) -> int:
-        if str(client or "").startswith("user:admin"):
+        is_admin = (
+            client in self._admin_clients if self._admin_clients is not None
+            else str(client or "").startswith("user:admin")
+        )
+        if is_admin:
             return self.max_per_admin_client
         return self.max_per_client
 

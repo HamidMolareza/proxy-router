@@ -1,9 +1,31 @@
 import unittest
+from unittest.mock import patch
 
 from proxy_router.runtime import TunnelLimitManager, UpstreamSetupLimitManager
 
 
 class TunnelLimitManagerTests(unittest.TestCase):
+    def test_explicit_admin_clients_get_admin_limit_regardless_of_name(self):
+        with patch.dict("os.environ", {"PROXY_ROUTER_ADMIN_CLIENTS": " user:tadvin-hesab, user:admin "}):
+            manager = TunnelLimitManager(max_active=10, max_per_client=1, max_per_admin_client=2)
+
+        for client, expected_limit in (("user:tadvin-hesab", 2), ("user:admin", 2), ("user:admin-imposter", 1), ("user:regular", 1)):
+            with self.subTest(client=client):
+                tickets = []
+                try:
+                    for _ in range(expected_limit):
+                        ticket, rejection = manager.try_acquire(client=client)
+                        self.assertIsNotNone(ticket)
+                        self.assertIsNone(rejection)
+                        tickets.append(ticket)
+                    ticket, rejection = manager.try_acquire(client=client)
+                    self.assertIsNone(ticket)
+                    self.assertEqual(rejection["reason"], "client_limit")
+                    self.assertEqual(rejection["client_limit"], expected_limit)
+                finally:
+                    for ticket in tickets:
+                        ticket.release()
+
     def test_enforces_global_and_client_limits(self):
         manager = TunnelLimitManager(
             max_active=2,

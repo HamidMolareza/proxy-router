@@ -329,6 +329,13 @@ Diagnosis tips:
 - HTTPS interception can add TLS and body-preview work for matched hosts; use HTTPS throughput mode or an allowlist-only setup when raw CONNECT/SOCKS5 speed matters.
 - `python3 ./proxy-router usage-analyze /tmp/proxy-router-usage.log` prints timing samples from the same JSONL data for offline review.
 
+Set `PROXY_ROUTER_ADMIN_CLIENTS` to a comma-separated list of exact authenticated
+client IDs (for example, `user:admin,user:admin-mobile,user:operator`) to select
+the admin tunnel limit independently of usernames. An empty value gives every
+client the regular limit. When unset, the legacy `user:admin` prefix behavior
+is retained. Keep this server-managed list synchronized with VPN admin roles;
+it selects tunnel capacity only and does not grant dashboard or API access.
+
 Run the managed tunnel pressure test before deploying relay or tunnel-limit
 changes:
 
