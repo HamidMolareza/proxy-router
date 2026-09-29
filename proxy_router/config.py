@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shutil
 import socket
@@ -720,7 +721,13 @@ class RouterConfigManager:
 
     def _write_config_locked(self, normalized_config):
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
-        self.config_file.write_text(json.dumps(normalized_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_file = self.config_file.with_name(f"{self.config_file.name}.tmp.{os.getpid()}")
+        try:
+            tmp_file.write_text(json.dumps(normalized_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp_file.replace(self.config_file)
+        finally:
+            if tmp_file.exists():
+                tmp_file.unlink(missing_ok=True)
         self._config = normalized_config
         self._refresh_next_expiration_locked()
         self._clear_route_decision_cache_locked()
