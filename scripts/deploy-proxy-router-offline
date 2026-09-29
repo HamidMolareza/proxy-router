@@ -133,6 +133,10 @@ log "Downloading Python wheels for offline container install"
 python3 -m pip download \
   --dest "$STAGE_DIR/src/wheelhouse" \
   --only-binary=:all: \
+  --python-version 3.12 \
+  --platform manylinux2014_x86_64 \
+  --implementation cp \
+  --abi cp312 \
   --index-url "$PIP_INDEX_URL" \
   --extra-index-url "$PIP_EXTRA_INDEX_URL" \
   -r "$ROOT_DIR/requirements.txt"
